@@ -17,9 +17,9 @@ from torchvision.transforms.v2 import Compose
 
 from rfdetr.datasets._aug_utils import filter_keypoint_hflip_augmentations
 from rfdetr.datasets._develop import _SimpleDataset
-from rfdetr.datasets.aug_configs import AUG_AGGRESSIVE, AUG_CONFIG
+from rfdetr.datasets.aug_configs import AUG_AGGRESSIVE, AUG_CONFIG, AUG_SAHI
 from rfdetr.datasets.coco import make_coco_transforms, make_coco_transforms_square_div_64
-from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize, _build_albu_transform
+from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize, SAHIMaskCrop, _build_albu_transform
 from rfdetr.utilities import collate_fn
 
 
@@ -1396,6 +1396,134 @@ class TestAlbumentationsWrapperNestedConfig:
 
         names = [t.transform.transforms[0].__class__.__name__ for t in transforms]
         assert "HorizontalFlip" in names
+
+
+class TestSAHIMaskCrop:
+    """Tests for the SAHI-style mask-aware crop augmentation."""
+
+    def test_returns_requested_crop_size_when_foreground_exists(self):
+        """SAHIMaskCrop should crop to the configured fixed size when possible."""
+        wrapper = AlbumentationsWrapper(SAHIMaskCrop(height=50, width=50, p=1.0, edge_bias_prob=0.0))
+        image = Image.new("RGB", (100, 100))
+        target = {
+            "boxes": torch.tensor([[60.0, 60.0, 90.0, 90.0]], dtype=torch.float32),
+            "labels": torch.tensor([1]),
+        }
+
+        aug_image, aug_target = wrapper(image, target)
+
+        assert aug_image.size == (50, 50)
+        assert aug_target["boxes"].shape == (1, 4)
+        assert aug_target["labels"].tolist() == [1]
+
+    def test_detection_only_uses_box_foreground(self):
+        """Detection-only targets should use rectangular masks generated from boxes."""
+        wrapper = AlbumentationsWrapper(SAHIMaskCrop(height=40, width=40, p=1.0, edge_bias_prob=0.0))
+        image = Image.new("RGB", (100, 100))
+        target = {
+            "boxes": torch.tensor([[70.0, 70.0, 90.0, 90.0]], dtype=torch.float32),
+            "labels": torch.tensor([3]),
+        }
+
+        aug_image, aug_target = wrapper(image, target)
+
+        assert aug_image.size == (40, 40)
+        assert aug_target["boxes"].shape[0] >= 1
+        assert aug_target["labels"].tolist() == [3]
+
+    def test_filters_boxes_by_min_area(self):
+        """Boxes below SAHIMaskCrop min_area should be removed after cropping."""
+        wrapper = AlbumentationsWrapper(SAHIMaskCrop(height=50, width=50, min_area=10_000.0, p=1.0))
+        image = Image.new("RGB", (100, 100))
+        target = {
+            "boxes": torch.tensor([[10.0, 10.0, 20.0, 20.0]], dtype=torch.float32),
+            "labels": torch.tensor([1]),
+            "area": torch.tensor([100.0]),
+        }
+
+        _, aug_target = wrapper(image, target)
+
+        assert aug_target["boxes"].shape == (0, 4)
+        assert aug_target["labels"].shape == (0,)
+        assert aug_target["area"].shape == (0,)
+
+    def test_tightens_boxes_from_matching_masks(self):
+        """When masks exist, final boxes should be recomputed from cropped masks."""
+        wrapper = AlbumentationsWrapper(SAHIMaskCrop(height=80, width=80, p=1.0, edge_bias_prob=0.0))
+        image = Image.new("RGB", (100, 100))
+        masks = torch.zeros((1, 100, 100), dtype=torch.bool)
+        masks[0, 20:40, 25:35] = True
+        target = {
+            "boxes": torch.tensor([[10.0, 10.0, 50.0, 50.0]], dtype=torch.float32),
+            "labels": torch.tensor([1]),
+            "masks": masks,
+            "area": torch.tensor([1600.0]),
+        }
+
+        _, aug_target = wrapper(image, target)
+
+        aug_mask = aug_target["masks"][0]
+        ys, xs = torch.nonzero(aug_mask, as_tuple=True)
+        expected_box = torch.tensor(
+            [xs.min().item(), ys.min().item(), xs.max().item() + 1, ys.max().item() + 1],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(aug_target["boxes"][0], expected_box)
+        expected_area = float((expected_box[2] - expected_box[0]) * (expected_box[3] - expected_box[1]))
+        assert aug_target["area"].item() == pytest.approx(expected_area)
+
+    def test_empty_masks_drop_matching_boxes_and_keep_fields_aligned(self):
+        """A surviving cropped box with an empty matching mask should be dropped."""
+        wrapper = AlbumentationsWrapper(SAHIMaskCrop(height=80, width=80, p=1.0, edge_bias_prob=0.0))
+        image = Image.new("RGB", (100, 100))
+        masks = torch.zeros((2, 100, 100), dtype=torch.bool)
+        masks[0, 10:30, 10:30] = True
+        target = {
+            "boxes": torch.tensor([[10.0, 10.0, 30.0, 30.0], [12.0, 12.0, 28.0, 28.0]], dtype=torch.float32),
+            "labels": torch.tensor([1, 2]),
+            "masks": masks,
+            "area": torch.tensor([400.0, 256.0]),
+            "iscrowd": torch.tensor([0, 1]),
+            "keypoints": torch.tensor([[[15.0, 15.0, 2.0]], [[20.0, 20.0, 2.0]]]),
+        }
+
+        _, aug_target = wrapper(image, target)
+
+        assert aug_target["boxes"].shape == (1, 4)
+        assert aug_target["labels"].tolist() == [1]
+        assert aug_target["masks"].shape[0] == 1
+        assert aug_target["iscrowd"].tolist() == [0]
+        assert aug_target["keypoints"].shape == (1, 1, 3)
+
+    def test_no_boxes_returns_unchanged_by_default(self):
+        """No-box inputs should be unchanged when allow_empty is False."""
+        wrapper = AlbumentationsWrapper(SAHIMaskCrop(height=40, width=40, p=1.0))
+        image = Image.new("RGB", (100, 100))
+        target = {
+            "boxes": torch.zeros((0, 4), dtype=torch.float32),
+            "labels": torch.zeros((0,), dtype=torch.long),
+        }
+
+        aug_image, aug_target = wrapper(image, target)
+
+        assert aug_image.size == (100, 100)
+        assert aug_target["boxes"].shape == (0, 4)
+        assert aug_target["labels"].shape == (0,)
+
+    def test_from_config_instantiates_sahi_mask_crop(self):
+        """SAHIMaskCrop should be available through RF-DETR aug_config."""
+        transforms = AlbumentationsWrapper.from_config({"SAHIMaskCrop": {"height": 32, "width": 32, "p": 1.0}})
+
+        assert len(transforms) == 1
+        assert transforms[0].transform.transforms[0].__class__.__name__ == "SAHIMaskCrop"
+
+    def test_kornia_gpu_backend_reports_sahi_mask_crop_as_unsupported(self):
+        """The GPU augmentation backend should reject SAHIMaskCrop by name."""
+        pytest.importorskip("kornia")
+        from rfdetr.datasets.kornia_transforms import build_kornia_pipeline
+
+        with pytest.raises(ValueError, match="SAHIMaskCrop"):
+            build_kornia_pipeline(AUG_SAHI, 640)
 
 
 class TestIntegration:

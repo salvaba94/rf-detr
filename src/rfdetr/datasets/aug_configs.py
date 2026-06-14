@@ -8,7 +8,7 @@
 Import a preset and pass it as ``aug_config`` to your training call:
 
 ```python
-from rfdetr.datasets.aug_configs import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL
+from rfdetr.datasets.aug_configs import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL, AUG_SAHI
 
 model.train(dataset_dir="...", aug_config=AUG_CONSERVATIVE) model.train(dataset_dir="...", aug_config=AUG_AGGRESSIVE)
 
@@ -27,13 +27,14 @@ model.train(dataset_dir="...", aug_config={"HorizontalFlip": {"p": 0.5}})
 | ``AUG_AGGRESSIVE``    | Large datasets (2000+ images)                 |
 | ``AUG_AERIAL``        | Satellite / overhead imagery                  |
 | ``AUG_INDUSTRIAL``    | Manufacturing / inspection data               |
+| ``AUG_SAHI``          | SAHI-style sliced inference training          |
 
 ## Transform Categories
 
 **Geometric transforms** (automatically transform bounding boxes):
 - Flips: HorizontalFlip, VerticalFlip
 - Rotations: Rotate, Affine, ShiftScaleRotate
-- Crops: RandomCrop, CenterCrop, RandomResizedCrop
+- Crops: RandomCrop, CenterCrop, RandomResizedCrop, SAHIMaskCrop
 - Perspective: Perspective, ElasticTransform, GridDistortion
 
 **Pixel-level transforms** (preserve bounding boxes):
@@ -65,7 +66,7 @@ GEOMETRIC_TRANSFORMS = {
 When ``augmentation_backend="auto"`` or ``"gpu"`` is set in ``TrainConfig``, augmentations run on the GPU via Kornia
 instead of Albumentations.
 
-**Supported transforms** (all presets):
+**Supported transforms** (Kornia-compatible presets only; ``AUG_SAHI`` is CPU-only):
 
 | Preset key | Kornia equivalent | Notes |
 |---|---|---|
@@ -150,3 +151,9 @@ AUG_INDUSTRIAL = {
     "GaussianBlur": {"blur_limit": 3, "p": 0.3},
     "GaussNoise": {"std_range": (0.01, 0.05), "p": 0.3},
 }
+
+#: SAHI-style foreground crops for sliced/tiled inference deployment. Requires CPU augmentation.
+AUG_SAHI = [
+    {"SAHIMaskCrop": {"height": 640, "width": 640, "p": 0.5}},
+    {"HorizontalFlip": {"p": 0.5}},
+]

@@ -124,6 +124,7 @@ GEOMETRIC_TRANSFORMS = {
     "AtLeastOneBBoxRandomCrop",
     "RandomResizedCrop",
     "CropAndPad",
+    "SAHIMaskCrop",
     # Perspective and distortions
     "Perspective",
     "ElasticTransform",
@@ -147,6 +148,182 @@ GEOMETRIC_TRANSFORMS = {
 
 # Albumentations container/meta transforms that hold nested transforms
 ALBUMENTATIONS_CONTAINERS = frozenset({"OneOf", "SomeOf", "Sequential"})
+
+
+if alb is not None:
+    from albumentations.augmentations.crops.transforms import BaseCrop
+
+    class SAHIMaskCrop(BaseCrop):
+        """Crop around annotation foreground to mimic SAHI-style sliced inference.
+
+        The crop location is sampled from per-instance masks when they are present,
+        otherwise from rectangular masks generated from ground-truth boxes.
+        """
+
+        def __init__(
+            self,
+            height: int,
+            width: int,
+            allow_empty: bool = False,
+            min_visibility: float = 0.05,
+            min_area: float = 1.0,
+            sampling: str = "small_object_weighted",
+            edge_bias_prob: float = 0.25,
+            p: float = 0.5,
+        ) -> None:
+            super().__init__(p=p)
+            if height <= 0 or width <= 0:
+                raise ValueError("SAHIMaskCrop height and width must be positive")
+            if sampling not in {"uniform", "area_weighted", "small_object_weighted"}:
+                raise ValueError("SAHIMaskCrop sampling must be 'uniform', 'area_weighted', or 'small_object_weighted'")
+            self.height = int(height)
+            self.width = int(width)
+            self.allow_empty = allow_empty
+            self.min_visibility = float(min_visibility)
+            self.min_area = float(min_area)
+            self.sampling = sampling
+            self.edge_bias_prob = float(edge_bias_prob)
+
+        @staticmethod
+        def _full_image_crop(image_height: int, image_width: int) -> tuple[int, int, int, int]:
+            """Return crop coordinates that leave the image unchanged."""
+            return (0, 0, image_width, image_height)
+
+        @staticmethod
+        def _boxes_to_pixel_coords(bboxes: Any, image_height: int, image_width: int) -> np.ndarray:
+            """Return bbox coordinates in absolute XYXY pixels."""
+            boxes = np.asarray(bboxes, dtype=np.float32)
+            if boxes.size == 0:
+                return np.zeros((0, 4), dtype=np.float32)
+            boxes = boxes.reshape(-1, boxes.shape[-1])[:, :4].copy()
+            if float(np.nanmax(np.abs(boxes))) <= 1.5:
+                boxes[:, [0, 2]] *= image_width
+                boxes[:, [1, 3]] *= image_height
+            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, image_width)
+            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, image_height)
+            return boxes
+
+        @staticmethod
+        def _choice(weights: np.ndarray, py_random: Any) -> int:
+            """Sample an index using Python's RNG to follow Albumentations seeding."""
+            total = float(weights.sum())
+            if total <= 0:
+                return 0
+            threshold = py_random.random() * total
+            cumulative = 0.0
+            for index, weight in enumerate(weights):
+                cumulative += float(weight)
+                if cumulative >= threshold:
+                    return index
+            return int(len(weights) - 1)
+
+        def _sample_instance_index(self, areas: np.ndarray) -> int:
+            """Sample an instance according to the configured weighting strategy."""
+            if self.sampling == "uniform":
+                weights = np.ones_like(areas, dtype=np.float64)
+            elif self.sampling == "area_weighted":
+                weights = areas.astype(np.float64)
+            else:
+                weights = 1.0 / np.maximum(areas.astype(np.float64), 1.0)
+            return self._choice(weights, self.py_random)
+
+        def _random_crop_coords(self, image_height: int, image_width: int) -> tuple[int, int, int, int]:
+            """Return random crop coordinates, or full image when the crop cannot fit."""
+            crop_height = min(self.height, image_height)
+            crop_width = min(self.width, image_width)
+            max_x = image_width - crop_width
+            max_y = image_height - crop_height
+            x_min = self.py_random.randint(0, max_x) if max_x > 0 else 0
+            y_min = self.py_random.randint(0, max_y) if max_y > 0 else 0
+            return (x_min, y_min, x_min + crop_width, y_min + crop_height)
+
+        def _crop_around_point(
+            self,
+            x: int,
+            y: int,
+            image_height: int,
+            image_width: int,
+        ) -> tuple[int, int, int, int]:
+            """Return fixed-size crop coordinates around a sampled foreground point."""
+            crop_height = min(self.height, image_height)
+            crop_width = min(self.width, image_width)
+            if self.py_random.random() < self.edge_bias_prob:
+                x_min = x - self.py_random.choice([0, crop_width - 1])
+                y_min = y - self.py_random.choice([0, crop_height - 1])
+            else:
+                x_min = x - self.py_random.randint(0, max(crop_width - 1, 0))
+                y_min = y - self.py_random.randint(0, max(crop_height - 1, 0))
+            x_min = int(np.clip(x_min, 0, image_width - crop_width))
+            y_min = int(np.clip(y_min, 0, image_height - crop_height))
+            return (x_min, y_min, x_min + crop_width, y_min + crop_height)
+
+        def _instance_masks_from_data(
+            self,
+            data: dict[str, Any],
+            image_height: int,
+            image_width: int,
+        ) -> tuple[list[np.ndarray], np.ndarray]:
+            """Build per-instance foreground masks and their areas."""
+            raw_masks = data.get("masks")
+            masks: list[np.ndarray] = []
+            if raw_masks is not None:
+                for raw_mask in raw_masks:
+                    mask = np.asarray(raw_mask).astype(bool, copy=False)
+                    if mask.shape[:2] == (image_height, image_width) and mask.any():
+                        masks.append(mask)
+            if masks:
+                return masks, np.asarray([float(mask.sum()) for mask in masks], dtype=np.float32)
+
+            boxes = self._boxes_to_pixel_coords(data.get("bboxes", []), image_height, image_width)
+            for box in boxes:
+                x_min, y_min, x_max, y_max = box
+                x1, y1 = int(np.floor(x_min)), int(np.floor(y_min))
+                x2, y2 = int(np.ceil(x_max)), int(np.ceil(y_max))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                mask = np.zeros((image_height, image_width), dtype=bool)
+                mask[y1:y2, x1:x2] = True
+                masks.append(mask)
+            if not masks:
+                return [], np.zeros((0,), dtype=np.float32)
+            return masks, np.asarray([float(mask.sum()) for mask in masks], dtype=np.float32)
+
+        def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+            """Compute crop coordinates from annotation foreground."""
+            image_height, image_width = params["shape"][:2]
+            if image_height <= 0 or image_width <= 0:
+                return {"crop_coords": (0, 0, 0, 0)}
+
+            masks, areas = self._instance_masks_from_data(data, image_height, image_width)
+            if not masks:
+                crop_coords = (
+                    self._random_crop_coords(image_height, image_width)
+                    if self.allow_empty
+                    else self._full_image_crop(image_height, image_width)
+                )
+                return {"crop_coords": crop_coords}
+
+            mask = masks[self._sample_instance_index(areas)]
+            coords = np.argwhere(mask)
+            if coords.size == 0:
+                return {"crop_coords": self._full_image_crop(image_height, image_width)}
+            y, x = coords[self.py_random.randrange(len(coords))]
+            return {"crop_coords": self._crop_around_point(int(x), int(y), image_height, image_width)}
+
+else:
+    SAHIMaskCrop = None  # type: ignore[assignment]
+
+
+def _find_transform_by_name(transform: Any, name: str) -> Any | None:
+    """Return the first transform with the requested class name, including nested containers."""
+    if type(transform).__name__ == name:
+        return transform
+    if hasattr(transform, "transforms"):
+        for nested in transform.transforms:
+            found = _find_transform_by_name(nested, name)
+            if found is not None:
+                return found
+    return None
 
 
 def _is_geometric_transform(transform: alb.BasicTransform) -> bool:
@@ -250,7 +427,8 @@ def _build_albu_transform(name: str, params: dict[str, Any]) -> alb.BasicTransfo
             raise ValueError(f"Unknown Albumentations container: {name!r}")
         return container_cls(transforms=nested_transforms, **other_params)
 
-    aug_cls = getattr(alb, name, None)
+    local_transforms = {"SAHIMaskCrop": SAHIMaskCrop}
+    aug_cls = local_transforms.get(name) or getattr(alb, name, None)
     if aug_cls is None:
         raise ValueError(f"Unknown Albumentations transform: {name!r}")
     return aug_cls(**_normalize_albu_params(name, params, aug_cls))
@@ -403,6 +581,7 @@ class AlbumentationsWrapper:
         # Auto-detect if transform is geometric (recursively for containers)
         self._is_geometric = _is_geometric_transform(transform)
         self._keypoint_flip_pairs = list(keypoint_flip_pairs or [])
+        self._sahi_mask_crop = _find_transform_by_name(transform, "SAHIMaskCrop")
 
         if self._is_geometric:
             # Wrap geometric transform with bbox handling capabilities
@@ -419,7 +598,8 @@ class AlbumentationsWrapper:
                 bbox_params=alb.BboxParams(
                     format="pascal_voc",  # Boxes are in (x1, y1, x2, y2) format
                     label_fields=["category_ids", "idxs"],  # Track labels and indices for per-instance field sync
-                    min_visibility=0.0,  # Remove boxes with zero visibility/area after transformation
+                    min_visibility=getattr(self._sahi_mask_crop, "min_visibility", 0.0),
+                    min_area=getattr(self._sahi_mask_crop, "min_area", 0.0),
                     clip=True,  # Clip box coordinates to image boundaries after transformation
                 ),
                 keypoint_params=alb.KeypointParams(
@@ -664,6 +844,68 @@ class AlbumentationsWrapper:
                     result[key] = [value[i] for i in kept_idxs]
         return result
 
+    @staticmethod
+    def _filter_current_instances(
+        target: Dict[str, Any], num_instances: int, keep_positions: List[int]
+    ) -> Dict[str, Any]:
+        """Filter already-transformed per-instance fields by current positions."""
+        global_fields = {"orig_size", "size", "image_id"}
+        keep_tensor = torch.as_tensor(keep_positions, dtype=torch.long)
+        result: Dict[str, Any] = {}
+        for key, value in target.items():
+            if key in global_fields:
+                result[key] = value
+                continue
+            if torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] == num_instances:
+                result[key] = value[keep_tensor]
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) == num_instances:
+                result[key] = [value[i] for i in keep_positions]
+            else:
+                result[key] = value
+        return result
+
+    @staticmethod
+    def _tighten_boxes_from_masks(target: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace boxes with tight boxes from their matching binary masks."""
+        masks = target.get("masks")
+        boxes = target.get("boxes")
+        if masks is None or boxes is None or not torch.is_tensor(masks) or not torch.is_tensor(boxes):
+            return target
+        if masks.ndim != 3 or boxes.ndim != 2 or boxes.shape[0] != masks.shape[0]:
+            return target
+
+        keep_positions: List[int] = []
+        tight_boxes: List[torch.Tensor] = []
+        for index, mask in enumerate(masks.bool()):
+            ys, xs = torch.nonzero(mask, as_tuple=True)
+            if xs.numel() == 0 or ys.numel() == 0:
+                continue
+            tight_boxes.append(
+                torch.tensor(
+                    [
+                        float(xs.min().item()),
+                        float(ys.min().item()),
+                        float(xs.max().item() + 1),
+                        float(ys.max().item() + 1),
+                    ],
+                    dtype=torch.float32,
+                    device=boxes.device,
+                )
+            )
+            keep_positions.append(index)
+
+        target_out = AlbumentationsWrapper._filter_current_instances(target, int(boxes.shape[0]), keep_positions)
+        if tight_boxes:
+            target_out["boxes"] = torch.stack(tight_boxes).to(dtype=torch.float32)
+        else:
+            target_out["boxes"] = boxes.new_zeros((0, 4), dtype=torch.float32)
+        if "labels" in target_out and torch.is_tensor(target_out["labels"]):
+            target_out["labels"] = target_out["labels"].to(dtype=torch.long)
+        if "area" in target_out:
+            boxes_out = target_out["boxes"]
+            target_out["area"] = (boxes_out[:, 2] - boxes_out[:, 0]) * (boxes_out[:, 3] - boxes_out[:, 1])
+        return target_out
+
     def _apply_geometric_transform(
         self, image_np: np.ndarray, target: dict[str, Any], labels: list[int]
     ) -> tuple[Image.Image, dict[str, Any]]:
@@ -776,6 +1018,8 @@ class AlbumentationsWrapper:
                 target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
             else:
                 target_out["masks"] = torch.as_tensor(np.stack(masks_aug), dtype=torch.bool)
+            if self._sahi_mask_crop is not None:
+                target_out = self._tighten_boxes_from_masks(target_out)
         return image_out, target_out
 
     def __call__(

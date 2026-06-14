@@ -12,7 +12,7 @@ Pass `aug_config` to your training call. Import one of the built-in presets:
 
 ```python
 from rfdetr import RFDETRSmall
-from rfdetr.datasets.aug_configs import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL
+from rfdetr.datasets.aug_configs import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL, AUG_SAHI
 
 model = RFDETRSmall()
 model.train(dataset_dir="path/to/dataset", epochs=100, aug_config=AUG_CONSERVATIVE)
@@ -42,8 +42,9 @@ To disable augmentations: `aug_config={}`. Omitting it uses the default (horizon
 | `AUG_AGGRESSIVE`   | Large datasets (2000+ images)     |
 | `AUG_AERIAL`       | Satellite / overhead imagery      |
 | `AUG_INDUSTRIAL`   | Manufacturing / inspection data   |
+| `AUG_SAHI`         | SAHI-style sliced inference       |
 
-All presets are plain dicts — inspect or extend them before passing:
+Most presets are plain dicts; `AUG_SAHI` uses list format to preserve ordering. Inspect or extend them before passing:
 
 ```python
 from rfdetr.datasets.aug_configs import AUG_AGGRESSIVE
@@ -59,6 +60,34 @@ model.train(dataset_dir="...", aug_config=my_config)
 | Under 500 images | `AUG_CONSERVATIVE` — flip + mild brightness/contrast            |
 | 500–2000 images  | Default or `AUG_CONSERVATIVE` with a few extra transforms added |
 | 2000+ images     | `AUG_AGGRESSIVE` — rotations, affine, color jitter              |
+
+## SAHI-Style Crops
+
+Use `SAHIMaskCrop` when deployment will use sliced or tiled inference. The crop is sampled from foreground derived
+from ground-truth boxes, and if instance masks are present, boxes are tightened to the visible mask after cropping.
+
+```python
+from rfdetr.datasets.aug_configs import AUG_SAHI
+
+model.train(
+    dataset_dir="path/to/dataset",
+    epochs=100,
+    aug_config=AUG_SAHI,
+    augmentation_backend="cpu",
+)
+```
+
+For a custom crop size:
+
+```python
+aug_config = [
+    {"SAHIMaskCrop": {"height": 640, "width": 640, "p": 0.5}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+```
+
+`SAHIMaskCrop` is CPU-only in this version. Use `augmentation_backend="cpu"`; the Kornia GPU backend reports it as
+unsupported.
 
 ## Nested Transforms
 

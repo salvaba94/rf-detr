@@ -322,10 +322,19 @@ def build_kornia_pipeline(
         include_keypoints=include_keypoints,
         warn=logger.warning,
     )
-    assert isinstance(filtered_aug_config, dict)
+    assert isinstance(filtered_aug_config, (dict, list))
+
+    if isinstance(filtered_aug_config, list):
+        entries = []
+        for entry in filtered_aug_config:
+            if not isinstance(entry, dict) or len(entry) != 1:
+                raise ValueError(f"Invalid augmentation config entry for Kornia GPU backend: {entry!r}.")
+            entries.append(next(iter(entry.items())))
+    else:
+        entries = list(filtered_aug_config.items())
 
     transforms: list[Any] = []
-    for name, params in filtered_aug_config.items():
+    for name, params in entries:
         factory = _REGISTRY.get(name)
         if factory is None:
             raise ValueError(
