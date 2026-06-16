@@ -30,7 +30,7 @@ from torch import Tensor
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
 from rfdetr.datasets.aug_configs import AUG_CONFIG
-from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
+from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize, prepare_multi_image_augmentations
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -269,12 +269,30 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             num_keypoints_per_class=num_keypoints_per_class,
         )
 
-    def __getitem__(self, idx: int) -> tuple[Any, Any]:
+    def _load_prepared_sample(self, idx: int) -> Tuple[Any, Any]:
+        """Load one sample and convert annotations without applying augmentations."""
         img, target = super(CocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]
         target = {"image_id": image_id, "annotations": target}
-        img, target = self.prepare(img, target)
+        return self.prepare(img, target)
+
+    def _get_additional_sample(self, idx: int) -> Tuple[Any, Any] | None:
+        """Return a random different prepared sample for multi-image augmentations."""
+        if len(self.ids) <= 1:
+            return None
+        sample_idx = idx
+        for _ in range(10):
+            sample_idx = int(torch.randint(0, len(self.ids), ()).item())
+            if sample_idx != idx:
+                break
+        if sample_idx == idx:
+            sample_idx = (idx + 1) % len(self.ids)
+        return self._load_prepared_sample(sample_idx)
+
+    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+        img, target = self._load_prepared_sample(idx)
         if self._transforms is not None:
+            prepare_multi_image_augmentations(self._transforms, self, idx)
             # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to
             # normalized [cx, cy, w, h] occurs inside Normalize
             img, target = self._transforms(img, target)

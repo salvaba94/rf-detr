@@ -22,7 +22,7 @@ from typing import Any, List
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from rfdetr.assets.model_weights import download_pretrain_weights, validate_pretrain_weights
+from rfdetr.assets.model_weights import download_pretrain_weights, get_model_cache_dir, validate_pretrain_weights
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.utilities.decorators import deprecated
 from rfdetr.utilities.logger import get_logger
@@ -298,6 +298,9 @@ def load_pretrain_weights(
     pretrain_weights = mc.pretrain_weights
     if pretrain_weights is None:
         return []
+    if not os.path.dirname(pretrain_weights):
+        pretrain_weights = os.path.join(get_model_cache_dir(), pretrain_weights)
+        mc.pretrain_weights = pretrain_weights
     class_names: List[str] = []
 
     from rfdetr.util.io import _safe_torch_load

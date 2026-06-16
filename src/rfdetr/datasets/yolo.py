@@ -30,6 +30,7 @@ from rfdetr.datasets.coco import (
     make_coco_transforms,
     make_coco_transforms_square_div_64,
 )
+from rfdetr.datasets.transforms import prepare_multi_image_augmentations
 
 REQUIRED_YOLO_YAML_FILES = ["data.yaml", "data.yml"]
 REQUIRED_SPLIT_DIRS = ["train", "valid"]
@@ -791,18 +792,34 @@ class YoloDetection(VisionDataset):
     def __len__(self) -> int:
         return len(self.sv_dataset)
 
-    def __getitem__(self, idx: int):
+    def _load_prepared_sample(self, idx: int) -> tuple[Any, Any]:
+        """Load one sample and convert annotations without applying augmentations."""
         image_id = self.ids[idx]
-        image_path, rgb_image, detections = self.sv_dataset[idx]
-
+        _, rgb_image, detections = self.sv_dataset[idx]
         img = Image.fromarray(rgb_image)
-
         target = {"image_id": image_id, "detections": detections}
         if self.include_keypoints:
             target["keypoints"] = self.sv_dataset.get_image_info(idx).keypoints
-        img, target = self.prepare(img, target)
+        return self.prepare(img, target)
+
+    def _get_additional_sample(self, idx: int) -> tuple[Any, Any] | None:
+        """Return a random different prepared sample for multi-image augmentations."""
+        if len(self.ids) <= 1:
+            return None
+        sample_idx = idx
+        for _ in range(10):
+            sample_idx = int(torch.randint(0, len(self.ids), ()).item())
+            if sample_idx != idx:
+                break
+        if sample_idx == idx:
+            sample_idx = (idx + 1) % len(self.ids)
+        return self._load_prepared_sample(sample_idx)
+
+    def __getitem__(self, idx: int):
+        img, target = self._load_prepared_sample(idx)
 
         if self._transforms is not None:
+            prepare_multi_image_augmentations(self._transforms, self, idx)
             img, target = self._transforms(img, target)
 
         return img, target

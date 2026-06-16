@@ -34,8 +34,9 @@ model.train(dataset_dir="...", aug_config={"HorizontalFlip": {"p": 0.5}})
 **Geometric transforms** (automatically transform bounding boxes):
 - Flips: HorizontalFlip, VerticalFlip
 - Rotations: Rotate, Affine, ShiftScaleRotate
-- Crops: RandomCrop, CenterCrop, RandomResizedCrop, SAHIMaskCrop
+- Crops: RandomCrop, CenterCrop, RandomResizedCrop, TiledCroppingWithMasks
 - Perspective: Perspective, ElasticTransform, GridDistortion
+- Target-aware native transforms: CopyPaste
 
 **Pixel-level transforms** (preserve bounding boxes):
 - Color: ColorJitter, HueSaturationValue, RandomBrightnessContrast
@@ -154,6 +155,24 @@ AUG_INDUSTRIAL = {
 
 #: SAHI-style foreground crops for sliced/tiled inference deployment. Requires CPU augmentation.
 AUG_SAHI = [
-    {"SAHIMaskCrop": {"height": 640, "width": 640, "p": 0.5}},
+    {"TiledCroppingWithMasks": {"height": 640, "width": 640, "p": 0.5}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+
+#: Multi-image object CopyPaste. Uses masks when available, otherwise rectangular bbox cutouts.
+AUG_COPY_PASTE = [
+    {"CopyPaste": {"p": 0.3, "max_paste_objects": 3, "max_iou": 0.3}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+
+#: Multi-image MixUp. Blends a second training image and appends its annotations.
+AUG_MIXUP = [
+    {"MixUp": {"p": 0.3, "alpha": 1.0}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+
+#: Albumentations Mosaic. COCO/YOLO datasets provide additional images automatically.
+AUG_MOSAIC = [
+    {"Mosaic": {"grid_yx": (2, 2), "target_size": (640, 640), "cell_shape": (360, 360), "p": 0.5}},
     {"HorizontalFlip": {"p": 0.5}},
 ]

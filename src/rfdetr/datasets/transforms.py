@@ -124,7 +124,7 @@ GEOMETRIC_TRANSFORMS = {
     "AtLeastOneBBoxRandomCrop",
     "RandomResizedCrop",
     "CropAndPad",
-    "SAHIMaskCrop",
+    "TiledCroppingWithMasks",
     # Perspective and distortions
     "Perspective",
     "ElasticTransform",
@@ -144,6 +144,10 @@ GEOMETRIC_TRANSFORMS = {
     "PadIfNeeded",
     "Pad",
     "SquareSymmetry",
+    # RF-DETR-native multi-image target-aware transforms
+    "CopyPaste",
+    "MixUp",
+    "Mosaic"
 }
 
 # Albumentations container/meta transforms that hold nested transforms
@@ -151,168 +155,127 @@ ALBUMENTATIONS_CONTAINERS = frozenset({"OneOf", "SomeOf", "Sequential"})
 
 
 if alb is not None:
-    from albumentations.augmentations.crops.transforms import BaseCrop
+    from albumentations.augmentations.crops.transforms import CropNonEmptyMaskIfExists
 
-    class SAHIMaskCrop(BaseCrop):
-        """Crop around annotation foreground to mimic SAHI-style sliced inference.
+    class TiledCroppingWithMasks(CropNonEmptyMaskIfExists):
+        """Crop around foreground using Albumentations' non-empty-mask crop.
 
-        The crop location is sampled from per-instance masks when they are present,
-        otherwise from rectangular masks generated from ground-truth boxes.
+        This is a thin RF-DETR/DA-YOLO-style wrapper around
+        :class:`albumentations.CropNonEmptyMaskIfExists`. RF-DETR supplies a
+        foreground mask from real instance masks when available, or from bounding
+        boxes for detection-only targets. Albumentations handles crop geometry,
+        boxes, masks, and keypoints through its standard processors.
         """
 
         def __init__(
             self,
-            height: int,
-            width: int,
+            height: int | None = None,
+            width: int | None = None,
+            target_size: int | tuple[int, int] | list[int] | None = None,
+            height_range: tuple[int, int] | list[int] | None = None,
+            width_range: tuple[int, int] | list[int] | None = None,
+            ignore_values: list[int] | None = None,
+            ignore_channels: list[int] | None = None,
             allow_empty: bool = False,
             min_visibility: float = 0.05,
             min_area: float = 1.0,
-            sampling: str = "small_object_weighted",
-            edge_bias_prob: float = 0.25,
             p: float = 0.5,
+            **_: Any,
         ) -> None:
-            super().__init__(p=p)
+            """Initialize a SAHI-style tiled foreground crop."""
+            if target_size is not None:
+                if isinstance(target_size, (int, float)):
+                    height = width = int(target_size)
+                elif isinstance(target_size, Sequence) and len(target_size) == 2:
+                    height, width = int(target_size[0]), int(target_size[1])
+                else:
+                    raise ValueError("TiledCroppingWithMasks target_size must be an int or (height, width)")
+            if height is None or width is None:
+                raise ValueError("TiledCroppingWithMasks requires height/width or target_size")
             if height <= 0 or width <= 0:
-                raise ValueError("SAHIMaskCrop height and width must be positive")
-            if sampling not in {"uniform", "area_weighted", "small_object_weighted"}:
-                raise ValueError("SAHIMaskCrop sampling must be 'uniform', 'area_weighted', or 'small_object_weighted'")
-            self.height = int(height)
-            self.width = int(width)
-            self.allow_empty = allow_empty
+                raise ValueError("TiledCroppingWithMasks height and width must be positive")
+            super().__init__(
+                height=int(height),
+                width=int(width),
+                ignore_values=ignore_values,
+                ignore_channels=ignore_channels,
+                p=p,
+            )
+            self.base_height = int(height)
+            self.base_width = int(width)
+            self.height_range = self._validate_size_range(height_range, "height_range")
+            self.width_range = self._validate_size_range(width_range, "width_range")
+            self.allow_empty = bool(allow_empty)
             self.min_visibility = float(min_visibility)
             self.min_area = float(min_area)
-            self.sampling = sampling
-            self.edge_bias_prob = float(edge_bias_prob)
 
         @staticmethod
-        def _full_image_crop(image_height: int, image_width: int) -> tuple[int, int, int, int]:
-            """Return crop coordinates that leave the image unchanged."""
-            return (0, 0, image_width, image_height)
+        def _validate_size_range(
+            value: tuple[int, int] | list[int] | None,
+            name: str,
+        ) -> tuple[int, int] | None:
+            """Validate an optional inclusive crop-size range."""
+            if value is None:
+                return None
+            if not isinstance(value, Sequence) or len(value) != 2:
+                raise ValueError(f"TiledCroppingWithMasks {name} must be a two-value sequence")
+            min_value, max_value = int(value[0]), int(value[1])
+            if min_value <= 0 or max_value <= 0 or min_value > max_value:
+                raise ValueError(f"TiledCroppingWithMasks {name} must contain positive values with min <= max")
+            return min_value, max_value
 
-        @staticmethod
-        def _boxes_to_pixel_coords(bboxes: Any, image_height: int, image_width: int) -> np.ndarray:
-            """Return bbox coordinates in absolute XYXY pixels."""
-            boxes = np.asarray(bboxes, dtype=np.float32)
-            if boxes.size == 0:
-                return np.zeros((0, 4), dtype=np.float32)
-            boxes = boxes.reshape(-1, boxes.shape[-1])[:, :4].copy()
-            if float(np.nanmax(np.abs(boxes))) <= 1.5:
-                boxes[:, [0, 2]] *= image_width
-                boxes[:, [1, 3]] *= image_height
-            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, image_width)
-            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, image_height)
-            return boxes
-
-        @staticmethod
-        def _choice(weights: np.ndarray, py_random: Any) -> int:
-            """Sample an index using Python's RNG to follow Albumentations seeding."""
-            total = float(weights.sum())
-            if total <= 0:
-                return 0
-            threshold = py_random.random() * total
-            cumulative = 0.0
-            for index, weight in enumerate(weights):
-                cumulative += float(weight)
-                if cumulative >= threshold:
-                    return index
-            return int(len(weights) - 1)
-
-        def _sample_instance_index(self, areas: np.ndarray) -> int:
-            """Sample an instance according to the configured weighting strategy."""
-            if self.sampling == "uniform":
-                weights = np.ones_like(areas, dtype=np.float64)
-            elif self.sampling == "area_weighted":
-                weights = areas.astype(np.float64)
+        def _random_size(self) -> None:
+            """Select a crop size for this call, following DA-YOLO tiled cropping."""
+            if self.height_range is None:
+                self.height = self.base_height
             else:
-                weights = 1.0 / np.maximum(areas.astype(np.float64), 1.0)
-            return self._choice(weights, self.py_random)
-
-        def _random_crop_coords(self, image_height: int, image_width: int) -> tuple[int, int, int, int]:
-            """Return random crop coordinates, or full image when the crop cannot fit."""
-            crop_height = min(self.height, image_height)
-            crop_width = min(self.width, image_width)
-            max_x = image_width - crop_width
-            max_y = image_height - crop_height
-            x_min = self.py_random.randint(0, max_x) if max_x > 0 else 0
-            y_min = self.py_random.randint(0, max_y) if max_y > 0 else 0
-            return (x_min, y_min, x_min + crop_width, y_min + crop_height)
-
-        def _crop_around_point(
-            self,
-            x: int,
-            y: int,
-            image_height: int,
-            image_width: int,
-        ) -> tuple[int, int, int, int]:
-            """Return fixed-size crop coordinates around a sampled foreground point."""
-            crop_height = min(self.height, image_height)
-            crop_width = min(self.width, image_width)
-            if self.py_random.random() < self.edge_bias_prob:
-                x_min = x - self.py_random.choice([0, crop_width - 1])
-                y_min = y - self.py_random.choice([0, crop_height - 1])
+                self.height = self.py_random.randint(self.height_range[0], self.height_range[1])
+            if self.width_range is None:
+                self.width = self.base_width
             else:
-                x_min = x - self.py_random.randint(0, max(crop_width - 1, 0))
-                y_min = y - self.py_random.randint(0, max(crop_height - 1, 0))
-            x_min = int(np.clip(x_min, 0, image_width - crop_width))
-            y_min = int(np.clip(y_min, 0, image_height - crop_height))
-            return (x_min, y_min, x_min + crop_width, y_min + crop_height)
+                self.width = self.py_random.randint(self.width_range[0], self.width_range[1])
 
-        def _instance_masks_from_data(
-            self,
-            data: dict[str, Any],
-            image_height: int,
-            image_width: int,
-        ) -> tuple[list[np.ndarray], np.ndarray]:
-            """Build per-instance foreground masks and their areas."""
-            raw_masks = data.get("masks")
-            masks: list[np.ndarray] = []
-            if raw_masks is not None:
-                for raw_mask in raw_masks:
-                    mask = np.asarray(raw_mask).astype(bool, copy=False)
-                    if mask.shape[:2] == (image_height, image_width) and mask.any():
-                        masks.append(mask)
-            if masks:
-                return masks, np.asarray([float(mask.sum()) for mask in masks], dtype=np.float32)
+        def _preprocess_mask(self, mask: np.ndarray) -> np.ndarray:
+            """Preprocess masks and clamp oversized crop dimensions."""
+            mask_height, mask_width = mask.shape[:2]
 
-            boxes = self._boxes_to_pixel_coords(data.get("bboxes", []), image_height, image_width)
-            for box in boxes:
-                x_min, y_min, x_max, y_max = box
-                x1, y1 = int(np.floor(x_min)), int(np.floor(y_min))
-                x2, y2 = int(np.ceil(x_max)), int(np.ceil(y_max))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                mask = np.zeros((image_height, image_width), dtype=bool)
-                mask[y1:y2, x1:x2] = True
-                masks.append(mask)
-            if not masks:
-                return [], np.zeros((0,), dtype=np.float32)
-            return masks, np.asarray([float(mask.sum()) for mask in masks], dtype=np.float32)
+            if self.ignore_values is not None:
+                ignore_values_np = np.array(self.ignore_values)
+                mask = np.where(np.isin(mask, ignore_values_np), 0, mask)
+
+            if mask.ndim == 3 and self.ignore_channels is not None:
+                target_channels = np.array([ch for ch in range(mask.shape[-1]) if ch not in self.ignore_channels])
+                mask = np.take(mask, target_channels, axis=-1)
+
+            self.height = min(self.height, mask_height)
+            self.width = min(self.width, mask_width)
+            return mask
 
         def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
-            """Compute crop coordinates from annotation foreground."""
-            image_height, image_width = params["shape"][:2]
-            if image_height <= 0 or image_width <= 0:
-                return {"crop_coords": (0, 0, 0, 0)}
+            """Select random size and then delegate crop sampling to Albumentations."""
+            self._random_size()
+            mask = data.get("mask")
+            masks = data.get("masks")
+            if mask is None and masks is not None and len(masks) > 0:
+                mask = np.copy(masks[0])
+                for candidate in masks[1:]:
+                    mask |= candidate
+            if mask is None:
+                if self.allow_empty:
+                    return super().get_params_dependent_on_data(params, data)
+                image_height, image_width = params["shape"][:2]
+                return {"crop_coords": (0, 0, image_width, image_height)}
 
-            masks, areas = self._instance_masks_from_data(data, image_height, image_width)
-            if not masks:
-                crop_coords = (
-                    self._random_crop_coords(image_height, image_width)
-                    if self.allow_empty
-                    else self._full_image_crop(image_height, image_width)
-                )
-                return {"crop_coords": crop_coords}
-
-            mask = masks[self._sample_instance_index(areas)]
-            coords = np.argwhere(mask)
-            if coords.size == 0:
-                return {"crop_coords": self._full_image_crop(image_height, image_width)}
-            y, x = coords[self.py_random.randrange(len(coords))]
-            return {"crop_coords": self._crop_around_point(int(x), int(y), image_height, image_width)}
+            processed_mask = self._preprocess_mask(np.asarray(mask).copy())
+            if not self.allow_empty and not processed_mask.any():
+                image_height, image_width = params["shape"][:2]
+                return {"crop_coords": (0, 0, image_width, image_height)}
+            data = dict(data)
+            data["mask"] = processed_mask
+            return super().get_params_dependent_on_data(params, data)
 
 else:
-    SAHIMaskCrop = None  # type: ignore[assignment]
-
+    TiledCroppingWithMasks = None  # type: ignore[assignment]
 
 def _find_transform_by_name(transform: Any, name: str) -> Any | None:
     """Return the first transform with the requested class name, including nested containers."""
@@ -427,7 +390,7 @@ def _build_albu_transform(name: str, params: dict[str, Any]) -> alb.BasicTransfo
             raise ValueError(f"Unknown Albumentations container: {name!r}")
         return container_cls(transforms=nested_transforms, **other_params)
 
-    local_transforms = {"SAHIMaskCrop": SAHIMaskCrop}
+    local_transforms = {"TiledCroppingWithMasks": TiledCroppingWithMasks}
     aug_cls = local_transforms.get(name) or getattr(alb, name, None)
     if aug_cls is None:
         raise ValueError(f"Unknown Albumentations transform: {name!r}")
@@ -537,6 +500,518 @@ def _normalize_albu_params(name: str, params: dict[str, Any], aug_cls: type) -> 
     return normalized_params
 
 
+class CopyPaste:
+    """Copy annotated objects within the same image and paste them at new locations.
+
+    This target-aware transform works with RF-DETR's ``(PIL.Image, target)`` pipeline. It uses a dataset-provided
+    additional sample when one is available, falls back to same-image copy-paste otherwise, uses instance masks when
+    available, and falls back to rectangular bbox cutouts for detection-only datasets.
+    """
+
+    def __init__(
+        self,
+        p: float = 0.5,
+        max_paste_objects: int = 3,
+        paste_attempts: int = 20,
+        min_area: float = 1.0,
+        max_iou: float = 0.3,
+        use_masks: bool = True,
+        seed: int | None = None,
+    ) -> None:
+        """Initialize CopyPaste augmentation.
+
+        Args:
+            p: Probability of applying the augmentation.
+            max_paste_objects: Maximum number of source objects to paste when the augmentation fires.
+            paste_attempts: Number of random destination attempts per selected object.
+            min_area: Minimum pasted box area to keep.
+            max_iou: Maximum IoU allowed between a pasted box and existing boxes.
+            use_masks: When masks are present, paste only masked pixels and append pasted masks.
+            seed: Optional deterministic RNG seed for tests and reproducible experiments.
+        """
+        if not 0.0 <= p <= 1.0:
+            raise ValueError("CopyPaste p must be in [0, 1]")
+        if max_paste_objects <= 0:
+            raise ValueError("CopyPaste max_paste_objects must be positive")
+        if paste_attempts <= 0:
+            raise ValueError("CopyPaste paste_attempts must be positive")
+        self.p = float(p)
+        self.max_paste_objects = int(max_paste_objects)
+        self.paste_attempts = int(paste_attempts)
+        self.min_area = float(min_area)
+        self.max_iou = float(max_iou)
+        self.use_masks = bool(use_masks)
+        self._rng = np.random.default_rng(seed)
+        self._additional_sample_provider = None
+
+    def set_additional_sample_provider(self, provider: Any | None) -> None:
+        """Attach a callable that returns an additional ``(image, target)`` sample."""
+        self._additional_sample_provider = provider
+
+    @staticmethod
+    def _clip_boxes(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        """Clip XYXY boxes to image bounds."""
+        clipped = boxes.clone().to(dtype=torch.float32)
+        clipped[:, 0::2].clamp_(0, width)
+        clipped[:, 1::2].clamp_(0, height)
+        return clipped
+
+    @staticmethod
+    def _box_iou_one_to_many(box: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+        """Compute IoU between one XYXY box and many XYXY boxes."""
+        if boxes.numel() == 0:
+            return torch.zeros((0,), dtype=torch.float32)
+        lt = torch.maximum(box[:2], boxes[:, :2])
+        rb = torch.minimum(box[2:], boxes[:, 2:])
+        wh = (rb - lt).clamp(min=0)
+        intersection = wh[:, 0] * wh[:, 1]
+        box_area = (box[2] - box[0]).clamp(min=0) * (box[3] - box[1]).clamp(min=0)
+        boxes_area = (boxes[:, 2] - boxes[:, 0]).clamp(min=0) * (boxes[:, 3] - boxes[:, 1]).clamp(min=0)
+        union = box_area + boxes_area - intersection
+        return torch.where(union > 0, intersection / union, torch.zeros_like(union))
+
+    @staticmethod
+    def _mask_bounds(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+        """Return tight XYXY bounds for a binary mask."""
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0 or ys.size == 0:
+            return None
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+    def _source_object_bounds(
+        self,
+        box: torch.Tensor,
+        mask: np.ndarray | None,
+        width: int,
+        height: int,
+    ) -> tuple[int, int, int, int] | None:
+        """Return the source crop bounds for an object."""
+        if mask is not None and mask.any():
+            return self._mask_bounds(mask)
+        x1, y1, x2, y2 = box.round().to(dtype=torch.int64).tolist()
+        x1, x2 = max(0, x1), min(width, x2)
+        y1, y2 = max(0, y1), min(height, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2, y2
+
+    def _sample_destination(
+        self,
+        object_width: int,
+        object_height: int,
+        image_width: int,
+        image_height: int,
+        existing_boxes: torch.Tensor,
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """Sample a valid destination top-left and pasted box."""
+        if object_width <= 0 or object_height <= 0 or object_width > image_width or object_height > image_height:
+            return None
+        max_x = image_width - object_width
+        max_y = image_height - object_height
+        for _ in range(self.paste_attempts):
+            dst_x = int(self._rng.integers(0, max_x + 1)) if max_x > 0 else 0
+            dst_y = int(self._rng.integers(0, max_y + 1)) if max_y > 0 else 0
+            new_box = torch.tensor(
+                [dst_x, dst_y, dst_x + object_width, dst_y + object_height],
+                dtype=torch.float32,
+            )
+            ious = self._box_iou_one_to_many(new_box, existing_boxes)
+            max_iou = float(ious.max().item()) if ious.numel() > 0 else 0.0
+            if max_iou <= self.max_iou:
+                return dst_x, dst_y, new_box
+        return None
+
+    @staticmethod
+    def _append_tensor_field(value: torch.Tensor, appended: list[torch.Tensor]) -> torch.Tensor:
+        """Append per-instance tensor values preserving dtype and device."""
+        if not appended:
+            return value
+        return torch.cat([value, *[item.to(device=value.device, dtype=value.dtype) for item in appended]], dim=0)
+
+    @staticmethod
+    def _translate_keypoints(
+        keypoints: torch.Tensor,
+        source_index: int,
+        dx: int,
+        dy: int,
+        image_width: int,
+        image_height: int,
+    ) -> torch.Tensor:
+        """Copy one instance's keypoints and translate visible coordinates."""
+        pasted_keypoints = keypoints[source_index].clone()
+        visibility = None
+        if pasted_keypoints.ndim >= 2 and pasted_keypoints.shape[-1] >= 3:
+            visibility = pasted_keypoints[..., 2] > 0
+        if visibility is None:
+            pasted_keypoints[..., 0] = pasted_keypoints[..., 0] + dx
+            pasted_keypoints[..., 1] = pasted_keypoints[..., 1] + dy
+        else:
+            pasted_keypoints[..., 0] = torch.where(
+                visibility,
+                pasted_keypoints[..., 0] + dx,
+                pasted_keypoints[..., 0],
+            )
+            pasted_keypoints[..., 1] = torch.where(
+                visibility,
+                pasted_keypoints[..., 1] + dy,
+                pasted_keypoints[..., 1],
+            )
+        pasted_keypoints[..., 0].clamp_(0, image_width)
+        pasted_keypoints[..., 1].clamp_(0, image_height)
+        return pasted_keypoints.unsqueeze(0)
+
+    def __call__(
+        self, image: PIL.Image.Image, target: Optional[Dict[str, Any]] = None
+    ) -> Tuple[PIL.Image.Image, Optional[Dict[str, Any]]]:
+        """Apply CopyPaste using an additional sample when available."""
+        if target is None or self._rng.random() > self.p or "boxes" not in target or "labels" not in target:
+            return image, target
+
+        image_np = np.array(image).copy()
+        height, width = image_np.shape[:2]
+        boxes = self._clip_boxes(target["boxes"], width, height)
+        labels = target["labels"]
+        num_boxes = int(boxes.shape[0])
+
+        source_image = image
+        source_target = target
+        if self._additional_sample_provider is not None:
+            try:
+                provided = self._additional_sample_provider()
+            except Exception as exc:
+                logger.debug("CopyPaste additional sample provider failed: %s", exc)
+                provided = None
+            if provided is not None:
+                source_image, source_target = provided
+
+        source_image_np = np.array(source_image).copy()
+        source_height, source_width = source_image_np.shape[:2]
+        if source_target is None or "boxes" not in source_target or "labels" not in source_target:
+            return image, target
+        source_boxes = self._clip_boxes(source_target["boxes"], source_width, source_height)
+        source_labels = source_target["labels"]
+        source_num_boxes = int(source_boxes.shape[0])
+        if source_num_boxes == 0:
+            return image, target
+
+        masks_tensor = target.get("masks")
+        source_masks_tensor = source_target.get("masks")
+        masks_np = None
+        if (
+            self.use_masks
+            and torch.is_tensor(source_masks_tensor)
+            and source_masks_tensor.ndim == 3
+            and source_masks_tensor.shape[0] == source_num_boxes
+        ):
+            masks_np = source_masks_tensor.cpu().numpy().astype(bool, copy=False)
+
+        valid_areas = (source_boxes[:, 2] - source_boxes[:, 0]).clamp(min=0) * (
+            source_boxes[:, 3] - source_boxes[:, 1]
+        ).clamp(min=0)
+        valid_indices = torch.nonzero(valid_areas >= self.min_area, as_tuple=False).flatten().cpu().numpy()
+        if valid_indices.size == 0:
+            return image, target
+
+        num_to_paste = int(self._rng.integers(1, min(self.max_paste_objects, valid_indices.size) + 1))
+        source_indices = self._rng.choice(valid_indices, size=num_to_paste, replace=False)
+        existing_boxes = boxes.clone()
+        new_boxes: list[torch.Tensor] = []
+        new_labels: list[torch.Tensor] = []
+        new_masks: list[torch.Tensor] = []
+        new_area: list[torch.Tensor] = []
+        new_keypoints: list[torch.Tensor] = []
+        copied_fields: dict[str, list[torch.Tensor]] = {}
+        handled_fields = {"boxes", "labels", "masks", "area", "orig_size", "size", "image_id", "keypoints"}
+        keypoints_tensor = target.get("keypoints")
+        source_keypoints_tensor = source_target.get("keypoints")
+        has_keypoints = (
+            torch.is_tensor(keypoints_tensor)
+            and keypoints_tensor.ndim >= 2
+            and keypoints_tensor.shape[0] == num_boxes
+            and torch.is_tensor(source_keypoints_tensor)
+            and source_keypoints_tensor.ndim >= 2
+            and source_keypoints_tensor.shape[0] == source_num_boxes
+        )
+
+        for source_index in source_indices.tolist():
+            mask = masks_np[source_index] if masks_np is not None else None
+            bounds = self._source_object_bounds(source_boxes[source_index], mask, source_width, source_height)
+            if bounds is None:
+                continue
+            x1, y1, x2, y2 = bounds
+            object_width = x2 - x1
+            object_height = y2 - y1
+            if object_width * object_height < self.min_area:
+                continue
+            sampled = self._sample_destination(object_width, object_height, width, height, existing_boxes)
+            if sampled is None:
+                continue
+            dst_x, dst_y, new_box = sampled
+            object_pixels = source_image_np[y1:y2, x1:x2]
+            destination = image_np[dst_y : dst_y + object_height, dst_x : dst_x + object_width]
+
+            pasted_mask_tensor: torch.Tensor | None = None
+            if mask is not None:
+                object_mask = mask[y1:y2, x1:x2]
+                destination[object_mask] = object_pixels[object_mask]
+                pasted_mask = np.zeros((height, width), dtype=bool)
+                pasted_mask[dst_y : dst_y + object_height, dst_x : dst_x + object_width] = object_mask
+                pasted_mask_tensor = torch.as_tensor(pasted_mask, dtype=torch.bool)
+                tight_bounds = self._mask_bounds(pasted_mask)
+                if tight_bounds is None:
+                    continue
+                new_box = torch.tensor(tight_bounds, dtype=torch.float32)
+            else:
+                destination[:, :] = object_pixels
+                if torch.is_tensor(masks_tensor):
+                    pasted_mask = np.zeros((height, width), dtype=bool)
+                    pasted_mask[dst_y : dst_y + object_height, dst_x : dst_x + object_width] = True
+                    pasted_mask_tensor = torch.as_tensor(pasted_mask, dtype=torch.bool)
+
+            existing_boxes = torch.cat([existing_boxes, new_box.unsqueeze(0)], dim=0)
+            new_boxes.append(new_box.unsqueeze(0))
+            new_labels.append(source_labels[source_index].reshape(1))
+            if has_keypoints:
+                new_keypoints.append(
+                    self._translate_keypoints(
+                        source_keypoints_tensor,
+                        source_index,
+                        dst_x - x1,
+                        dst_y - y1,
+                        width,
+                        height,
+                    )
+                )
+            if pasted_mask_tensor is not None:
+                new_masks.append(pasted_mask_tensor.unsqueeze(0))
+            box_area = (new_box[2] - new_box[0]) * (new_box[3] - new_box[1])
+            new_area.append(box_area.reshape(1))
+
+            for key, value in source_target.items():
+                if key in handled_fields or key not in target:
+                    continue
+                base_value = target[key]
+                if (
+                    torch.is_tensor(value)
+                    and torch.is_tensor(base_value)
+                    and value.ndim >= 1
+                    and base_value.ndim >= 1
+                    and value.shape[0] == source_num_boxes
+                    and base_value.shape[0] == num_boxes
+                ):
+                    copied_fields.setdefault(key, []).append(value[source_index].unsqueeze(0))
+
+        if not new_boxes:
+            return image, target
+
+        target_out = target.copy()
+        target_out["boxes"] = torch.cat([boxes, *new_boxes], dim=0).to(dtype=torch.float32)
+        target_out["labels"] = self._append_tensor_field(labels, new_labels)
+        if "area" in target_out:
+            target_out["area"] = self._append_tensor_field(target_out["area"], new_area)
+        if torch.is_tensor(masks_tensor):
+            if new_masks:
+                target_out["masks"] = self._append_tensor_field(masks_tensor.bool(), new_masks)
+            else:
+                target_out["masks"] = masks_tensor.bool()
+        if has_keypoints:
+            target_out["keypoints"] = self._append_tensor_field(keypoints_tensor, new_keypoints)
+        for key, values in copied_fields.items():
+            target_out[key] = self._append_tensor_field(target_out[key], values)
+
+        return Image.fromarray(image_np), target_out
+
+
+class MixUp:
+    """Blend an image with an additional training sample and merge annotations.
+
+    This RF-DETR-native transform follows the DA-YOLO MixUp idea while keeping the
+    repository's ``(PIL.Image, target)`` transform interface. Datasets attach an
+    additional-sample provider before transforms run. When no provider is
+    attached, MixUp is a no-op.
+    """
+
+    def __init__(self, alpha: float = 1.0, p: float = 0.5, seed: int | None = None, **_: Any) -> None:
+        """Initialize MixUp augmentation.
+
+        Args:
+            alpha: Beta distribution parameter. ``0`` uses a fixed 0.5 blend.
+            p: Probability of applying the augmentation.
+            seed: Optional deterministic RNG seed.
+            **_: Ignored compatibility kwargs from Albumentations/DA-YOLO configs.
+        """
+        if alpha < 0:
+            raise ValueError(f"MixUp alpha must be >= 0, got {alpha}")
+        if not 0.0 <= p <= 1.0:
+            raise ValueError("MixUp p must be in [0, 1]")
+        self.alpha = float(alpha)
+        self.p = float(p)
+        self._rng = np.random.default_rng(seed)
+        self._additional_sample_provider = None
+
+    def set_additional_sample_provider(self, provider: Any | None) -> None:
+        """Attach a callable that returns an additional ``(image, target)`` sample."""
+        self._additional_sample_provider = provider
+
+    @staticmethod
+    def _scale_boxes(boxes: torch.Tensor, scale_x: float, scale_y: float, width: int, height: int) -> torch.Tensor:
+        """Scale absolute XYXY boxes and clip to the target image size."""
+        scaled = boxes.clone().to(dtype=torch.float32)
+        scaled[:, [0, 2]] *= float(scale_x)
+        scaled[:, [1, 3]] *= float(scale_y)
+        scaled[:, 0::2].clamp_(0, width)
+        scaled[:, 1::2].clamp_(0, height)
+        return scaled
+
+    @staticmethod
+    def _scale_keypoints(
+        keypoints: torch.Tensor,
+        scale_x: float,
+        scale_y: float,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        """Scale visible keypoints and clamp coordinates to the target image size."""
+        scaled = keypoints.clone().to(dtype=torch.float32)
+        visibility = scaled[..., 2] > 0 if scaled.shape[-1] >= 3 else torch.ones_like(scaled[..., 0], dtype=torch.bool)
+        scaled[..., 0] = torch.where(visibility, scaled[..., 0] * float(scale_x), scaled[..., 0])
+        scaled[..., 1] = torch.where(visibility, scaled[..., 1] * float(scale_y), scaled[..., 1])
+        scaled[..., 0].clamp_(0, width)
+        scaled[..., 1].clamp_(0, height)
+        return scaled
+
+    @staticmethod
+    def _resize_masks(masks: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        """Resize binary masks with nearest-neighbor interpolation."""
+        resized = []
+        for mask in masks.bool().cpu().numpy():
+            mask_image = Image.fromarray(mask.astype(np.uint8) * 255)
+            mask_image = mask_image.resize((width, height), resample=Image.Resampling.NEAREST)
+            resized.append(np.asarray(mask_image) > 0)
+        if not resized:
+            return torch.zeros((0, height, width), dtype=torch.bool)
+        return torch.as_tensor(np.stack(resized), dtype=torch.bool)
+
+    @staticmethod
+    def _append_tensor_field(value: torch.Tensor, appended: torch.Tensor) -> torch.Tensor:
+        """Append tensor values preserving dtype and device."""
+        return torch.cat([value, appended.to(device=value.device, dtype=value.dtype)], dim=0)
+
+    def _sample_lambda(self) -> float:
+        """Sample the MixUp blend weight."""
+        if self.alpha > 0:
+            return float(self._rng.beta(self.alpha, self.alpha))
+        return 0.5
+
+    def __call__(
+        self, image: PIL.Image.Image, target: Optional[Dict[str, Any]] = None
+    ) -> Tuple[PIL.Image.Image, Optional[Dict[str, Any]]]:
+        """Apply MixUp using a dataset-provided additional sample."""
+        if target is None or self._rng.random() > self.p or self._additional_sample_provider is None:
+            return image, target
+        if "boxes" not in target or "labels" not in target:
+            return image, target
+
+        try:
+            provided = self._additional_sample_provider()
+        except Exception as exc:
+            logger.debug("MixUp additional sample provider failed: %s", exc)
+            return image, target
+        if provided is None:
+            return image, target
+
+        mix_image, mix_target = provided
+        if mix_target is None or "boxes" not in mix_target or "labels" not in mix_target:
+            return image, target
+
+        image_np = np.array(image).copy()
+        mix_np = np.array(mix_image).copy()
+        height, width = image_np.shape[:2]
+        mix_height, mix_width = mix_np.shape[:2]
+        if height <= 0 or width <= 0 or mix_height <= 0 or mix_width <= 0:
+            return image, target
+
+        if (mix_width, mix_height) != (width, height):
+            mix_np = np.array(Image.fromarray(mix_np).resize((width, height), resample=Image.Resampling.BILINEAR))
+        scale_x = width / mix_width
+        scale_y = height / mix_height
+        lam = self._sample_lambda()
+        mixed_np = lam * image_np.astype(np.float32) + (1.0 - lam) * mix_np.astype(np.float32)
+        if image_np.dtype == np.uint8:
+            mixed_np = np.clip(mixed_np, 0, 255).astype(np.uint8)
+        else:
+            mixed_np = mixed_np.astype(image_np.dtype, copy=False)
+
+        target_out = target.copy()
+        boxes = target["boxes"].to(dtype=torch.float32)
+        mix_boxes = self._scale_boxes(mix_target["boxes"], scale_x, scale_y, width, height)
+        target_out["boxes"] = torch.cat([boxes, mix_boxes], dim=0)
+        target_out["labels"] = self._append_tensor_field(target["labels"], mix_target["labels"])
+
+        if "area" in target_out:
+            boxes_out = target_out["boxes"]
+            target_out["area"] = (boxes_out[:, 2] - boxes_out[:, 0]) * (boxes_out[:, 3] - boxes_out[:, 1])
+
+        target_masks = target.get("masks")
+        mix_masks = mix_target.get("masks")
+        if torch.is_tensor(target_masks) and torch.is_tensor(mix_masks) and mix_masks.ndim == 3:
+            resized_mix_masks = self._resize_masks(mix_masks, width, height)
+            target_out["masks"] = self._append_tensor_field(target_masks.bool(), resized_mix_masks)
+
+        target_keypoints = target.get("keypoints")
+        mix_keypoints = mix_target.get("keypoints")
+        if (
+            torch.is_tensor(target_keypoints)
+            and torch.is_tensor(mix_keypoints)
+            and target_keypoints.ndim >= 2
+            and mix_keypoints.ndim >= 2
+        ):
+            scaled_mix_keypoints = self._scale_keypoints(mix_keypoints, scale_x, scale_y, width, height)
+            target_out["keypoints"] = self._append_tensor_field(target_keypoints, scaled_mix_keypoints)
+
+        global_fields = {"boxes", "labels", "masks", "area", "orig_size", "size", "image_id", "keypoints"}
+        num_target = int(boxes.shape[0])
+        num_mix = int(mix_boxes.shape[0])
+        for key, value in mix_target.items():
+            if key in global_fields or key not in target:
+                continue
+            base_value = target[key]
+            if (
+                torch.is_tensor(base_value)
+                and torch.is_tensor(value)
+                and base_value.ndim >= 1
+                and value.ndim >= 1
+                and base_value.shape[0] == num_target
+                and value.shape[0] == num_mix
+            ):
+                target_out[key] = self._append_tensor_field(base_value, value)
+
+        return Image.fromarray(mixed_np), target_out
+
+
+def prepare_multi_image_augmentations(transforms: Any, dataset: Any, index: int) -> None:
+    """Attach dataset-backed additional-sample providers to multi-image transforms.
+
+    RF-DETR transform pipelines use the standard ``(image, target)`` callable
+    interface, which has no room for extra images. Datasets call this helper
+    immediately before applying transforms so native multi-image augmentations can
+    request an unaugmented, prepared sample from the same split.
+    """
+
+    def iter_transforms(transform: Any) -> Any:
+        yield transform
+        for child in getattr(transform, "transforms", []) or []:
+            yield from iter_transforms(child)
+
+    if not hasattr(dataset, "_get_additional_sample"):
+        return
+
+    for transform in iter_transforms(transforms):
+        setter = getattr(transform, "set_additional_sample_provider", None)
+        if setter is not None:
+            setter(lambda dataset=dataset, index=index: dataset._get_additional_sample(index))
+
+
 class AlbumentationsWrapper:
     """Wrapper to apply Albumentations transforms to (image, target) tuples.
 
@@ -582,6 +1057,9 @@ class AlbumentationsWrapper:
         self._is_geometric = _is_geometric_transform(transform)
         self._keypoint_flip_pairs = list(keypoint_flip_pairs or [])
         self._sahi_mask_crop = _find_transform_by_name(transform, "SAHIMaskCrop")
+        self._tiled_crop = _find_transform_by_name(transform, "TiledCroppingWithMasks")
+        self._mosaic_transform = _find_transform_by_name(transform, "Mosaic")
+        self._additional_sample_provider = None
 
         if self._is_geometric:
             # Wrap geometric transform with bbox handling capabilities
@@ -598,8 +1076,8 @@ class AlbumentationsWrapper:
                 bbox_params=alb.BboxParams(
                     format="pascal_voc",  # Boxes are in (x1, y1, x2, y2) format
                     label_fields=["category_ids", "idxs"],  # Track labels and indices for per-instance field sync
-                    min_visibility=getattr(self._sahi_mask_crop, "min_visibility", 0.0),
-                    min_area=getattr(self._sahi_mask_crop, "min_area", 0.0),
+                    min_visibility=getattr(self._tiled_crop, "min_visibility", 0.0),
+                    min_area=getattr(self._tiled_crop, "min_area", 0.0),
                     clip=True,  # Clip box coordinates to image boundaries after transformation
                 ),
                 keypoint_params=alb.KeypointParams(
@@ -634,6 +1112,29 @@ class AlbumentationsWrapper:
         transform_type = "geometric" if self._is_geometric else "pixel-level"
         return f"{self.__class__.__name__}(transform={transform}, type={transform_type})"
 
+    def set_additional_sample_provider(self, provider: Any | None) -> None:
+        """Attach a callable that returns an additional ``(image, target)`` sample."""
+        self._additional_sample_provider = provider
+
+    def _get_additional_samples(self, count: int) -> list[Tuple[PIL.Image.Image, Dict[str, Any]]]:
+        """Collect additional prepared samples for multi-image Albumentations transforms."""
+        samples: list[Tuple[PIL.Image.Image, Dict[str, Any]]] = []
+        if self._additional_sample_provider is None:
+            return samples
+        for _ in range(max(0, count)):
+            try:
+                provided = self._additional_sample_provider()
+            except Exception as exc:
+                logger.debug("AlbumentationsWrapper additional sample provider failed: %s", exc)
+                break
+            if provided is None:
+                break
+            sample_image, sample_target = provided
+            if sample_target is None or "boxes" not in sample_target or "labels" not in sample_target:
+                continue
+            samples.append((sample_image, sample_target))
+        return samples
+
     @staticmethod
     def _boxes_to_numpy(boxes: Tensor | np.ndarray) -> np.ndarray:
         """Convert boxes to numpy array and validate shape.
@@ -665,6 +1166,83 @@ class AlbumentationsWrapper:
                 f"keypoints first dimension must match number of boxes ({num_boxes}), got {keypoints_np.shape[0]}"
             )
         return keypoints_np
+
+    @staticmethod
+    def _stack_optional_instance_field(
+        targets: list[Dict[str, Any]],
+        field: str,
+        num_instances: list[int],
+    ) -> torch.Tensor | None:
+        """Stack a per-instance tensor field across targets when every target has it."""
+        values: list[torch.Tensor] = []
+        for target, expected in zip(targets, num_instances):
+            value = target.get(field)
+            if not torch.is_tensor(value) or value.ndim < 1 or value.shape[0] != expected:
+                return None
+            values.append(value)
+        return torch.cat(values, dim=0) if values else None
+
+    @staticmethod
+    def _filter_indices_by_valid_mask(values: Any, valid_mask: np.ndarray) -> Any:
+        """Filter tensors/lists/arrays by a bbox valid mask."""
+        if torch.is_tensor(values):
+            return values[torch.as_tensor(valid_mask, dtype=torch.bool, device=values.device)]
+        if isinstance(values, np.ndarray):
+            return values[valid_mask]
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            return [value for value, keep in zip(values, valid_mask.tolist()) if keep]
+        return values
+
+    @staticmethod
+    def _resize_sample_to_match(
+        image: PIL.Image.Image,
+        target: Dict[str, Any],
+        width: int,
+        height: int,
+    ) -> Tuple[PIL.Image.Image, Dict[str, Any]]:
+        """Resize a prepared sample and scale its annotations to match an image size."""
+        src_width, src_height = image.size
+        if (src_width, src_height) == (width, height):
+            return image, target
+        scale_x = width / src_width
+        scale_y = height / src_height
+        resized_image = image.resize((width, height), resample=Image.Resampling.BILINEAR)
+        resized_target = target.copy()
+        boxes = target["boxes"].clone().to(dtype=torch.float32)
+        boxes[:, [0, 2]] *= scale_x
+        boxes[:, [1, 3]] *= scale_y
+        boxes[:, 0::2].clamp_(0, width)
+        boxes[:, 1::2].clamp_(0, height)
+        resized_target["boxes"] = boxes
+        if "masks" in target and torch.is_tensor(target["masks"]):
+            masks = []
+            for mask in target["masks"].bool().cpu().numpy():
+                mask_image = Image.fromarray(mask.astype(np.uint8) * 255)
+                mask_image = mask_image.resize((width, height), resample=Image.Resampling.NEAREST)
+                masks.append(np.asarray(mask_image) > 0)
+            resized_target["masks"] = torch.as_tensor(np.stack(masks), dtype=torch.bool) if masks else target["masks"]
+        if "keypoints" in target and torch.is_tensor(target["keypoints"]):
+            keypoints = target["keypoints"].clone().to(dtype=torch.float32)
+            if keypoints.shape[-1] >= 3:
+                visible = keypoints[..., 2] > 0
+            else:
+                visible = torch.ones_like(keypoints[..., 0], dtype=torch.bool)
+            keypoints[..., 0] = torch.where(visible, keypoints[..., 0] * scale_x, keypoints[..., 0])
+            keypoints[..., 1] = torch.where(visible, keypoints[..., 1] * scale_y, keypoints[..., 1])
+            keypoints[..., 0].clamp_(0, width)
+            keypoints[..., 1].clamp_(0, height)
+            resized_target["keypoints"] = keypoints
+        return resized_image, resized_target
+
+    @staticmethod
+    def _build_dummy_albu_keypoints(idxs: List[int]) -> Dict[str, Any]:
+        """Build invisible placeholder keypoints for Albumentations Mosaic when targets have no keypoints."""
+        return {
+            "keypoints": [(0.0, 0.0) for _ in idxs],
+            "keypoint_instance_ids": [float(idx) for idx in idxs],
+            "keypoint_point_ids": [0.0 for _ in idxs],
+            "keypoint_visibility": [0.0 for _ in idxs],
+        }
 
     @staticmethod
     def _build_albu_keypoints(
@@ -726,6 +1304,19 @@ class AlbumentationsWrapper:
             params = replay.get("params") or {}
             return str(params.get("group_element")) == "h"
         return False
+
+    @staticmethod
+    def _boxes_to_foreground_mask(boxes_np: np.ndarray, height: int, width: int) -> np.ndarray:
+        """Build a binary foreground mask from absolute XYXY boxes."""
+        mask = np.zeros((height, width), dtype=np.uint8)
+        for box in boxes_np:
+            x1 = int(np.floor(max(0.0, float(box[0]))))
+            y1 = int(np.floor(max(0.0, float(box[1]))))
+            x2 = int(np.ceil(min(float(width), float(box[2]))))
+            y2 = int(np.ceil(min(float(height), float(box[3]))))
+            if x2 > x1 and y2 > y1:
+                mask[y1:y2, x1:x2] = 1
+        return mask
 
     @staticmethod
     def _rebuild_keypoints_from_albu(
@@ -933,6 +1524,8 @@ class AlbumentationsWrapper:
         """
         boxes_np = self._boxes_to_numpy(target["boxes"])
         num_boxes = boxes_np.shape[0]
+        merged_target = target
+        merged_num_boxes = num_boxes
         # Track indices to keep per-instance fields synchronized
         idxs = list(range(num_boxes))
         masks_list = None
@@ -959,12 +1552,87 @@ class AlbumentationsWrapper:
                 # idxs carries original indices so downstream _filter_per_instance_fields
                 # can correctly slice fields from the un-filtered target.
                 idxs = [idxs[i] for i in valid_positions]
+        mosaic_metadata: list[dict[str, Any]] = []
+        if self._mosaic_transform is not None:
+            grid_y, grid_x = getattr(self._mosaic_transform, "grid_yx", (2, 2))
+            additional_needed = max(0, int(grid_y) * int(grid_x) - 1)
+            height, width = image_np.shape[:2]
+            additional_samples = self._get_additional_samples(additional_needed)
+            all_targets = [target]
+            all_counts = [num_boxes]
+            merged_boxes = [target["boxes"]]
+            merged_labels = [target["labels"]]
+            merged_masks = [target["masks"]] if torch.is_tensor(target.get("masks")) else None
+            merged_keypoints = [target["keypoints"]] if torch.is_tensor(target.get("keypoints")) else None
+            offset = num_boxes
+            for sample_image, sample_target in additional_samples:
+                sample_image, sample_target = self._resize_sample_to_match(sample_image, sample_target, width, height)
+                sample_boxes_np = self._boxes_to_numpy(sample_target["boxes"])
+                sample_labels = (
+                    sample_target["labels"].cpu().tolist()
+                    if torch.is_tensor(sample_target["labels"])
+                    else list(sample_target["labels"])
+                )
+                sample_count = sample_boxes_np.shape[0]
+                sample_idxs = list(range(offset, offset + sample_count))
+                metadata_item: dict[str, Any] = {
+                    "image": np.array(sample_image),
+                    "bboxes": sample_boxes_np,
+                    "category_ids": sample_labels,
+                    "idxs": sample_idxs,
+                }
+                metadata_item.update(self._build_dummy_albu_keypoints(sample_idxs))
+                if "masks" in sample_target and torch.is_tensor(sample_target["masks"]):
+                    sample_masks_np = sample_target["masks"].cpu().numpy().astype(np.uint8, copy=False)
+                    metadata_item["masks"] = [mask for mask in sample_masks_np]
+                if keypoints_np is not None and "keypoints" in sample_target:
+                    sample_keypoints_np = self._keypoints_to_numpy(sample_target["keypoints"], sample_count)
+                    metadata_item.update(self._build_albu_keypoints(sample_keypoints_np, sample_idxs))
+                mosaic_metadata.append(metadata_item)
+                all_targets.append(sample_target)
+                all_counts.append(sample_count)
+                merged_boxes.append(sample_target["boxes"])
+                merged_labels.append(sample_target["labels"])
+                if merged_masks is not None and torch.is_tensor(sample_target.get("masks")):
+                    merged_masks.append(sample_target["masks"])
+                else:
+                    merged_masks = None
+                if merged_keypoints is not None and torch.is_tensor(sample_target.get("keypoints")):
+                    merged_keypoints.append(sample_target["keypoints"])
+                else:
+                    merged_keypoints = None
+                offset += sample_count
+            if mosaic_metadata:
+                merged_target = target.copy()
+                merged_target["boxes"] = torch.cat(merged_boxes, dim=0)
+                merged_target["labels"] = torch.cat(merged_labels, dim=0)
+                merged_num_boxes = int(merged_target["boxes"].shape[0])
+                stacked_area = self._stack_optional_instance_field(all_targets, "area", all_counts)
+                if stacked_area is not None:
+                    merged_target["area"] = stacked_area
+                stacked_iscrowd = self._stack_optional_instance_field(all_targets, "iscrowd", all_counts)
+                if stacked_iscrowd is not None:
+                    merged_target["iscrowd"] = stacked_iscrowd
+                if merged_masks is not None:
+                    merged_target["masks"] = torch.cat(merged_masks, dim=0)
+                    masks_list = [mask.cpu().numpy().astype(np.uint8, copy=False) for mask in merged_target["masks"]]
+                if merged_keypoints is not None:
+                    merged_target["keypoints"] = torch.cat(merged_keypoints, dim=0)
+                    keypoints_np = self._keypoints_to_numpy(merged_target["keypoints"], merged_num_boxes)
+
         # Apply transform
         transform_kwargs = {"image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs}
         if masks_list is not None and len(masks_list) > 0:
             transform_kwargs["masks"] = masks_list
+        elif self._tiled_crop is not None:
+            height, width = image_np.shape[:2]
+            transform_kwargs["mask"] = self._boxes_to_foreground_mask(boxes_np, height, width)
+        if mosaic_metadata:
+            transform_kwargs[getattr(self._mosaic_transform, "metadata_key", "mosaic_metadata")] = mosaic_metadata
         if keypoints_np is not None:
             transform_kwargs.update(self._build_albu_keypoints(keypoints_np, idxs))
+        elif self._mosaic_transform is not None:
+            transform_kwargs.update(self._build_dummy_albu_keypoints(idxs))
         else:
             transform_kwargs.update(
                 {
@@ -975,14 +1643,14 @@ class AlbumentationsWrapper:
                 }
             )
         augmented = self.transform(**transform_kwargs)
-        target_out: dict[str, Any] = target.copy()
+        target_out: Dict[str, Any] = merged_target.copy()
         bboxes_aug = augmented["bboxes"]
         kept_idxs = [int(idx) for idx in augmented.get("idxs", idxs)]
         # Update target with transformed boxes and labels
         if len(bboxes_aug) == 0:
             target_out["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
             target_out["labels"] = torch.zeros((0,), dtype=torch.long)
-            target_out.update(self._clear_per_instance_fields(target, num_boxes))
+            target_out.update(self._clear_per_instance_fields(merged_target, merged_num_boxes))
             # Override masks after _clear_per_instance_fields to ensure bool dtype.
             if "masks" in target:
                 aug_height, aug_width = augmented["image"].shape[:2]
@@ -990,7 +1658,7 @@ class AlbumentationsWrapper:
         else:
             target_out["boxes"] = torch.as_tensor(bboxes_aug, dtype=torch.float32).reshape(-1, 4)
             target_out["labels"] = torch.tensor(augmented["category_ids"], dtype=torch.long)
-            target_out.update(self._filter_per_instance_fields(target, num_boxes, kept_idxs))
+            target_out.update(self._filter_per_instance_fields(merged_target, merged_num_boxes, kept_idxs))
             # Recompute area from the transformed box coordinates so it stays consistent with
             # the new image scale (e.g. after resize the original COCO area values are stale).
             if "area" in target_out:
@@ -1013,12 +1681,13 @@ class AlbumentationsWrapper:
         if masks_list is not None and "masks" in augmented:
             height, width = augmented["image"].shape[:2]
             masks_aug = augmented["masks"]
-            masks_aug = [masks_aug[int(i)] for i in kept_idxs]
+            if len(masks_aug) > max(kept_idxs, default=-1):
+                masks_aug = [masks_aug[int(i)] for i in kept_idxs]
             if len(masks_aug) == 0:
                 target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
             else:
                 target_out["masks"] = torch.as_tensor(np.stack(masks_aug), dtype=torch.bool)
-            if self._sahi_mask_crop is not None:
+            if self._tiled_crop is not None:
                 target_out = self._tighten_boxes_from_masks(target_out)
         return image_out, target_out
 
@@ -1211,10 +1880,13 @@ class AlbumentationsWrapper:
             return []
 
         if alb is None:
-            raise ImportError(
-                "Albumentations is required to build RF-DETR dataset transforms. "
-                "Install the project dependencies with `uv sync --all-groups` or install albumentations."
-            )
+            non_native_entries = [next(iter(entry.keys())) for entry in entries if isinstance(entry, dict) and entry]
+            non_native_entries = [name for name in non_native_entries if name not in {"CopyPaste", "MixUp"}]
+            if non_native_entries:
+                raise ImportError(
+                    "Albumentations is required to build RF-DETR dataset transforms. "
+                    "Install the project dependencies with `uv sync --all-groups` or install albumentations."
+                )
 
         transforms = []
         for entry in entries:
@@ -1239,6 +1911,12 @@ class AlbumentationsWrapper:
                 continue
 
             try:
+                if aug_name == "CopyPaste":
+                    transforms.append(CopyPaste(**params))
+                    continue
+                if aug_name == "MixUp":
+                    transforms.append(MixUp(**params))
+                    continue
                 transform = _build_albu_transform(aug_name, params)
                 transforms.append(AlbumentationsWrapper(transform, keypoint_flip_pairs=keypoint_flip_pairs))
             except Exception as e:
@@ -1250,5 +1928,5 @@ class AlbumentationsWrapper:
                 )
                 continue
 
-        logger.info("Built %d Albumentations transforms from config", len(transforms))
+        logger.info("Built %d augmentation transforms from config", len(transforms))
         return transforms

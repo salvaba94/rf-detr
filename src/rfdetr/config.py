@@ -706,6 +706,7 @@ class TrainConfig(BaseConfig):
     tensorboard: bool = True
     wandb: bool = False
     mlflow: bool = False
+    mlflow_tracking_uri: Optional[str] = Field(default_factory=lambda: os.getenv("MLFLOW_TRACKING_URI"))
     clearml: bool = False  # Not yet implemented — reserved for future use.
     project: Optional[str] = None
     run: Optional[str] = None
@@ -950,3 +951,23 @@ class KeypointTrainConfig(TrainConfig):
     keypoint_nll_loss_coef: float = 1.0
     smooth_alpha: float = 0.5
     skip_best_epochs: int = Field(default=10, ge=0)
+
+
+RFDETRModelConfig: TypeAlias = Union[
+    ModelConfig,
+    RFDETRBaseConfig,
+    RFDETRLargeDeprecatedConfig,
+    RFDETRNanoConfig,
+    RFDETRSmallConfig,
+    RFDETRMediumConfig,
+    RFDETRLargeConfig,
+    RFDETRSegPreviewConfig,
+    RFDETRSegNanoConfig,
+    RFDETRSegSmallConfig,
+    RFDETRSegMediumConfig,
+    RFDETRSegLargeConfig,
+    RFDETRSegXLargeConfig,
+    RFDETRSeg2XLargeConfig,
+    RFDETRKeypointPreviewConfig,
+]
+RFDETRTrainConfig: TypeAlias = Union[TrainConfig, SegmentationTrainConfig, KeypointTrainConfig]

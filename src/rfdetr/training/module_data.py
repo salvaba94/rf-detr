@@ -5,6 +5,7 @@
 # ------------------------------------------------------------------------
 """LightningDataModule for RF-DETR dataset construction and loaders."""
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
@@ -14,7 +15,7 @@ from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import ModelConfig, TrainConfig
+from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
 from rfdetr.datasets import build_dataset
 from rfdetr.datasets.aug_configs import AUG_CONFIG
 from rfdetr.utilities.box_ops import box_xyxy_to_cxcywh
@@ -145,7 +146,7 @@ class RFDETRDataModule(LightningDataModule):
         train_config: Training hyperparameter configuration (used for dataset params).
     """
 
-    def __init__(self, model_config: ModelConfig, train_config: TrainConfig) -> None:
+    def __init__(self, model_config: RFDETRModelConfig, train_config: RFDETRTrainConfig) -> None:
         super().__init__()
         self.model_config = model_config
         self.train_config = train_config
@@ -176,6 +177,7 @@ class RFDETRDataModule(LightningDataModule):
         # where _kornia_pipeline stays None), preventing redundant re-runs on repeated
         # setup("fit") calls (e.g. during validation loops in some PTL strategies).
         self._kornia_setup_done: bool = False
+        self._dataset_grids_saved: bool = False
 
         self._num_workers: int = self.train_config.num_workers
 
@@ -242,6 +244,7 @@ class RFDETRDataModule(LightningDataModule):
             if not self._kornia_setup_done:
                 self._setup_kornia_pipeline()
                 self._kornia_setup_done = True
+            self._maybe_save_dataset_grids()
         elif stage == "validate":
             if self._dataset_val is None:
                 self._dataset_val = build_dataset("val", ns, resolution)
@@ -252,6 +255,25 @@ class RFDETRDataModule(LightningDataModule):
         elif stage == "predict":
             if self._dataset_val is None:
                 self._dataset_val = build_dataset("val", ns, resolution)
+
+    def _maybe_save_dataset_grids(self) -> None:
+        """Save train/validation sample grids once when enabled."""
+        if self._dataset_grids_saved or not self.train_config.save_dataset_grids:
+            return
+        self._dataset_grids_saved = True
+        if os.environ.get("LOCAL_RANK", "0") != "0":
+            return
+        try:
+            from rfdetr.datasets.save_grids import DatasetGridSaver
+
+            grids_output_dir = Path(self.train_config.output_dir) / "dataset_grids"
+            DatasetGridSaver(self.train_dataloader(), grids_output_dir, dataset_type="train").save_grid()
+            DatasetGridSaver(self.val_dataloader(), grids_output_dir, dataset_type="val").save_grid()
+        except Exception:
+            logger.warning(
+                "Failed to save dataset grids; training will continue without them.",
+                exc_info=True,
+            )
 
     def train_dataloader(self) -> DataLoader:
         """Return the training DataLoader.

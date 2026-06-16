@@ -115,3 +115,126 @@ class TestRFDETRCliArgumentLinking:
         match = next((lnk for lnk in links if lnk["source"] == source), None)
         assert match is not None, f"No link registered for source {source!r}"
         assert match["target"] == expected_target
+
+
+class TestRFDETRCliConfigParsing:
+    """RFDETRCli accepts the supported config file shapes."""
+
+    def _make_model_parser(self):
+        """Create a parser with the RFDETRModelModule arguments registered."""
+        from pytorch_lightning.cli import LightningArgumentParser
+
+        from rfdetr.training.module_model import RFDETRModelModule
+
+        parser = LightningArgumentParser(exit_on_error=False)
+        parser.add_lightning_class_args(RFDETRModelModule, "model")
+        return parser
+
+    def test_model_config_class_path_init_args_are_accepted(self):
+        """Variant model_config sections may use class_path/init_args."""
+        parser = self._make_model_parser()
+
+        parsed = parser.parse_object(
+            {
+                "model": {
+                    "model_config": {
+                        "class_path": "rfdetr.config.RFDETRNanoConfig",
+                        "init_args": {"num_classes": 6},
+                    },
+                    "train_config": {
+                        "class_path": "rfdetr.config.TrainConfig",
+                        "init_args": {"dataset_dir": "."},
+                    },
+                }
+            }
+        )
+
+        assert parsed.model.model_config.class_path == "rfdetr.config.RFDETRNanoConfig"
+        assert parsed.model.model_config.init_args.num_classes == 6
+        assert parsed.model.model_config.init_args.num_windows == 2
+        assert parsed.model.model_config.init_args.resolution == 384
+        assert parsed.model.model_config.init_args.positional_encoding_size == 24
+        assert parsed.model.model_config.init_args.num_queries == 300
+        assert parsed.model.model_config.init_args.num_select == 300
+        assert parsed.model.train_config.dataset_dir == "."
+
+    def test_flat_model_config_with_train_config_class_path_is_accepted(self):
+        """Custom base model_config sections may be flat while train_config uses class_path/init_args."""
+        parser = self._make_model_parser()
+
+        parsed = parser.parse_object(
+            {
+                "model": {
+                    "model_config": {
+                        "encoder": "dinov2_windowed_small",
+                        "out_feature_indexes": [3, 6, 9, 12],
+                        "dec_layers": 2,
+                        "projector_scale": ["P4"],
+                        "hidden_dim": 256,
+                        "patch_size": 16,
+                        "num_windows": 4,
+                        "sa_nheads": 8,
+                        "ca_nheads": 16,
+                        "dec_n_points": 2,
+                        "num_classes": 6,
+                        "resolution": 640,
+                        "positional_encoding_size": 40,
+                    },
+                    "train_config": {
+                        "class_path": "rfdetr.config.TrainConfig",
+                        "init_args": {"dataset_dir": ".", "batch_size": 32},
+                    },
+                }
+            }
+        )
+
+        assert parsed.model.model_config.resolution == 640
+        assert parsed.model.model_config.num_classes == 6
+        assert parsed.model.train_config.batch_size == 32
+
+
+class TestRFDETRCliTrainerInstantiation:
+    """RFDETRCli builds Trainer from RF-DETR TrainConfig semantics."""
+
+    def test_instantiate_trainer_uses_build_trainer_without_lightning_epoch_defaults(self):
+        """Lightning default max_epochs must not override TrainConfig.epochs."""
+        from types import SimpleNamespace
+        from unittest.mock import sentinel
+
+        from jsonargparse import Namespace
+
+        from rfdetr.config import RFDETRNanoConfig, TrainConfig
+        from rfdetr.training.cli import RFDETRCli
+
+        model_config = RFDETRNanoConfig(pretrain_weights=None)
+        train_config = TrainConfig(dataset_dir=".", epochs=10, grad_accum_steps=2)
+
+        cli = RFDETRCli.__new__(RFDETRCli)
+        cli.subcommand = None
+        cli.config_init = Namespace(
+            trainer=Namespace(
+                accelerator="gpu",
+                devices="auto",
+                max_epochs=1000,
+                accumulate_grad_batches=1,
+            )
+        )
+        cli.model = SimpleNamespace(model_config=model_config, train_config=train_config)
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            calls = []
+
+            def fake_build_trainer(*args, **kwargs):
+                calls.append((args, kwargs))
+                return sentinel.trainer
+
+            monkeypatch.setattr("rfdetr.training.cli.build_trainer", fake_build_trainer)
+            trainer = cli.instantiate_trainer()
+
+        assert trainer is sentinel.trainer
+        assert calls == [
+            (
+                (train_config, model_config),
+                {"accelerator": "gpu", "devices": "auto"},
+            )
+        ]

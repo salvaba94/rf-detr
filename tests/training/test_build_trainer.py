@@ -697,6 +697,35 @@ class TestBuildTrainerLoggers:
             )
         assert fake_logger in trainer.loggers
 
+    def test_mlflow_tracking_uri_wired(self, tmp_path):
+        """Configured MLflow tracking URI is passed to MLFlowLogger."""
+        import unittest.mock as mock
+
+        tracking_uri = "http://192.168.1.145:5000"
+        with mock.patch("rfdetr.training.trainer.MLFlowLogger") as mlflow_logger:
+            build_trainer(
+                _tc(tmp_path, mlflow=True, mlflow_tracking_uri=tracking_uri, use_ema=False),
+                _mc(),
+            )
+
+        mlflow_logger.assert_called_once()
+        assert mlflow_logger.call_args.kwargs["tracking_uri"] == tracking_uri
+
+    def test_mlflow_tracking_uri_reads_environment(self, tmp_path, monkeypatch):
+        """MLflow tracking URI defaults to MLFLOW_TRACKING_URI."""
+        import unittest.mock as mock
+
+        tracking_uri = "http://192.168.1.145:5000"
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", tracking_uri)
+        with mock.patch("rfdetr.training.trainer.MLFlowLogger") as mlflow_logger:
+            build_trainer(
+                _tc(tmp_path, mlflow=True, use_ema=False),
+                _mc(),
+            )
+
+        mlflow_logger.assert_called_once()
+        assert mlflow_logger.call_args.kwargs["tracking_uri"] == tracking_uri
+
     def test_missing_tensorboard_dep_warns_not_crashes(self, tmp_path):
         """If tensorboard package is absent, a warning is logged and training continues."""
         import unittest.mock as mock

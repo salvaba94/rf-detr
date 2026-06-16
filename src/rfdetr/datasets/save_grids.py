@@ -110,7 +110,8 @@ class DatasetGridSaver:
         h, w = int(resized_size[0]), int(resized_size[1])
 
         de_normalized_img = inv_normalize(single_image)
-        if isinstance(de_normalized_img, Tensor):
+        if isinstance(de_normalized_img, torch.Tensor):
+            de_normalized_img = de_normalized_img[:, :h, :w]
             de_normalized_img = de_normalized_img.detach().cpu().numpy()
         scene = PILImage.fromarray((np.clip(de_normalized_img.transpose(1, 2, 0), 0.0, 1.0) * 255).astype(np.uint8))
 

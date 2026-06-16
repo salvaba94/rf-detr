@@ -17,7 +17,7 @@ import torch.nn.functional as F  # noqa: N812 -- project-conventional alias (see
 from pytorch_lightning import LightningModule, seed_everything
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import ModelConfig, TrainConfig
+from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
@@ -47,7 +47,7 @@ class RFDETRModelModule(LightningModule):
         train_config: Training hyperparameter configuration.
     """
 
-    def __init__(self, model_config: ModelConfig, train_config: TrainConfig) -> None:
+    def __init__(self, model_config: RFDETRModelConfig, train_config: RFDETRTrainConfig) -> None:
         super().__init__()
         self.model_config = model_config
         self.train_config = train_config

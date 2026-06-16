@@ -386,6 +386,10 @@ def download_pretrain_weights(
                 logger.info(f"File {pretrain_weights} already exists with correct MD5 hash.")
         return
 
+    parent_dir = os.path.dirname(pretrain_weights)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
     logger.info(f"Downloading pretrained weights for {pretrain_weights}")
     _download_file(
         url=url,

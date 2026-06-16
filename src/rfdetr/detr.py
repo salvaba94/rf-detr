@@ -828,7 +828,11 @@ class RFDETR:
         # is not yet initialized here (it is set up inside trainer.fit()).  In Lightning DDP
         # subprocesses, LOCAL_RANK is set by the launcher before the subprocess calls train(),
         # so this correctly identifies rank 0 even before dist.init_process_group() runs.
-        if config.save_dataset_grids and os.environ.get("LOCAL_RANK", "0") == "0":
+        if (
+            config.save_dataset_grids
+            and os.environ.get("LOCAL_RANK", "0") == "0"
+            and not getattr(datamodule, "_dataset_grids_saved", False)
+        ):
             try:
                 from rfdetr.datasets.save_grids import DatasetGridSaver
 

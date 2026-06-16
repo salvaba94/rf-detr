@@ -179,6 +179,20 @@ class TestDownloadPretrainWeights:
         # Should not download if file exists (no MD5 to validate)
         mock_file_operations["download"].assert_not_called()
 
+    def test_download_creates_parent_directory(self, tmp_path):
+        """Missing parent directories are created before downloading a known model."""
+        target_path = tmp_path / "missing" / "rf-detr-base.pth"
+
+        with (
+            patch("rfdetr.assets.model_weights.os.path.exists", return_value=False),
+            patch("rfdetr.assets.model_weights._download_file") as mock_download,
+        ):
+            download_pretrain_weights(str(target_path))
+
+        assert target_path.parent.is_dir()
+        mock_download.assert_called_once()
+        assert mock_download.call_args[1]["filename"] == str(target_path)
+
 
 class TestDownloadIntegration:
     """Integration tests for the complete download flow."""

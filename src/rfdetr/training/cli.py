@@ -17,10 +17,39 @@ signature.  ``link_arguments`` eliminates the duplication so the user specifies 
 receives the same values automatically at parse time.
 """
 
+from typing import Any
+
+from pytorch_lightning import Trainer
 from pytorch_lightning.cli import LightningArgumentParser, LightningCLI
 
 from rfdetr.training.module_data import RFDETRDataModule
 from rfdetr.training.module_model import RFDETRModelModule
+from rfdetr.training.trainer import build_trainer
+
+
+_TRAINER_PASSTHROUGH_KEYS = (
+    "devices",
+    "num_nodes",
+    "strategy",
+    "fast_dev_run",
+    "limit_train_batches",
+    "limit_val_batches",
+    "limit_test_batches",
+    "limit_predict_batches",
+    "overfit_batches",
+    "val_check_interval",
+    "check_val_every_n_epoch",
+    "num_sanity_val_steps",
+    "log_every_n_steps",
+    "enable_checkpointing",
+    "enable_model_summary",
+    "profiler",
+    "detect_anomaly",
+    "barebones",
+    "plugins",
+    "reload_dataloaders_every_n_epochs",
+    "default_root_dir",
+)
 
 
 class RFDETRCli(LightningCLI):
@@ -44,6 +73,36 @@ class RFDETRCli(LightningCLI):
         """
         parser.link_arguments("model.model_config", "data.model_config", apply_on="parse")
         parser.link_arguments("model.train_config", "data.train_config", apply_on="parse")
+
+    def instantiate_trainer(self, **kwargs: Any) -> Trainer:
+        """Instantiate the RF-DETR trainer from ``TrainConfig``.
+
+        LightningCLI's default trainer construction only reads the top-level
+        ``trainer`` section. RF-DETR's public configs put training semantics
+        such as ``epochs``, ``grad_accum_steps``, callbacks, loggers, and EMA
+        under ``model.train_config``. Route construction through
+        :func:`rfdetr.training.trainer.build_trainer` so the CLI behaves like
+        the Python ``RFDETR.train()`` path.
+
+        Args:
+            **kwargs: Extra trainer arguments supplied by LightningCLI internals.
+
+        Returns:
+            A configured PyTorch Lightning Trainer.
+        """
+        trainer_config = {**self._get(self.config_init, "trainer", default={}), **kwargs}
+        trainer_kwargs = {
+            key: trainer_config[key]
+            for key in _TRAINER_PASSTHROUGH_KEYS
+            if key in trainer_config and trainer_config[key] is not None
+        }
+        accelerator = trainer_config.get("accelerator")
+        return build_trainer(
+            self.model.train_config,
+            self.model.model_config,
+            accelerator=accelerator,
+            **trainer_kwargs,
+        )
 
 
 def main() -> None:

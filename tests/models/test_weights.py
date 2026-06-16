@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
-from rfdetr.config import RFDETRBaseConfig, TrainConfig
+from rfdetr.config import RFDETRBaseConfig, RFDETRNanoConfig, TrainConfig
 from rfdetr.models.weights import _warn_on_partial_load
 
 # ---------------------------------------------------------------------------
@@ -122,6 +122,25 @@ class TestLoadPretrainWeightsReinitScenarios:
             "A second reinit to 91 would destroy loaded fine-tuned weights."
         )
         assert mc.num_classes == 2, "Auto-aligned checkpoint class count must be persisted back onto ModelConfig."
+
+    def test_default_bare_pretrain_weights_resolve_to_rf_home(self, monkeypatch, tmp_path):
+        """Default variant weight filenames are downloaded through the RF_HOME cache directory."""
+        from rfdetr.models.weights import load_pretrain_weights
+
+        monkeypatch.setenv("RF_HOME", str(tmp_path))
+        downloaded = []
+        monkeypatch.setattr("rfdetr.models.weights.download_pretrain_weights", lambda path, **kw: downloaded.append(path))
+        checkpoint = _make_checkpoint(num_classes=91, num_queries=300, group_detr=13)
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+
+        mc = RFDETRNanoConfig(device="cpu")
+        nn_model = _fake_nn_model()
+
+        load_pretrain_weights(nn_model, mc)
+
+        expected_path = str(tmp_path / "rf-detr-nano.pth")
+        assert downloaded == [expected_path]
+        assert mc.pretrain_weights == expected_path
 
     def test_characterization_backbone_pretrain_two_reinits(self, monkeypatch, tmp_path):
         """Backbone pretrain (more classes in checkpoint) + explicit small num_classes → 2 reinits.

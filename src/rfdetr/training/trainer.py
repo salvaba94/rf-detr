@@ -454,11 +454,15 @@ def build_trainer(
 
     if tc.mlflow:
         try:
+            mlflow_kwargs = {}
+            if tc.mlflow_tracking_uri is not None:
+                mlflow_kwargs["tracking_uri"] = tc.mlflow_tracking_uri
             loggers.append(
                 MLFlowLogger(
                     experiment_name=tc.project or "rfdetr",
                     run_name=tc.run,
                     save_dir=tc.output_dir,
+                    **mlflow_kwargs,
                 )
             )
         except ModuleNotFoundError as exc:

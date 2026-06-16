@@ -12,7 +12,14 @@ Pass `aug_config` to your training call. Import one of the built-in presets:
 
 ```python
 from rfdetr import RFDETRSmall
-from rfdetr.datasets.aug_configs import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL, AUG_SAHI
+from rfdetr.datasets.aug_configs import (
+    AUG_AGGRESSIVE,
+    AUG_AERIAL,
+    AUG_CONSERVATIVE,
+    AUG_COPY_PASTE,
+    AUG_INDUSTRIAL,
+    AUG_SAHI,
+)
 
 model = RFDETRSmall()
 model.train(dataset_dir="path/to/dataset", epochs=100, aug_config=AUG_CONSERVATIVE)
@@ -43,6 +50,7 @@ To disable augmentations: `aug_config={}`. Omitting it uses the default (horizon
 | `AUG_AERIAL`       | Satellite / overhead imagery      |
 | `AUG_INDUSTRIAL`   | Manufacturing / inspection data   |
 | `AUG_SAHI`         | SAHI-style sliced inference       |
+| `AUG_COPY_PASTE`   | Datasets with sparse small objects |
 
 Most presets are plain dicts; `AUG_SAHI` uses list format to preserve ordering. Inspect or extend them before passing:
 
@@ -63,8 +71,9 @@ model.train(dataset_dir="...", aug_config=my_config)
 
 ## SAHI-Style Crops
 
-Use `SAHIMaskCrop` when deployment will use sliced or tiled inference. The crop is sampled from foreground derived
-from ground-truth boxes, and if instance masks are present, boxes are tightened to the visible mask after cropping.
+Use `TiledCroppingWithMasks` when deployment will use sliced or tiled inference. The crop is sampled from foreground derived
+from ground-truth boxes, keypoints are translated through RF-DETR's standard Albumentations keypoint interface, and if
+instance masks are present, boxes are tightened to the visible mask after cropping.
 
 ```python
 from rfdetr.datasets.aug_configs import AUG_SAHI
@@ -81,13 +90,63 @@ For a custom crop size:
 
 ```python
 aug_config = [
-    {"SAHIMaskCrop": {"height": 640, "width": 640, "p": 0.5}},
+    {"TiledCroppingWithMasks": {"height": 640, "width": 640, "p": 0.5}},
     {"HorizontalFlip": {"p": 0.5}},
 ]
 ```
 
-`SAHIMaskCrop` is CPU-only in this version. Use `augmentation_backend="cpu"`; the Kornia GPU backend reports it as
+`TiledCroppingWithMasks` also accepts DA-YOLO-style tiled-cropping parameters: `target_size`, `height_range`, and
+`width_range`.
+
+`TiledCroppingWithMasks` is CPU-only in this version. Use `augmentation_backend="cpu"`; the Kornia GPU backend reports it as
 unsupported.
+
+## CopyPaste
+
+Use `CopyPaste` to duplicate annotated objects from another training image when the dataset supports multi-image
+augmentation. If no additional sample provider is attached, it falls back to same-image copy-paste. If instance masks
+are present, only masked pixels are pasted and the pasted box is tightened to the pasted mask. For bounding-box-only
+datasets, rectangular box cutouts are pasted instead.
+
+```python
+aug_config = [
+    {"CopyPaste": {"p": 0.3, "max_paste_objects": 3, "max_iou": 0.3}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+```
+
+`CopyPaste` is a native RF-DETR target-aware transform, so keep `augmentation_backend="cpu"` when using it. For
+keypoint targets, pasted instances receive a translated copy of the source instance keypoints while preserving
+invisible keypoints. COCO and YOLO datasets attach an additional-sample provider automatically before transforms run.
+
+## MixUp
+
+Use `MixUp` to blend another training image into the current sample and append its annotations. COCO and YOLO datasets
+attach the additional-sample provider automatically before transforms run.
+
+```python
+aug_config = [
+    {"MixUp": {"p": 0.3, "alpha": 1.0}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+```
+
+`MixUp` is CPU-only and uses RF-DETR's native target-aware transform interface.
+
+## Mosaic
+
+Use Albumentations `Mosaic` to combine the current sample with additional training images in a tiled layout. COCO and
+YOLO datasets attach provider samples automatically before transforms run.
+
+```python
+aug_config = [
+    {"Mosaic": {"grid_yx": (2, 2), "target_size": (640, 640), "cell_shape": (360, 360), "p": 0.5}},
+    {"HorizontalFlip": {"p": 0.5}},
+]
+```
+
+`Mosaic` is CPU-only in RF-DETR's augmentation stack and is rejected by the Kornia GPU backend like other unsupported
+custom/multi-image augmentations.
 
 ## Nested Transforms
 
