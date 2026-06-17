@@ -19,6 +19,7 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,12 @@ from torch import Tensor
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
 from rfdetr.datasets.aug_configs import AUG_CONFIG
-from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize, prepare_multi_image_augmentations
+from rfdetr.datasets.transforms import (
+    AlbumentationsWrapper,
+    Normalize,
+    UseTransformedSizeAsOrigSize,
+    prepare_multi_image_augmentations,
+)
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -268,6 +274,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             cat2label=self.cat2label,
             num_keypoints_per_class=num_keypoints_per_class,
         )
+        self._recent_additional_indices: deque[int] = deque(maxlen=128)
 
     def _load_prepared_sample(self, idx: int) -> Tuple[Any, Any]:
         """Load one sample and convert annotations without applying augmentations."""
@@ -276,18 +283,44 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         target = {"image_id": image_id, "annotations": target}
         return self.prepare(img, target)
 
-    def _get_additional_sample(self, idx: int) -> Tuple[Any, Any] | None:
-        """Return a random different prepared sample for multi-image augmentations."""
+    def _sample_additional_index(self, idx: int, exclude_indices: Optional[set[int]] = None) -> Optional[int]:
+        """Sample a diverse additional index for multi-image augmentations."""
         if len(self.ids) <= 1:
             return None
-        sample_idx = idx
-        for _ in range(10):
+        excluded = {idx, *(exclude_indices or set())}
+        recent_excluded = set(self._recent_additional_indices)
+        if len(excluded | recent_excluded) < len(self.ids):
+            excluded |= recent_excluded
+        for _ in range(32):
             sample_idx = int(torch.randint(0, len(self.ids), ()).item())
-            if sample_idx != idx:
-                break
-        if sample_idx == idx:
-            sample_idx = (idx + 1) % len(self.ids)
-        return self._load_prepared_sample(sample_idx)
+            if sample_idx not in excluded:
+                self._recent_additional_indices.append(sample_idx)
+                return sample_idx
+        candidates = [sample_idx for sample_idx in range(len(self.ids)) if sample_idx not in excluded]
+        if not candidates:
+            candidates = [sample_idx for sample_idx in range(len(self.ids)) if sample_idx != idx]
+        if not candidates:
+            return None
+        choice = candidates[int(torch.randint(0, len(candidates), ()).item())]
+        self._recent_additional_indices.append(choice)
+        return choice
+
+    def _get_additional_sample_info(
+        self, idx: int, exclude_indices: Optional[set[int]] = None
+    ) -> Tuple[int, Tuple[Any, Any]] | None:
+        """Return a random prepared sample and its index for multi-image augmentations."""
+        sample_idx = self._sample_additional_index(idx, exclude_indices=exclude_indices)
+        if sample_idx is None:
+            return None
+        return sample_idx, self._load_prepared_sample(sample_idx)
+
+    def _get_additional_sample(self, idx: int, exclude_indices: Optional[set[int]] = None) -> Tuple[Any, Any] | None:
+        """Return a random different prepared sample for multi-image augmentations."""
+        sampled = self._get_additional_sample_info(idx, exclude_indices=exclude_indices)
+        if sampled is None:
+            return None
+        _, sample = sampled
+        return sample
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         img, target = self._load_prepared_sample(idx)
@@ -522,6 +555,19 @@ def _build_train_resize_config(
     return [{"OneOf": {"transforms": [option_a, option_b]}}]
 
 
+def _last_aug_config_transform_name(config: Any) -> Optional[str]:
+    """Return the final top-level transform name in an augmentation config."""
+    if not config:
+        return None
+    if isinstance(config, dict):
+        return next(reversed(config), None)
+    if isinstance(config, list):
+        last_item = config[-1]
+        if isinstance(last_item, dict) and last_item:
+            return next(iter(last_item))
+    return None
+
+
 def make_coco_transforms(
     image_set: str,
     resolution: int,
@@ -530,7 +576,8 @@ def make_coco_transforms(
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-    aug_config: dict[str, dict[str, Any]] | None = None,
+    aug_config: dict[str, Any] | list[dict[str, Any]] | None = None,
+    eval_aug_config: dict[str, Any] | list[dict[str, Any]] | None = None,
     gpu_postprocess: bool = False,
     keypoint_flip_pairs: list[int] | None = None,
 ) -> Compose:
@@ -618,7 +665,14 @@ def make_coco_transforms(
                 {"LongestMaxSize": {"max_size": 1333}},
             ]
         )
-        return Compose([*resize_wrappers, to_image, to_float, normalize])
+        pipeline = [*resize_wrappers]
+        if eval_aug_config is not None:
+            pipeline += [
+                *AlbumentationsWrapper.from_config(eval_aug_config, keypoint_flip_pairs=keypoint_flip_pairs),
+                UseTransformedSizeAsOrigSize(),
+            ]
+        pipeline += [to_image, to_float, normalize]
+        return Compose(pipeline)
     if image_set == "val_speed":
         resize_wrappers = AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution}}])
         return Compose([*resize_wrappers, to_image, to_float, normalize])
@@ -634,7 +688,8 @@ def make_coco_transforms_square_div_64(
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-    aug_config: dict[str, dict[str, Any]] | None = None,
+    aug_config: dict[str, Any] | list[dict[str, Any]] | None = None,
+    eval_aug_config: dict[str, Any] | list[dict[str, Any]] | None = None,
     gpu_postprocess: bool = False,
     keypoint_flip_pairs: list[int] | None = None,
 ) -> Compose:
@@ -694,6 +749,12 @@ def make_coco_transforms_square_div_64(
                 resolved_aug_config, keypoint_flip_pairs=keypoint_flip_pairs
             )
             pipeline += [*aug_wrappers]
+            if skip_random_resize and _last_aug_config_transform_name(resolved_aug_config) != "Resize":
+                restore_size_wrappers = AlbumentationsWrapper.from_config(
+                    [{"Resize": {"height": resolution, "width": resolution, "p": 1.0}}],
+                    keypoint_flip_pairs=keypoint_flip_pairs,
+                )
+                pipeline += [*restore_size_wrappers]
         pipeline += [to_image, to_float]
         if not gpu_postprocess:
             pipeline += [normalize]
@@ -701,7 +762,22 @@ def make_coco_transforms_square_div_64(
 
     if image_set in ("val", "test", "val_speed"):
         resize_wrappers = AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution}}])
-        return Compose([*resize_wrappers, to_image, to_float, normalize])
+        if eval_aug_config is None:
+            return Compose([*resize_wrappers, to_image, to_float, normalize])
+
+        # Mirror the training crop canvas when batch-level multiscale is active:
+        # resize to the deterministic largest training scale, then apply the
+        # evaluation crop, then restore model input size if the eval config did
+        # not already do so. Evaluation is crop-space, so orig_size=size.
+        eval_canvas = scales[-1] if multi_scale and skip_random_resize else resolution
+        pipeline = [*AlbumentationsWrapper.from_config([{"Resize": {"height": eval_canvas, "width": eval_canvas}}])]
+        pipeline += [*AlbumentationsWrapper.from_config(eval_aug_config, keypoint_flip_pairs=keypoint_flip_pairs)]
+        if _last_aug_config_transform_name(eval_aug_config) != "Resize":
+            pipeline += [
+                *AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution, "p": 1.0}}])
+            ]
+        pipeline += [UseTransformedSizeAsOrigSize(), to_image, to_float, normalize]
+        return Compose(pipeline)
 
     raise ValueError(f"unknown {image_set}")
 
@@ -728,6 +804,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     include_keypoints = has_keypoints
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
     aug_config = getattr(args, "aug_config", None)
+    eval_aug_config = getattr(args, "eval_aug_config", None)
     keypoint_flip_pairs: list[int] = getattr(args, "keypoint_flip_pairs", []) or []
     augmentation_backend = getattr(args, "augmentation_backend", "cpu")
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(augmentation_backend)
@@ -752,6 +829,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 patch_size=args.patch_size,
                 num_windows=args.num_windows,
                 aug_config=aug_config,
+                eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
             ),
@@ -777,6 +855,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 patch_size=args.patch_size,
                 num_windows=args.num_windows,
                 aug_config=aug_config,
+                eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
             ),
@@ -834,6 +913,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
     keypoint_flip_pairs: list[int] = getattr(args, "keypoint_flip_pairs", []) or []
     aug_config = getattr(args, "aug_config", None)
+    eval_aug_config = getattr(args, "eval_aug_config", None)
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
     gpu_postprocess = resolved_augmentation_backend != "cpu"
 
@@ -851,6 +931,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
             ),
@@ -873,6 +954,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
             ),

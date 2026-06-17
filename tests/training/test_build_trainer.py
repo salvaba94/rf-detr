@@ -23,6 +23,7 @@ from rfdetr.training.callbacks.best_model import BestModelCallback, RFDETREarlyS
 from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
 from rfdetr.training.callbacks.drop_schedule import DropPathCallback
 from rfdetr.training.callbacks.ema import RFDETREMACallback
+from rfdetr.training.callbacks.mlflow import RFDETRMLflowArtifactCallback
 
 
 def _mc(**kwargs):
@@ -690,19 +691,85 @@ class TestBuildTrainerLoggers:
         from pytorch_lightning.loggers import MLFlowLogger
 
         fake_logger = mock.MagicMock(spec=MLFlowLogger)
-        with mock.patch("rfdetr.training.trainer.MLFlowLogger", return_value=fake_logger):
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger", return_value=fake_logger),
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics"),
+        ):
             trainer = build_trainer(
                 _tc(tmp_path, mlflow=True, use_ema=False),
                 _mc(),
             )
         assert fake_logger in trainer.loggers
 
+    def test_mlflow_artifact_callback_wired(self, tmp_path):
+        """RF-DETR MLflow artifact callback is added when mlflow artifact logging is enabled."""
+        import unittest.mock as mock
+
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger"),
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics"),
+        ):
+            trainer = build_trainer(
+                _tc(tmp_path, mlflow=True, mlflow_log_artifacts=True, use_ema=False),
+                _mc(),
+            )
+
+        assert any(isinstance(cb, RFDETRMLflowArtifactCallback) for cb in trainer.callbacks)
+
+    def test_mlflow_artifact_callback_can_be_disabled(self, tmp_path):
+        """MLflow metric logging can remain enabled while RF-DETR artifact uploads are disabled."""
+        import unittest.mock as mock
+
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger"),
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics"),
+        ):
+            trainer = build_trainer(
+                _tc(tmp_path, mlflow=True, mlflow_log_artifacts=False, use_ema=False),
+                _mc(),
+            )
+
+        assert all(not isinstance(cb, RFDETRMLflowArtifactCallback) for cb in trainer.callbacks)
+
+    def test_mlflow_system_metrics_enabled(self, tmp_path):
+        """MLflow system metrics logging is enabled when requested."""
+        import unittest.mock as mock
+
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger"),
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics") as enable_system_metrics,
+        ):
+            build_trainer(
+                _tc(tmp_path, mlflow=True, mlflow_log_system_metrics=True, use_ema=False),
+                _mc(),
+            )
+
+        enable_system_metrics.assert_called_once()
+
+    def test_mlflow_system_metrics_can_be_disabled(self, tmp_path):
+        """MLflow system metrics logging can be disabled independently of MLflow metrics."""
+        import unittest.mock as mock
+
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger"),
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics") as enable_system_metrics,
+        ):
+            build_trainer(
+                _tc(tmp_path, mlflow=True, mlflow_log_system_metrics=False, use_ema=False),
+                _mc(),
+            )
+
+        enable_system_metrics.assert_not_called()
+
     def test_mlflow_tracking_uri_wired(self, tmp_path):
         """Configured MLflow tracking URI is passed to MLFlowLogger."""
         import unittest.mock as mock
 
         tracking_uri = "http://192.168.1.145:5000"
-        with mock.patch("rfdetr.training.trainer.MLFlowLogger") as mlflow_logger:
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger") as mlflow_logger,
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics"),
+        ):
             build_trainer(
                 _tc(tmp_path, mlflow=True, mlflow_tracking_uri=tracking_uri, use_ema=False),
                 _mc(),
@@ -717,7 +784,10 @@ class TestBuildTrainerLoggers:
 
         tracking_uri = "http://192.168.1.145:5000"
         monkeypatch.setenv("MLFLOW_TRACKING_URI", tracking_uri)
-        with mock.patch("rfdetr.training.trainer.MLFlowLogger") as mlflow_logger:
+        with (
+            mock.patch("rfdetr.training.trainer.MLFlowLogger") as mlflow_logger,
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics"),
+        ):
             build_trainer(
                 _tc(tmp_path, mlflow=True, use_ema=False),
                 _mc(),
@@ -788,6 +858,7 @@ class TestBuildTrainerLoggers:
             mock.patch("rfdetr.training.trainer._try_import_tensorboard_summary_writer"),
             mock.patch("rfdetr.training.trainer.TensorBoardLogger", return_value=fake_tb),
             mock.patch("rfdetr.training.trainer.MLFlowLogger", return_value=fake_mlflow),
+            mock.patch("rfdetr.training.trainer._enable_mlflow_system_metrics"),
         ):
             trainer = build_trainer(
                 _tc(tmp_path, tensorboard=True, mlflow=True, use_ema=False),

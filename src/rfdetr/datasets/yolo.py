@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -785,6 +786,7 @@ class YoloDetection(VisionDataset):
 
         self.classes = self.sv_dataset.classes
         self.ids = list(range(len(self.sv_dataset)))
+        self._recent_additional_indices: deque[int] = deque(maxlen=128)
 
         # Create COCO-compatible API for evaluation
         self.coco = _build_coco_api_from_samples(self.classes, self.sv_dataset, self.keypoint_schema)
@@ -802,18 +804,44 @@ class YoloDetection(VisionDataset):
             target["keypoints"] = self.sv_dataset.get_image_info(idx).keypoints
         return self.prepare(img, target)
 
-    def _get_additional_sample(self, idx: int) -> tuple[Any, Any] | None:
-        """Return a random different prepared sample for multi-image augmentations."""
+    def _sample_additional_index(self, idx: int, exclude_indices: set[int] | None = None) -> int | None:
+        """Sample a diverse additional index for multi-image augmentations."""
         if len(self.ids) <= 1:
             return None
-        sample_idx = idx
-        for _ in range(10):
+        excluded = {idx, *(exclude_indices or set())}
+        recent_excluded = set(self._recent_additional_indices)
+        if len(excluded | recent_excluded) < len(self.ids):
+            excluded |= recent_excluded
+        for _ in range(32):
             sample_idx = int(torch.randint(0, len(self.ids), ()).item())
-            if sample_idx != idx:
-                break
-        if sample_idx == idx:
-            sample_idx = (idx + 1) % len(self.ids)
-        return self._load_prepared_sample(sample_idx)
+            if sample_idx not in excluded:
+                self._recent_additional_indices.append(sample_idx)
+                return sample_idx
+        candidates = [sample_idx for sample_idx in range(len(self.ids)) if sample_idx not in excluded]
+        if not candidates:
+            candidates = [sample_idx for sample_idx in range(len(self.ids)) if sample_idx != idx]
+        if not candidates:
+            return None
+        choice = candidates[int(torch.randint(0, len(candidates), ()).item())]
+        self._recent_additional_indices.append(choice)
+        return choice
+
+    def _get_additional_sample_info(
+        self, idx: int, exclude_indices: set[int] | None = None
+    ) -> tuple[int, tuple[Any, Any]] | None:
+        """Return a random prepared sample and its index for multi-image augmentations."""
+        sample_idx = self._sample_additional_index(idx, exclude_indices=exclude_indices)
+        if sample_idx is None:
+            return None
+        return sample_idx, self._load_prepared_sample(sample_idx)
+
+    def _get_additional_sample(self, idx: int, exclude_indices: set[int] | None = None) -> tuple[Any, Any] | None:
+        """Return a random different prepared sample for multi-image augmentations."""
+        sampled = self._get_additional_sample_info(idx, exclude_indices=exclude_indices)
+        if sampled is None:
+            return None
+        _, sample = sampled
+        return sample
 
     def __getitem__(self, idx: int):
         img, target = self._load_prepared_sample(idx)
@@ -865,6 +893,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
     patch_size = getattr(args, "patch_size", None)
     num_windows = getattr(args, "num_windows", None)
     aug_config = getattr(args, "aug_config", None)
+    eval_aug_config = getattr(args, "eval_aug_config", None)
     include_keypoints = getattr(args, "use_grouppose_keypoints", False)
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
     keypoint_flip_pairs: list[int] | None = (
@@ -895,6 +924,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
             ),
@@ -916,6 +946,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
             ),

@@ -1524,6 +1524,40 @@ class TestCopyPaste:
 
         assert transform._additional_sample_provider is not None
 
+    def test_prepare_multi_image_augmentations_tracks_used_indices(self):
+        """Provider should exclude the base index and donors already used for the current sample."""
+        transform = CopyPaste(p=1.0, max_paste_objects=1, max_iou=1.0, seed=5)
+        composed = Compose([transform])
+
+        class DatasetWithIndexedAdditionalSamples:
+            def __init__(self):
+                self.exclude_history = []
+
+            def _get_additional_sample(self, index):
+                raise AssertionError("_get_additional_sample_info should be preferred when available")
+
+            def _get_additional_sample_info(self, index, exclude_indices=None):
+                excluded = set(exclude_indices or set())
+                self.exclude_history.append(excluded)
+                for candidate in (1, 2, 3):
+                    if candidate not in excluded:
+                        return candidate, (
+                            Image.new("RGB", (8, 8)),
+                            {
+                                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                                "labels": torch.zeros((0,), dtype=torch.long),
+                            },
+                        )
+                return None
+
+        dataset = DatasetWithIndexedAdditionalSamples()
+        prepare_multi_image_augmentations(composed, dataset, 0)
+
+        assert transform._additional_sample_provider is not None
+        assert transform._additional_sample_provider() is not None
+        assert transform._additional_sample_provider() is not None
+        assert dataset.exclude_history == [{0}, {0, 1}]
+
     def test_from_config_instantiates_copy_paste(self):
         """CopyPaste should be available through RF-DETR aug_config."""
         transforms = AlbumentationsWrapper.from_config({"CopyPaste": {"p": 1.0, "seed": 0}})
@@ -2241,6 +2275,42 @@ class TestMakeCocoTransformsAugConfig:
         pipeline = make_transforms("test", 640, aug_config={"HorizontalFlip": {"p": 1.0}})
         wrappers = [t for t in pipeline.transforms if isinstance(t, AlbumentationsWrapper)]
         assert len(wrappers) == expected_resize_wrappers
+
+    def test_eval_aug_config_applied_on_square_val(self):
+        """eval_aug_config explicitly adds validation transforms in crop-space."""
+        pipeline = make_coco_transforms_square_div_64(
+            "val",
+            640,
+            multi_scale=True,
+            skip_random_resize=True,
+            aug_config={"HorizontalFlip": {"p": 1.0}},
+            eval_aug_config=[
+                {"TiledCroppingWithMasks": {"height": 640, "width": 640, "p": 1.0}},
+                {"Resize": {"height": 640, "width": 640, "p": 1.0}},
+            ],
+        )
+
+        names = [
+            t.transform.transforms[0].__class__.__name__
+            for t in pipeline.transforms
+            if isinstance(t, AlbumentationsWrapper)
+        ]
+
+        assert names == ["Resize", "TiledCroppingWithMasks", "Resize"]
+        assert any(isinstance(t, UseTransformedSizeAsOrigSize) for t in pipeline.transforms)
+
+    def test_use_transformed_size_as_orig_size(self):
+        """Crop-space eval must postprocess and score against transformed image size."""
+        transform = UseTransformedSizeAsOrigSize()
+        target = {
+            "orig_size": torch.tensor([1080, 1920]),
+            "size": torch.tensor([640, 640]),
+        }
+
+        _, transformed = transform(Image.new("RGB", (640, 640)), target)
+
+        assert torch.equal(transformed["orig_size"], torch.tensor([640, 640]))
+        assert torch.equal(target["orig_size"], torch.tensor([1080, 1920]))
 
 
 class TestMakeCocoTransformsOutputSize:

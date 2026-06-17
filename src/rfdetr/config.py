@@ -707,6 +707,8 @@ class TrainConfig(BaseConfig):
     wandb: bool = False
     mlflow: bool = False
     mlflow_tracking_uri: Optional[str] = Field(default_factory=lambda: os.getenv("MLFLOW_TRACKING_URI"))
+    mlflow_log_artifacts: bool = True
+    mlflow_log_system_metrics: bool = True
     clearml: bool = False  # Not yet implemented — reserved for future use.
     project: Optional[str] = None
     run: Optional[str] = None
@@ -717,6 +719,7 @@ class TrainConfig(BaseConfig):
     eval_interval: int = 1
     log_per_class_metrics: bool = True
     aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
+    eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False
     notes: Optional[Any] = Field(

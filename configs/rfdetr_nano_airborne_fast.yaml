@@ -6,11 +6,7 @@ model:
     class_path: rfdetr.config.RFDETRNanoConfig
     init_args:
       num_classes: 6
-      num_windows: 4
       resolution: 640
-      positional_encoding_size: 40
-      num_queries: 100
-      num_select: 100
 
   train_config:
     class_path: rfdetr.config.TrainConfig
@@ -18,7 +14,7 @@ model:
       dataset_dir: ../airborne-object-tracking/exports/rf_detr_coco/
       output_dir: output/rfdetr_nano_airborne_fast
 
-      epochs: 10
+      epochs: 25
       batch_size: 32
       grad_accum_steps: 1
       num_workers: 8
@@ -40,16 +36,28 @@ model:
             height: 640
             width: 640
             p: 1.0
+      eval_aug_config:
+        - TiledCroppingWithMasks:
+            height: 640
+            width: 640
+            p: 1.0
+        - Resize:
+            height: 640
+            width: 640
+            p: 1.0
 
       multi_scale: true
-      expanded_scales: true
       do_random_resize_via_padding: false
 
       tensorboard: false
       wandb: false
       mlflow: true
+      mlflow_log_artifacts: true
+      mlflow_log_system_metrics: true
+      train_log_on_step: true
       save_dataset_grids: true
 
 trainer:
   accelerator: auto
   devices: auto
+  log_every_n_steps: 10

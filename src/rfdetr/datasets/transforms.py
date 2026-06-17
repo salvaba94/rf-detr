@@ -93,6 +93,20 @@ class Normalize(object):
         return image, target
 
 
+class UseTransformedSizeAsOrigSize(object):
+    """Make evaluation targets use transformed image coordinates."""
+
+    def __call__(
+        self, image: Any, target: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        if target is None:
+            return image, None
+        target = target.copy()
+        if "size" in target:
+            target["orig_size"] = torch.as_tensor(target["size"]).clone()
+        return image, target
+
+
 # Albumentations wrapper for RF-DETR
 
 # Geometric transforms that affect bounding boxes
@@ -1006,10 +1020,23 @@ def prepare_multi_image_augmentations(transforms: Any, dataset: Any, index: int)
     if not hasattr(dataset, "_get_additional_sample"):
         return
 
+    used_indices = {index}
+
+    def provider(dataset: Any = dataset, index: int = index, used_indices: set[int] = used_indices) -> Any | None:
+        sampler_with_info = getattr(dataset, "_get_additional_sample_info", None)
+        if callable(sampler_with_info):
+            sampled = sampler_with_info(index, exclude_indices=used_indices)
+            if sampled is None:
+                return None
+            sample_idx, sample = sampled
+            used_indices.add(int(sample_idx))
+            return sample
+        return dataset._get_additional_sample(index)
+
     for transform in iter_transforms(transforms):
         setter = getattr(transform, "set_additional_sample_provider", None)
         if setter is not None:
-            setter(lambda dataset=dataset, index=index: dataset._get_additional_sample(index))
+            setter(provider)
 
 
 class AlbumentationsWrapper:

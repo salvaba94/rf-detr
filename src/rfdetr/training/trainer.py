@@ -27,6 +27,7 @@ from rfdetr.config import KeypointTrainConfig, ModelConfig, TrainConfig
 from rfdetr.training.callbacks import (
     BestModelCallback,
     DropPathCallback,
+    RFDETRMLflowArtifactCallback,
     RFDETREarlyStopping,
     RFDETREMACallback,
 )
@@ -131,6 +132,29 @@ def _requests_multiple_devices(devices: int | str, accelerator: str | None = Non
     if "," in devices_name:
         return len([entry for entry in devices_name.split(",") if entry.strip()]) > 1
     return False
+
+
+def _enable_mlflow_system_metrics() -> None:
+    """Enable MLflow system metrics logging when the installed MLflow supports it."""
+    try:
+        import mlflow
+    except ModuleNotFoundError as exc:
+        raise exc
+    except Exception as exc:  # pragma: no cover - defensive only
+        _logger.warning("MLflow system metrics logging disabled: %s", exc)
+        return
+
+    enable_system_metrics = getattr(mlflow, "enable_system_metrics_logging", None)
+    if not callable(enable_system_metrics):
+        _logger.warning(
+            "MLflow system metrics logging disabled: installed mlflow does not expose "
+            "enable_system_metrics_logging()."
+        )
+        return
+    try:
+        enable_system_metrics()
+    except Exception as exc:  # pragma: no cover - defensive only
+        _logger.warning("MLflow system metrics logging disabled: %s", exc)
 
 
 def build_trainer(
@@ -454,6 +478,8 @@ def build_trainer(
 
     if tc.mlflow:
         try:
+            if tc.mlflow_log_system_metrics:
+                _enable_mlflow_system_metrics()
             mlflow_kwargs = {}
             if tc.mlflow_tracking_uri is not None:
                 mlflow_kwargs["tracking_uri"] = tc.mlflow_tracking_uri
@@ -465,6 +491,8 @@ def build_trainer(
                     **mlflow_kwargs,
                 )
             )
+            if tc.mlflow_log_artifacts:
+                callbacks.append(RFDETRMLflowArtifactCallback(output_dir=tc.output_dir))
         except ModuleNotFoundError as exc:
             _logger.warning("MLflow logging disabled: %s. Install with: pip install mlflow", exc)
 
