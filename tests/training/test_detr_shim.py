@@ -542,10 +542,10 @@ class TestRFDETRTrainPTLAbsorption:
             result = RFDETR.train(mock_self)
         assert result is None
 
-    def test_save_dataset_grids_true_calls_grid_saver(self, tmp_path, patch_lit):
-        """save_dataset_grids=True triggers DatasetGridSaver.save_grid() for train and val."""
+    def test_save_dataset_grids_true_does_not_pre_save_before_fit(self, tmp_path, patch_lit):
+        """save_dataset_grids=True is handled by the trainer callback, not RFDETR.train()."""
         mock_self = _make_rfdetr_self(tmp_path, save_dataset_grids=True)
-        p_mod, p_dm, p_bt, _mcls, _dmcls, _mock_bt = patch_lit
+        p_mod, p_dm, p_bt, _mcls, _dmcls, mock_bt = patch_lit
         mock_saver_cls = MagicMock(name="DatasetGridSaver")
         with (
             p_mod,
@@ -555,13 +555,8 @@ class TestRFDETRTrainPTLAbsorption:
         ):
             RFDETR.train(mock_self)
 
-        # DatasetGridSaver must be constructed twice (train + val) and save_grid called on each
-        assert mock_saver_cls.call_count == 2
-        assert mock_saver_cls.return_value.save_grid.call_count == 2
-
-        # setup("fit") must be called on the datamodule before training
-        dm_instance = _dmcls.return_value
-        dm_instance.setup.assert_called_with("fit")
+        mock_saver_cls.assert_not_called()
+        mock_bt.return_value.fit.assert_called_once()
 
     def test_save_dataset_grids_false_skips_grid_saver(self, tmp_path, patch_lit):
         """save_dataset_grids=False (default) must not call DatasetGridSaver at all."""
@@ -578,28 +573,8 @@ class TestRFDETRTrainPTLAbsorption:
 
         mock_saver_cls.assert_not_called()
 
-    def test_save_dataset_grids_uses_output_dir_subdir(self, tmp_path, patch_lit):
-        """Grid images are saved to <output_dir>/dataset_grids."""
-        from pathlib import Path
-
-        mock_self = _make_rfdetr_self(tmp_path, save_dataset_grids=True)
-        config = mock_self.get_train_config.return_value
-        p_mod, p_dm, p_bt, _mcls, _dmcls, _mock_bt = patch_lit
-        mock_saver_cls = MagicMock(name="DatasetGridSaver")
-        with (
-            p_mod,
-            p_dm,
-            p_bt,
-            patch("rfdetr.datasets.save_grids.DatasetGridSaver", mock_saver_cls),
-        ):
-            RFDETR.train(mock_self)
-
-        expected_output_dir = Path(config.output_dir) / "dataset_grids"
-        called_dirs = [call.args[1] for call in mock_saver_cls.call_args_list]
-        assert all(d == expected_output_dir for d in called_dirs)
-
-    def test_save_dataset_grids_failure_does_not_abort_training(self, tmp_path, patch_lit):
-        """A save_grid() failure must not abort training — trainer.fit() must still be called."""
+    def test_save_dataset_grids_callback_path_does_not_abort_train_call(self, tmp_path, patch_lit):
+        """RFDETR.train() proceeds because grid saving happens inside the trainer callback."""
         mock_self = _make_rfdetr_self(tmp_path, save_dataset_grids=True)
         p_mod, p_dm, p_bt, _mcls, _dmcls, mock_bt = patch_lit
         mock_saver_cls = MagicMock(name="DatasetGridSaver")
@@ -610,10 +585,9 @@ class TestRFDETRTrainPTLAbsorption:
             p_bt,
             patch("rfdetr.datasets.save_grids.DatasetGridSaver", mock_saver_cls),
         ):
-            # Must not raise even though save_grid() fails
             RFDETR.train(mock_self)
 
-        # Training must proceed regardless of the grid-save failure
+        mock_saver_cls.assert_not_called()
         mock_bt.return_value.fit.assert_called_once()
 
 

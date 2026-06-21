@@ -535,6 +535,15 @@ class TestMakeCollateFn:
         for t in targets:
             assert set(t.keys()) == {"boxes", "labels"}
 
+    def test_resize_size_choices_resize_batch_before_padding(self) -> None:
+        """Factory collator can apply one square multiscale resize to the whole batch."""
+        collate = make_collate_fn(block_size=32, resize_size_choices=[128])
+        samples, targets = collate(self._batch((3, 100, 200), (3, 150, 180)))
+
+        assert samples.tensors.shape[-2:] == (128, 128)
+        assert samples.mask.any().item() is False
+        assert all(torch.equal(t["size"], torch.tensor([128, 128])) for t in targets)
+
     def test_mixed_landscape_portrait_batch_masked_correctly(self) -> None:
         """Mixed-orientation batch: all pad (batch + divisor) correctly marked True in mask."""
         # landscape (H=100, W=200) and portrait (H=200, W=100).  block_size=32 rounds

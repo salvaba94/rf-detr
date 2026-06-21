@@ -5,10 +5,13 @@
 # ------------------------------------------------------------------------
 """Unit tests for build_trainer() — callback stack and config coercion."""
 
+from unittest.mock import Mock
+
 import pytest
 from pytorch_lightning.callbacks import RichProgressBar, TQDMProgressBar
 
 from rfdetr.training import build_trainer
+from rfdetr.training.callbacks import DatasetGridCallback
 
 # ---------------------------------------------------------------------------
 # TestProgressBarCallbacks — verifies the correct callback is installed
@@ -53,6 +56,36 @@ class TestProgressBarCallbacks:
         cb_types = [type(cb) for cb in trainer.callbacks]
         assert RichProgressBar not in cb_types
         assert TQDMProgressBar not in cb_types
+
+
+class TestDatasetGridCallback:
+    """build_trainer() wires dataset grid saving at train epoch start."""
+
+    def test_dataset_grid_callback_installed_when_enabled(self, base_model_config, base_train_config):
+        """save_dataset_grids=True must add DatasetGridCallback."""
+        mc = base_model_config()
+        tc = base_train_config(save_dataset_grids=True)
+        trainer = build_trainer(tc, mc, accelerator="cpu")
+
+        assert any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
+
+    def test_dataset_grid_callback_skipped_when_disabled(self, base_model_config, base_train_config):
+        """save_dataset_grids=False must not add DatasetGridCallback."""
+        mc = base_model_config()
+        tc = base_train_config(save_dataset_grids=False)
+        trainer = build_trainer(tc, mc, accelerator="cpu")
+
+        assert not any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
+
+    def test_dataset_grid_callback_saves_on_train_epoch_start(self):
+        """DatasetGridCallback delegates saving to the attached datamodule at epoch start."""
+        callback = DatasetGridCallback()
+        datamodule = Mock()
+        trainer = Mock(datamodule=datamodule, current_epoch=3)
+
+        callback.on_train_epoch_start(trainer, Mock())
+
+        datamodule._maybe_save_dataset_grids.assert_called_once_with(epoch=3)
 
 
 # ---------------------------------------------------------------------------

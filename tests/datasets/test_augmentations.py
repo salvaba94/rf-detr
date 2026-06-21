@@ -2190,14 +2190,14 @@ class TestMakeCocoTransformsAugConfig:
     def test_default_none_uses_aug_config(self, make_transforms):
         """Omitting aug_config uses the module-level AUG_CONFIG default (HorizontalFlip)."""
         pipeline = make_transforms("train", 640)
-        # Train pipeline: [resize_wrapper, *aug_wrappers, normalize]
-        # First AlbumentationsWrapper is the resize OneOf; remaining are from aug_config.
         wrappers = [t for t in pipeline.transforms if isinstance(t, AlbumentationsWrapper)]
-        aug_wrappers = wrappers[1:]
+        names = [w.transform.transforms[0].__class__.__name__ for w in wrappers]
 
         expected_names = list(AUG_CONFIG.keys())
-        actual_names = [w.transform.transforms[0].__class__.__name__ for w in aug_wrappers]
-        assert actual_names == expected_names
+        if make_transforms is make_coco_transforms_square_div_64:
+            assert names == [*expected_names, "Resize"]
+        else:
+            assert names[1:] == expected_names
 
     @pytest.mark.parametrize(
         "make_transforms",
@@ -2226,10 +2226,12 @@ class TestMakeCocoTransformsAugConfig:
         custom = {"HorizontalFlip": {"p": 1.0}}
         pipeline = make_transforms("train", 640, aug_config=custom)
         wrappers = [t for t in pipeline.transforms if isinstance(t, AlbumentationsWrapper)]
-        aug_wrappers = wrappers[1:]  # skip resize wrapper
+        names = [w.transform.transforms[0].__class__.__name__ for w in wrappers]
 
-        assert len(aug_wrappers) == 1
-        assert aug_wrappers[0].transform.transforms[0].__class__.__name__ == "HorizontalFlip"
+        if make_transforms is make_coco_transforms_square_div_64:
+            assert names == ["HorizontalFlip", "Resize"]
+        else:
+            assert names[1:] == ["HorizontalFlip"]
 
     @pytest.mark.parametrize(
         "make_transforms,expected_resize_wrappers",
@@ -2296,7 +2298,7 @@ class TestMakeCocoTransformsAugConfig:
             if isinstance(t, AlbumentationsWrapper)
         ]
 
-        assert names == ["Resize", "TiledCroppingWithMasks", "Resize"]
+        assert names == ["TiledCroppingWithMasks", "Resize"]
         assert any(isinstance(t, UseTransformedSizeAsOrigSize) for t in pipeline.transforms)
 
     def test_use_transformed_size_as_orig_size(self):

@@ -18,6 +18,7 @@ from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
 from rfdetr.datasets import build_dataset
 from rfdetr.datasets.aug_configs import AUG_CONFIG
+from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.utilities.box_ops import box_xyxy_to_cxcywh
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.tensors import make_collate_fn
@@ -162,9 +163,20 @@ class RFDETRDataModule(LightningDataModule):
                 f"{block_size} from patch_size={model_config.patch_size} "
                 f"and num_windows={model_config.num_windows}."
             )
-        self._collate_fn = make_collate_fn(
+        train_resize_choices = None
+        if train_config.multi_scale and not train_config.do_random_resize_via_padding:
+            train_resize_choices = compute_multi_scale_scales(
+                model_config.resolution,
+                train_config.expanded_scales,
+                model_config.patch_size,
+                model_config.num_windows,
+            )
+        self._train_collate_fn = make_collate_fn(
             block_size=block_size,
+            resize_size_choices=train_resize_choices,
         )
+        self._eval_collate_fn = make_collate_fn(block_size=block_size)
+        self._collate_fn = self._eval_collate_fn
 
         self._dataset_train: Optional[torch.utils.data.Dataset] = None
         self._dataset_val: Optional[torch.utils.data.Dataset] = None
@@ -178,6 +190,7 @@ class RFDETRDataModule(LightningDataModule):
         # setup("fit") calls (e.g. during validation loops in some PTL strategies).
         self._kornia_setup_done: bool = False
         self._dataset_grids_saved: bool = False
+        self._dataset_grid_saved_epochs: set[int] = set()
 
         self._num_workers: int = self.train_config.num_workers
 
@@ -244,7 +257,6 @@ class RFDETRDataModule(LightningDataModule):
             if not self._kornia_setup_done:
                 self._setup_kornia_pipeline()
                 self._kornia_setup_done = True
-            self._maybe_save_dataset_grids()
         elif stage == "validate":
             if self._dataset_val is None:
                 self._dataset_val = build_dataset("val", ns, resolution)
@@ -256,19 +268,41 @@ class RFDETRDataModule(LightningDataModule):
             if self._dataset_val is None:
                 self._dataset_val = build_dataset("val", ns, resolution)
 
-    def _maybe_save_dataset_grids(self) -> None:
-        """Save train/validation sample grids once when enabled."""
-        if self._dataset_grids_saved or not self.train_config.save_dataset_grids:
+    def _maybe_save_dataset_grids(self, epoch: int | None = None) -> None:
+        """Save train/validation sample grids when enabled.
+
+        Args:
+            epoch: Optional epoch index. When provided, grids are saved once per epoch with epoch-tagged filenames.
+                When omitted, grids are saved once for backward-compatible direct calls.
+        """
+        if not self.train_config.save_dataset_grids:
             return
-        self._dataset_grids_saved = True
+        if epoch is None and self._dataset_grids_saved:
+            return
+        if epoch is not None and epoch in self._dataset_grid_saved_epochs:
+            return
+        if epoch is None:
+            self._dataset_grids_saved = True
+        else:
+            self._dataset_grid_saved_epochs.add(epoch)
+            self._dataset_grids_saved = True
         if os.environ.get("LOCAL_RANK", "0") != "0":
             return
         try:
             from rfdetr.datasets.save_grids import DatasetGridSaver
 
             grids_output_dir = Path(self.train_config.output_dir) / "dataset_grids"
-            DatasetGridSaver(self.train_dataloader(), grids_output_dir, dataset_type="train").save_grid()
-            DatasetGridSaver(self.val_dataloader(), grids_output_dir, dataset_type="val").save_grid()
+            epoch_suffix = "" if epoch is None else f"_epoch{epoch:04d}"
+            DatasetGridSaver(
+                self.train_dataloader(),
+                grids_output_dir,
+                dataset_type=f"train{epoch_suffix}",
+            ).save_grid()
+            DatasetGridSaver(
+                self.val_dataloader(),
+                grids_output_dir,
+                dataset_type=f"val{epoch_suffix}",
+            ).save_grid()
         except Exception:
             logger.warning(
                 "Failed to save dataset grids; training will continue without them.",
@@ -307,7 +341,7 @@ class RFDETRDataModule(LightningDataModule):
                 dataset,
                 batch_size=batch_size,
                 sampler=sampler,
-                collate_fn=self._collate_fn,
+                collate_fn=self._train_collate_fn,
                 num_workers=num_workers,
                 pin_memory=self._pin_memory,
                 persistent_workers=self._persistent_workers,
@@ -326,7 +360,7 @@ class RFDETRDataModule(LightningDataModule):
             batch_size=batch_size,
             shuffle=True,
             drop_last=True,  # no-op after alignment, but keeps intent explicit
-            collate_fn=self._collate_fn,
+            collate_fn=self._train_collate_fn,
             num_workers=num_workers,
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
@@ -344,7 +378,7 @@ class RFDETRDataModule(LightningDataModule):
             batch_size=self.train_config.batch_size,
             sampler=torch.utils.data.SequentialSampler(self._dataset_val),
             drop_last=False,
-            collate_fn=self._collate_fn,
+            collate_fn=self._eval_collate_fn,
             num_workers=self._num_workers,
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
@@ -362,7 +396,7 @@ class RFDETRDataModule(LightningDataModule):
             batch_size=self.train_config.batch_size,
             sampler=torch.utils.data.SequentialSampler(self._dataset_test),
             drop_last=False,
-            collate_fn=self._collate_fn,
+            collate_fn=self._eval_collate_fn,
             num_workers=self._num_workers,
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
@@ -380,7 +414,7 @@ class RFDETRDataModule(LightningDataModule):
             batch_size=self.train_config.batch_size,
             sampler=torch.utils.data.SequentialSampler(self._dataset_val),
             drop_last=False,
-            collate_fn=self._collate_fn,
+            collate_fn=self._eval_collate_fn,
             num_workers=self._num_workers,
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,

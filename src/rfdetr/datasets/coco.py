@@ -732,24 +732,18 @@ def make_coco_transforms_square_div_64(
     to_float = ToDtype(torch.float32, scale=True)
     normalize = Normalize()
 
-    scales = [resolution]
     if multi_scale:
-        # scales = [448, 512, 576, 640, 704, 768, 832, 896]
-        scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
-        if skip_random_resize:
-            scales = [scales[-1]]
-        logger.info(f"Using multi-scale training with square resize and scales: {scales}")
+        logger.info("Using batch-level multi-scale resize after square dataset augmentations.")
 
     if image_set == "train":
         resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = AlbumentationsWrapper.from_config(_build_train_resize_config(scales, square=True))
-        pipeline = [*resize_wrappers]
+        pipeline = []
         if not gpu_postprocess:
             aug_wrappers = AlbumentationsWrapper.from_config(
                 resolved_aug_config, keypoint_flip_pairs=keypoint_flip_pairs
             )
             pipeline += [*aug_wrappers]
-            if skip_random_resize and _last_aug_config_transform_name(resolved_aug_config) != "Resize":
+            if _last_aug_config_transform_name(resolved_aug_config) != "Resize":
                 restore_size_wrappers = AlbumentationsWrapper.from_config(
                     [{"Resize": {"height": resolution, "width": resolution, "p": 1.0}}],
                     keypoint_flip_pairs=keypoint_flip_pairs,
@@ -765,13 +759,10 @@ def make_coco_transforms_square_div_64(
         if eval_aug_config is None:
             return Compose([*resize_wrappers, to_image, to_float, normalize])
 
-        # Mirror the training crop canvas when batch-level multiscale is active:
-        # resize to the deterministic largest training scale, then apply the
-        # evaluation crop, then restore model input size if the eval config did
-        # not already do so. Evaluation is crop-space, so orig_size=size.
-        eval_canvas = scales[-1] if multi_scale and skip_random_resize else resolution
-        pipeline = [*AlbumentationsWrapper.from_config([{"Resize": {"height": eval_canvas, "width": eval_canvas}}])]
-        pipeline += [*AlbumentationsWrapper.from_config(eval_aug_config, keypoint_flip_pairs=keypoint_flip_pairs)]
+        # Apply evaluation augmentations in dataset/original image space. Any
+        # fixed-size resize belongs after the crop, and train multiscale is a
+        # batch-level collate concern rather than a pre-augmentation resize.
+        pipeline = [*AlbumentationsWrapper.from_config(eval_aug_config, keypoint_flip_pairs=keypoint_flip_pairs)]
         if _last_aug_config_transform_name(eval_aug_config) != "Resize":
             pipeline += [
                 *AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution, "p": 1.0}}])

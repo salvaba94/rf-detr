@@ -7,6 +7,7 @@
 
 from rfdetr.training.callbacks.best_model import BestModelCallback, RFDETREarlyStopping
 from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
+from rfdetr.training.callbacks.dataset_grids import DatasetGridCallback
 from rfdetr.training.callbacks.drop_schedule import DropPathCallback
 from rfdetr.training.callbacks.ema import RFDETREMACallback
 from rfdetr.training.callbacks.mlflow import RFDETRMLflowArtifactCallback
@@ -14,6 +15,7 @@ from rfdetr.training.callbacks.mlflow import RFDETRMLflowArtifactCallback
 __all__ = [
     "BestModelCallback",
     "COCOEvalCallback",
+    "DatasetGridCallback",
     "DropPathCallback",
     "RFDETREMACallback",
     "RFDETREarlyStopping",

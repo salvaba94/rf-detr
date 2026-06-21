@@ -16,6 +16,7 @@ from functools import partial
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor
 
@@ -298,6 +299,7 @@ def _bilinear_grid_sample(
 def _collate_with_block_size(
     batch: list[tuple[Any, ...]],
     block_size: int | None = None,
+    resize_size_choices: tuple[int, ...] | None = None,
 ) -> tuple[Any, ...]:
     """Module-level collate helper used as the base for :func:`make_collate_fn`.
 
@@ -308,13 +310,59 @@ def _collate_with_block_size(
         batch: List of ``(image, target)`` pairs from a dataset.
         block_size: When set, round batch ``H`` and ``W`` up to the next multiple of this value before padding.  See
             :func:`nested_tensor_from_tensor_list`.
+        resize_size_choices: Optional square sizes. When provided, one size is sampled per batch and every image is
+            resized to that size before padding.
 
     Returns:
         Tuple of ``(NestedTensor_of_images, tuple_of_targets)``.
     """
     batch = list(zip(*batch))
+    if resize_size_choices:
+        size = int(resize_size_choices[int(torch.randint(0, len(resize_size_choices), ()).item())])
+        images, targets = _resize_collate_batch(list(batch[0]), list(batch[1]), size)
+        batch[0] = images
+        batch[1] = tuple(targets)
     batch[0] = nested_tensor_from_tensor_list(batch[0], block_size=block_size)
     return tuple(batch)
+
+
+def _resize_collate_batch(
+    images: list[Tensor],
+    targets: list[dict[str, Any]],
+    size: int,
+) -> tuple[list[Tensor], list[dict[str, Any]]]:
+    """Resize every image in a batch to one square size before padding.
+
+    Args:
+        images: Image tensors in ``C,H,W`` format.
+        targets: Per-image target dictionaries.
+        size: Output square size.
+
+    Returns:
+        Resized images and shallow-copied targets with updated ``size`` metadata.
+    """
+    resized_images: list[Tensor] = []
+    resized_targets: list[dict[str, Any]] = []
+    for image, target in zip(images, targets):
+        resized_image = F.interpolate(
+            image.unsqueeze(0),
+            size=(size, size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        resized_target = target.copy()
+        resized_target["size"] = torch.as_tensor([size, size], dtype=torch.int64)
+        if "masks" in resized_target and torch.is_tensor(resized_target["masks"]):
+            masks = resized_target["masks"]
+            if masks.numel() > 0:
+                resized_target["masks"] = F.interpolate(
+                    masks.unsqueeze(1).float(),
+                    size=(size, size),
+                    mode="nearest",
+                ).squeeze(1).to(masks.dtype)
+        resized_images.append(resized_image)
+        resized_targets.append(resized_target)
+    return resized_images, resized_targets
 
 
 def collate_fn(batch: list[tuple[Any, ...]]) -> tuple[Any, ...]:
@@ -335,6 +383,7 @@ def collate_fn(batch: list[tuple[Any, ...]]) -> tuple[Any, ...]:
 
 def make_collate_fn(
     block_size: int | None = None,
+    resize_size_choices: list[int] | tuple[int, ...] | None = None,
 ) -> Callable[[list[tuple[Any, ...]]], tuple[Any, ...]]:
     """Build a collate function that rounds batch ``H``/``W`` up to *block_size*.
 
@@ -348,8 +397,10 @@ def make_collate_fn(
     Args:
         block_size: When set, batch ``H`` and ``W`` are rounded up to the next
             multiple of this value before padding.  The rounded-up strip is marked as padding in the NestedTensor mask.
+        resize_size_choices: Optional square sizes. When set, one size is sampled per batch and applied before padding.
 
     Returns:
         A collate callable suitable for ``torch.utils.data.DataLoader``.
     """
-    return partial(_collate_with_block_size, block_size=block_size)
+    resize_choices_tuple = tuple(resize_size_choices) if resize_size_choices is not None else None
+    return partial(_collate_with_block_size, block_size=block_size, resize_size_choices=resize_choices_tuple)

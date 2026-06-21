@@ -8,17 +8,14 @@
 from __future__ import annotations
 
 import math
-import random
 import warnings
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F  # noqa: N812 -- project-conventional alias (see AGENTS.md)
 from pytorch_lightning import LightningModule, seed_everything
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
-from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
@@ -124,31 +121,6 @@ class RFDETRModelModule(LightningModule):
         """
         if self.train_config.seed is not None:
             seed_everything(self.train_config.seed + self.global_rank, workers=True)
-
-    def on_train_batch_start(self, batch: Tuple, batch_idx: int) -> None:
-        """Apply optional multi-scale resize to the incoming batch.
-
-        Modifications to ``batch`` (in-place on ``NestedTensor``) are visible in ``training_step`` because they share
-        the same object.
-
-        Args:
-            batch: Tuple of (NestedTensor samples, list of target dicts).
-            batch_idx: Index of the current batch within the epoch.
-        """
-        tc = self.train_config
-        mc = self.model_config
-
-        if tc.multi_scale and not tc.do_random_resize_via_padding:
-            samples, _ = batch
-            scales = compute_multi_scale_scales(mc.resolution, tc.expanded_scales, mc.patch_size, mc.num_windows)
-            step = self.trainer.global_step
-            random.seed(step)
-            scale = random.choice(scales)
-            with torch.no_grad():
-                samples.tensors = F.interpolate(samples.tensors, size=scale, mode="bilinear", align_corners=False)
-                samples.mask = (
-                    F.interpolate(samples.mask.unsqueeze(1).float(), size=scale, mode="nearest").squeeze(1).bool()
-                )
 
     def on_train_epoch_start(self) -> None:
         """Reset the accumulated box normalizer at the start of every training epoch.

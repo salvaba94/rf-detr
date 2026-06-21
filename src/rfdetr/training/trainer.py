@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - exercised in unit tests via monkeypatc
 from rfdetr.config import KeypointTrainConfig, ModelConfig, TrainConfig
 from rfdetr.training.callbacks import (
     BestModelCallback,
+    DatasetGridCallback,
     DropPathCallback,
     RFDETRMLflowArtifactCallback,
     RFDETREarlyStopping,
@@ -331,6 +332,9 @@ def build_trainer(
 
     # --- Build callbacks ---
     callbacks = []
+
+    if tc.save_dataset_grids:
+        callbacks.append(DatasetGridCallback())
 
     if tc.progress_bar == "rich":
         callbacks.append(
