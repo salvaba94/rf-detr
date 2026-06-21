@@ -11,7 +11,7 @@ import pytest
 from pytorch_lightning.callbacks import RichProgressBar, TQDMProgressBar
 
 from rfdetr.training import build_trainer
-from rfdetr.training.callbacks import DatasetGridCallback
+from rfdetr.training.callbacks import DatasetGridCallback, PredictionGridCallback
 
 # ---------------------------------------------------------------------------
 # TestProgressBarCallbacks — verifies the correct callback is installed
@@ -62,20 +62,22 @@ class TestDatasetGridCallback:
     """build_trainer() wires dataset grid saving at train epoch start."""
 
     def test_dataset_grid_callback_installed_when_enabled(self, base_model_config, base_train_config):
-        """save_dataset_grids=True must add DatasetGridCallback."""
+        """save_dataset_grids=True must add dataset and prediction grid callbacks."""
         mc = base_model_config()
         tc = base_train_config(save_dataset_grids=True)
         trainer = build_trainer(tc, mc, accelerator="cpu")
 
         assert any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
+        assert any(isinstance(cb, PredictionGridCallback) for cb in trainer.callbacks)
 
     def test_dataset_grid_callback_skipped_when_disabled(self, base_model_config, base_train_config):
-        """save_dataset_grids=False must not add DatasetGridCallback."""
+        """save_dataset_grids=False must not add image grid callbacks."""
         mc = base_model_config()
         tc = base_train_config(save_dataset_grids=False)
         trainer = build_trainer(tc, mc, accelerator="cpu")
 
         assert not any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
+        assert not any(isinstance(cb, PredictionGridCallback) for cb in trainer.callbacks)
 
     def test_dataset_grid_callback_saves_on_train_epoch_start(self):
         """DatasetGridCallback delegates saving to the attached datamodule at epoch start."""

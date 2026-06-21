@@ -718,7 +718,9 @@ class TrainConfig(BaseConfig):
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
+    pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
+    eval_pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False

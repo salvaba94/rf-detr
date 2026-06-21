@@ -165,6 +165,19 @@ class TestModelConfigValidation:
 
         assert config.resume == os.fspath(value)
 
+    def test_pre_resize_aug_configs_are_accepted(self) -> None:
+        """TrainConfig accepts explicit pre-resize augmentation configs."""
+        pre_resize = [{"TiledCroppingWithMasks": {"height": 640, "width": 640, "p": 1.0}}]
+
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            pre_resize_aug_config=pre_resize,
+            eval_pre_resize_aug_config=pre_resize,
+        )
+
+        assert config.pre_resize_aug_config == pre_resize
+        assert config.eval_pre_resize_aug_config == pre_resize
+
 
 class TestRFDETRBaseConfigEncoder:
     """Encoder field validation on RFDETRBaseConfig (no fixture needed — has defaults)."""

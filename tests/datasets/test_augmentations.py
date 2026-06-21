@@ -2233,6 +2233,19 @@ class TestMakeCocoTransformsAugConfig:
         else:
             assert names[1:] == ["HorizontalFlip"]
 
+    def test_pre_resize_aug_config_runs_before_resize_in_non_square_train_path(self):
+        """pre_resize_aug_config must run on loaded image pixels before aspect-ratio resize."""
+        pipeline = make_coco_transforms(
+            "train",
+            640,
+            pre_resize_aug_config=[{"TiledCroppingWithMasks": {"height": 320, "width": 320, "p": 1.0}}],
+            aug_config=[{"HorizontalFlip": {"p": 1.0}}],
+        )
+        wrappers = [t for t in pipeline.transforms if isinstance(t, AlbumentationsWrapper)]
+        names = [w.transform.transforms[0].__class__.__name__ for w in wrappers]
+
+        assert names == ["TiledCroppingWithMasks", "OneOf", "HorizontalFlip"]
+
     @pytest.mark.parametrize(
         "make_transforms,expected_resize_wrappers",
         [
@@ -2299,6 +2312,23 @@ class TestMakeCocoTransformsAugConfig:
         ]
 
         assert names == ["TiledCroppingWithMasks", "Resize"]
+        assert any(isinstance(t, UseTransformedSizeAsOrigSize) for t in pipeline.transforms)
+
+    def test_eval_pre_resize_aug_config_runs_before_resize_in_non_square_val_path(self):
+        """eval_pre_resize_aug_config must run on loaded image pixels before aspect-ratio resize."""
+        pipeline = make_coco_transforms(
+            "val",
+            640,
+            eval_pre_resize_aug_config=[{"TiledCroppingWithMasks": {"height": 640, "width": 640, "p": 1.0}}],
+        )
+
+        names = [
+            t.transform.transforms[0].__class__.__name__
+            for t in pipeline.transforms
+            if isinstance(t, AlbumentationsWrapper)
+        ]
+
+        assert names == ["TiledCroppingWithMasks", "SmallestMaxSize", "LongestMaxSize"]
         assert any(isinstance(t, UseTransformedSizeAsOrigSize) for t in pipeline.transforms)
 
     def test_use_transformed_size_as_orig_size(self):

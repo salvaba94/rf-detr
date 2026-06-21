@@ -892,7 +892,9 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
     do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
     patch_size = getattr(args, "patch_size", None)
     num_windows = getattr(args, "num_windows", None)
+    pre_resize_aug_config = getattr(args, "pre_resize_aug_config", None)
     aug_config = getattr(args, "aug_config", None)
+    eval_pre_resize_aug_config = getattr(args, "eval_pre_resize_aug_config", None)
     eval_aug_config = getattr(args, "eval_aug_config", None)
     include_keypoints = getattr(args, "use_grouppose_keypoints", False)
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
@@ -923,7 +925,9 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 skip_random_resize=not do_random_resize_via_padding,
                 patch_size=patch_size,
                 num_windows=num_windows,
+                pre_resize_aug_config=pre_resize_aug_config,
                 aug_config=aug_config,
+                eval_pre_resize_aug_config=eval_pre_resize_aug_config,
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
@@ -945,7 +949,9 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 skip_random_resize=not do_random_resize_via_padding,
                 patch_size=patch_size,
                 num_windows=num_windows,
+                pre_resize_aug_config=pre_resize_aug_config,
                 aug_config=aug_config,
+                eval_pre_resize_aug_config=eval_pre_resize_aug_config,
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,

@@ -26,6 +26,20 @@ from rfdetr.training.callbacks.ema import RFDETREMACallback
 from rfdetr.training.callbacks.mlflow import RFDETRMLflowArtifactCallback
 
 
+class _FakeMLFlowLogger:
+    """Minimal object whose class name matches Lightning's MLFlowLogger."""
+
+    __name__ = "MLFlowLogger"
+
+    def __init__(self):
+        """Initialize fake MLflow logger state."""
+        self.experiment = MagicMock()
+        self.run_id = "run-id"
+
+
+_FakeMLFlowLogger.__name__ = "MLFlowLogger"
+
+
 def _mc(**kwargs):
     """Minimal RFDETRBaseConfig for tests."""
     defaults = dict(pretrain_weights=None, device="cpu", num_classes=3)
@@ -795,6 +809,60 @@ class TestBuildTrainerLoggers:
 
         mlflow_logger.assert_called_once()
         assert mlflow_logger.call_args.kwargs["tracking_uri"] == tracking_uri
+
+    def test_mlflow_directory_logging_uploads_late_files(self, tmp_path):
+        """MLflow directory uploads are tracked per file so later artifacts are not skipped."""
+        output_dir = tmp_path / "out"
+        grid_dir = output_dir / "prediction_grids"
+        nested_dir = grid_dir / "nested"
+        nested_dir.mkdir(parents=True)
+        first_file = grid_dir / "epoch0.jpg"
+        second_file = nested_dir / "epoch1.jpg"
+        first_file.write_text("first", encoding="utf-8")
+        mlflow_logger = _FakeMLFlowLogger()
+        trainer = MagicMock(loggers=[mlflow_logger])
+        callback = RFDETRMLflowArtifactCallback(output_dir=str(output_dir))
+
+        callback._log_directory(trainer, grid_dir, artifact_path="prediction_grids")
+        second_file.write_text("second", encoding="utf-8")
+        callback._log_directory(trainer, grid_dir, artifact_path="prediction_grids")
+
+        logged_paths = [call.args[1] for call in mlflow_logger.experiment.log_artifact.call_args_list]
+        logged_artifact_paths = [
+            call.kwargs["artifact_path"] for call in mlflow_logger.experiment.log_artifact.call_args_list
+        ]
+        assert str(first_file) in logged_paths
+        assert str(second_file) in logged_paths
+        assert logged_artifact_paths == ["prediction_grids", "prediction_grids/nested"]
+
+    def test_mlflow_train_end_uploads_predictions_plots_metrics_and_checkpoints(self, tmp_path):
+        """End-of-run MLflow artifacts include prediction grids, plots, metrics, and model files."""
+        output_dir = tmp_path / "out"
+        (output_dir / "dataset_grids").mkdir(parents=True)
+        (output_dir / "prediction_grids").mkdir(parents=True)
+        (output_dir / "plots").mkdir(parents=True)
+        (output_dir / "dataset_grids" / "train.jpg").write_text("dataset", encoding="utf-8")
+        (output_dir / "prediction_grids" / "val.jpg").write_text("predictions", encoding="utf-8")
+        (output_dir / "plots" / "metrics.png").write_text("plot", encoding="utf-8")
+        (output_dir / "metrics.csv").write_text("epoch,loss\n0,1.0\n", encoding="utf-8")
+        (output_dir / "checkpoint_0.ckpt").write_text("checkpoint", encoding="utf-8")
+        mlflow_logger = _FakeMLFlowLogger()
+        trainer = MagicMock(is_global_zero=True, loggers=[mlflow_logger])
+        callback = RFDETRMLflowArtifactCallback(output_dir=str(output_dir))
+
+        with patch.object(callback, "_write_metric_plots"):
+            callback.on_train_end(trainer, MagicMock())
+
+        logged_artifact_paths = {
+            call.kwargs["artifact_path"] for call in mlflow_logger.experiment.log_artifact.call_args_list
+        }
+        assert {
+            "dataset_grids",
+            "prediction_grids",
+            "plots",
+            "metrics",
+            "checkpoints",
+        }.issubset(logged_artifact_paths)
 
     def test_missing_tensorboard_dep_warns_not_crashes(self, tmp_path):
         """If tensorboard package is absent, a warning is logged and training continues."""

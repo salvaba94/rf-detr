@@ -28,6 +28,7 @@ from rfdetr.training.callbacks import (
     BestModelCallback,
     DatasetGridCallback,
     DropPathCallback,
+    PredictionGridCallback,
     RFDETRMLflowArtifactCallback,
     RFDETREarlyStopping,
     RFDETREMACallback,
@@ -335,6 +336,7 @@ def build_trainer(
 
     if tc.save_dataset_grids:
         callbacks.append(DatasetGridCallback())
+        callbacks.append(PredictionGridCallback(output_dir=tc.output_dir))
 
     if tc.progress_bar == "rich":
         callbacks.append(

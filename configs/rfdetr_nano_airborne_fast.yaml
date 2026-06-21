@@ -18,30 +18,23 @@ model:
       batch_size: 32
       grad_accum_steps: 1
       num_workers: 8
-      progress_bar: rich
 
       augmentation_backend: cpu
-      aug_config:
+      square_resize_div_64: false
+      pre_resize_aug_config:
         - TiledCroppingWithMasks:
             height: 640
             width: 640
             p: 0.8
+      aug_config:
         - CopyPaste:
             p: 0.3
             max_paste_objects: 3
             max_iou: 0.3
         - HorizontalFlip:
             p: 0.5
-        - Resize:
-            height: 640
-            width: 640
-            p: 1.0
-      eval_aug_config:
+      eval_pre_resize_aug_config:
         - TiledCroppingWithMasks:
-            height: 640
-            width: 640
-            p: 1.0
-        - Resize:
             height: 640
             width: 640
             p: 1.0

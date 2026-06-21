@@ -42,7 +42,10 @@ class RFDETRMLflowArtifactCallback(Callback):
         """Log end-of-run artifacts such as metrics and checkpoints."""
         if not trainer.is_global_zero:
             return
+        self._write_metric_plots()
         self._log_directory(trainer, self.output_dir / "dataset_grids", artifact_path="dataset_grids")
+        self._log_directory(trainer, self.output_dir / "prediction_grids", artifact_path="prediction_grids")
+        self._log_directory(trainer, self.output_dir / "plots", artifact_path="plots")
         self._log_file(trainer, self.output_dir / "metrics.csv", artifact_path="metrics")
         self._log_matching_files(
             trainer,
@@ -79,26 +82,51 @@ class RFDETRMLflowArtifactCallback(Callback):
 
     def _log_directory(self, trainer: Trainer, path: Path, *, artifact_path: str) -> None:
         """Upload a directory to MLflow when it exists."""
-        resolved_path = path.resolve()
-        if not path.is_dir() or resolved_path in self._logged_paths:
+        if not path.is_dir():
             return
-        mlflow_logger = self._get_mlflow_logger(trainer)
-        if mlflow_logger is None:
+        for file_path in sorted(path.rglob("*")):
+            if not file_path.is_file():
+                continue
+            relative_parent = file_path.parent.relative_to(path)
+            nested_artifact_path = Path(artifact_path)
+            if str(relative_parent) != ".":
+                nested_artifact_path /= relative_parent
+            self._log_file(trainer, file_path, artifact_path=str(nested_artifact_path))
+
+    def _write_metric_plots(self) -> None:
+        """Render training metric plots from ``metrics.csv`` when plotting deps are installed."""
+        metrics_path = self.output_dir / "metrics.csv"
+        if not metrics_path.is_file():
             return
-        try:
-            experiment = mlflow_logger.experiment
-            run_id = mlflow_logger.run_id
-            if hasattr(experiment, "log_artifacts"):
-                experiment.log_artifacts(run_id, str(path), artifact_path=artifact_path)
-            else:
-                for file_path in sorted(path.rglob("*")):
-                    if file_path.is_file():
-                        relative_parent = file_path.parent.relative_to(path)
-                        nested_artifact_path = str(Path(artifact_path) / relative_parent)
-                        experiment.log_artifact(run_id, str(file_path), artifact_path=nested_artifact_path)
-            self._logged_paths.add(resolved_path)
-        except Exception as exc:  # pragma: no cover - defensive logging, not control flow
-            logger.warning("MLflow artifact upload skipped for %s: %s", path, exc)
+        plots_dir = self.output_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        plot_specs = (
+            ("metrics.png", "plot_metrics", {"loss_log_scale": True}),
+            ("loss.png", "plot_loss_metrics", {"loss_log_scale": True}),
+            ("map.png", "plot_map_metrics", {}),
+        )
+        for filename, function_name, kwargs in plot_specs:
+            output_path = plots_dir / filename
+            if output_path.resolve() in self._logged_paths:
+                continue
+            try:
+                from rfdetr.visualize import training as training_plots
+
+                figure = getattr(training_plots, function_name)(
+                    str(metrics_path),
+                    output_path=str(output_path),
+                    **kwargs,
+                )
+                try:
+                    import matplotlib.pyplot as plt
+
+                    plt.close(figure)
+                except Exception:  # pragma: no cover - best-effort figure cleanup
+                    pass
+            except (FileNotFoundError, ImportError, ValueError) as exc:
+                logger.warning("MLflow metrics plot skipped for %s: %s", function_name, exc)
+            except Exception as exc:  # pragma: no cover - defensive logging, not control flow
+                logger.warning("MLflow metrics plot skipped for %s: %s", function_name, exc)
 
     def _log_file(self, trainer: Trainer, path: Path, *, artifact_path: str) -> None:
         """Upload one file to MLflow when it exists."""
