@@ -10,6 +10,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import torchvision.transforms as T  # noqa: N812
 from matplotlib.axes import Axes
 from supervision import BoxAnnotator, Color, Detections, LabelAnnotator
