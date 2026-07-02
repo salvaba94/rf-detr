@@ -13,6 +13,9 @@ from typing import Any
 import torch
 from pytorch_lightning import Callback, LightningModule, Trainer
 
+VALIDATION_PREDICTION_GRID_SCORE_THRESHOLD = 0.5
+VALIDATION_PREDICTION_GRID_MAX_PREDICTIONS = 50
+
 
 class DatasetGridCallback(Callback):
     """Save train/validation dataset grids once at the beginning of training."""
@@ -38,8 +41,8 @@ class PredictionGridCallback(Callback):
         output_dir: str,
         max_batches: int = 3,
         max_images: int = 9,
-        score_threshold: float = 0.25,
-        max_predictions: int = 50,
+        score_threshold: float = VALIDATION_PREDICTION_GRID_SCORE_THRESHOLD,
+        max_predictions: int = VALIDATION_PREDICTION_GRID_MAX_PREDICTIONS,
     ) -> None:
         """Initialize the callback.
 

@@ -12,6 +12,10 @@ from pytorch_lightning.callbacks import RichProgressBar, TQDMProgressBar
 
 from rfdetr.training import build_trainer
 from rfdetr.training.callbacks import DatasetGridCallback, PredictionGridCallback
+from rfdetr.training.callbacks.dataset_grids import (
+    VALIDATION_PREDICTION_GRID_MAX_PREDICTIONS,
+    VALIDATION_PREDICTION_GRID_SCORE_THRESHOLD,
+)
 
 # ---------------------------------------------------------------------------
 # TestProgressBarCallbacks — verifies the correct callback is installed
@@ -70,19 +74,15 @@ class TestDatasetGridCallback:
         assert any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
         assert any(isinstance(cb, PredictionGridCallback) for cb in trainer.callbacks)
 
-    def test_prediction_grid_callback_uses_configured_threshold(self, base_model_config, base_train_config):
-        """Prediction grid confidence filter and cap come from TrainConfig."""
+    def test_prediction_grid_callback_uses_validation_defaults(self, base_model_config, base_train_config):
+        """Prediction grid confidence filter and cap are validation defaults."""
         mc = base_model_config()
-        tc = base_train_config(
-            save_dataset_grids=True,
-            prediction_grid_score_threshold=0.4,
-            prediction_grid_max_predictions=12,
-        )
+        tc = base_train_config(save_dataset_grids=True)
         trainer = build_trainer(tc, mc, accelerator="cpu")
 
         callback = next(cb for cb in trainer.callbacks if isinstance(cb, PredictionGridCallback))
-        assert callback.score_threshold == 0.4
-        assert callback.max_predictions == 12
+        assert callback.score_threshold == VALIDATION_PREDICTION_GRID_SCORE_THRESHOLD
+        assert callback.max_predictions == VALIDATION_PREDICTION_GRID_MAX_PREDICTIONS
 
     def test_dataset_grid_callback_skipped_when_disabled(self, base_model_config, base_train_config):
         """save_dataset_grids=False must not add image grid callbacks."""

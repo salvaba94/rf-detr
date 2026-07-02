@@ -60,8 +60,6 @@ model:
         nms_iou_threshold: 0.5
         confidence_threshold: 0.001
       save_dataset_grids: true
-      prediction_grid_score_threshold: 0.5
-      prediction_grid_max_predictions: 50
 
 trainer:
   accelerator: auto
