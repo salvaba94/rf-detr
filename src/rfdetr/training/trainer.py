@@ -314,7 +314,13 @@ def build_trainer(
 
     if tc.save_dataset_grids:
         callbacks.append(DatasetGridCallback())
-        callbacks.append(PredictionGridCallback(output_dir=tc.output_dir))
+        callbacks.append(
+            PredictionGridCallback(
+                output_dir=tc.output_dir,
+                score_threshold=tc.validation_prediction_grid_score_threshold,
+                max_predictions=tc.validation_prediction_grid_max_predictions,
+            )
+        )
 
     if tc.progress_bar == "rich":
         callbacks.append(

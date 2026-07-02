@@ -734,6 +734,8 @@ class TrainConfig(BaseConfig):
     eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False
+    validation_prediction_grid_score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    validation_prediction_grid_max_predictions: int = Field(default=50, ge=1)
     notes: Optional[Any] = Field(
         default=None,
         description=(
