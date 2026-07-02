@@ -117,6 +117,18 @@ class TestRFDETRTrainPTL:
         assert fit_args[0][0] is mcls.return_value  # module instance
         assert fit_args[0][1] is dmcls.return_value  # datamodule instance
 
+    def test_validate_before_fit_runs_validation_first(self, tmp_path, patch_lit):
+        """validate_before_fit=True runs one validation pass before trainer.fit()."""
+        mock_self = _make_rfdetr_self(tmp_path, validate_before_fit=True)
+        p_mod, p_dm, p_bt, mcls, dmcls, mock_bt = patch_lit
+        with p_mod, p_dm, p_bt:
+            RFDETR.train(mock_self)
+
+        trainer = mock_bt.return_value
+        trainer.validate.assert_called_once_with(mcls.return_value, dmcls.return_value, ckpt_path=None)
+        method_names = [call[0] for call in trainer.mock_calls]
+        assert method_names.index("validate") < method_names.index("fit")
+
     def test_ckpt_path_none_when_resume_not_set(self, tmp_path, patch_lit):
         """trainer.fit receives ckpt_path=None when config.resume is None."""
         mock_self = _make_rfdetr_self(tmp_path)  # resume defaults to None

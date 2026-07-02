@@ -27,6 +27,8 @@ from rfdetr.datasets._keypoint_schema import (
     infer_yolo_keypoint_schema,
 )
 from rfdetr.datasets.coco import (
+    _disable_eval_crop_for_sahi,
+    _preserve_eval_size_for_sahi,
     _resolve_runtime_augmentation_backend,
     make_coco_transforms,
     make_coco_transforms_square_div_64,
@@ -894,7 +896,12 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
     num_windows = getattr(args, "num_windows", None)
     pre_resize_aug_config = getattr(args, "pre_resize_aug_config", None)
     aug_config = getattr(args, "aug_config", None)
-    eval_pre_resize_aug_config = getattr(args, "eval_pre_resize_aug_config", None)
+    eval_pre_resize_aug_config = _disable_eval_crop_for_sahi(
+        image_set,
+        getattr(args, "validation_mode", "standard"),
+        getattr(args, "eval_pre_resize_aug_config", None),
+    )
+    preserve_eval_size = _preserve_eval_size_for_sahi(image_set, getattr(args, "validation_mode", "standard"))
     eval_aug_config = getattr(args, "eval_aug_config", None)
     include_keypoints = getattr(args, "use_grouppose_keypoints", False)
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
@@ -931,6 +938,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
+                preserve_eval_size=preserve_eval_size,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
@@ -955,6 +963,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
+                preserve_eval_size=preserve_eval_size,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,

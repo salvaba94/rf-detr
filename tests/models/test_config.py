@@ -178,6 +178,45 @@ class TestModelConfigValidation:
         assert config.pre_resize_aug_config == pre_resize
         assert config.eval_pre_resize_aug_config == pre_resize
 
+    def test_sahi_validation_config_is_accepted(self) -> None:
+        """TrainConfig accepts SAHI validation options."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            validation_mode="sahi",
+            sahi={
+                "slice_height": 576,
+                "slice_width": 640,
+                "overlap_height_ratio": 0.25,
+                "overlap_width_ratio": 0.3,
+                "nms_iou_threshold": 0.45,
+                "confidence_threshold": 0.01,
+            },
+            validation_batch_size=2,
+        )
+
+        assert config.validation_mode == "sahi"
+        assert config.sahi_slice_height == 576
+        assert config.sahi_slice_width == 640
+        assert config.sahi_nms_iou_threshold == 0.45
+        assert config.validation_batch_size == 2
+
+    def test_nested_mlflow_config_is_accepted(self) -> None:
+        """TrainConfig accepts grouped MLflow options."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            mlflow={
+                "enabled": True,
+                "tracking_uri": "http://127.0.0.1:5000",
+                "log_artifacts": False,
+                "log_system_metrics": False,
+            },
+        )
+
+        assert config.mlflow is True
+        assert config.mlflow_tracking_uri == "http://127.0.0.1:5000"
+        assert config.mlflow_log_artifacts is False
+        assert config.mlflow_log_system_metrics is False
+
 
 class TestRFDETRBaseConfigEncoder:
     """Encoder field validation on RFDETRBaseConfig (no fixture needed — has defaults)."""

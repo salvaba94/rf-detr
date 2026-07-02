@@ -797,11 +797,33 @@ class TestValDataloader:
         loader = dm.val_dataloader()
         assert loader.batch_size == 6
 
+    def test_validation_batch_size_overrides_train_batch_size(self, tmp_path):
+        """The validation DataLoader can use a separate top-level batch size."""
+        dm = self._setup_dm_with_val(tmp_path, batch_size=6)
+        dm.train_config.validation_batch_size = 4
+        loader = dm.val_dataloader()
+        assert loader.batch_size == 4
+
     def test_num_workers_forwarded(self, tmp_path):
         """The DataLoader's num_workers matches the train config."""
         dm = self._setup_dm_with_val(tmp_path, num_workers=0)
         loader = dm.val_dataloader()
         assert loader.num_workers == 0
+
+    def test_sahi_validation_uses_single_image_batches_by_default(self, tmp_path):
+        """SAHI validation keeps full-image DataLoader batches memory-bounded by default."""
+        dm = self._setup_dm_with_val(tmp_path, batch_size=6)
+        dm.train_config.validation_mode = "sahi"
+        loader = dm.val_dataloader()
+        assert loader.batch_size == 1
+
+    def test_validation_batch_size_applies_to_sahi_validation(self, tmp_path):
+        """The top-level validation batch size also applies to SAHI validation."""
+        dm = self._setup_dm_with_val(tmp_path, batch_size=6)
+        dm.train_config.validation_mode = "sahi"
+        dm.train_config.validation_batch_size = 3
+        loader = dm.val_dataloader()
+        assert loader.batch_size == 3
 
 
 class TestTestDataloader:

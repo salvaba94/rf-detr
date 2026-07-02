@@ -58,6 +58,7 @@ train = [
     "pycocotools",
     "scipy",
     "albumentations>=1.4.24,<3.0.0",
+    "sahi>=0.12.1,<0.13.0",
     "roboflow",
     "rf100vl",
 ]
@@ -158,6 +159,16 @@ rfdetr = "rfdetr.cli:main"
 # remove the <'3.13' upper bound from the tflite deps AND from the override below.
 override-dependencies = [
     "ml-dtypes==0.5.1; python_version >= '3.12' and python_version < '3.13'",
+]
+conflicts = [
+    [
+        { extra = "train" },
+        { extra = "tflite" },
+    ],
+    [
+        { extra = "onnx" },
+        { extra = "tflite" },
+    ],
 ]
 
 

@@ -535,9 +535,22 @@ class TestMakeCollateFn:
         for t in targets:
             assert set(t.keys()) == {"boxes", "labels"}
 
-    def test_resize_size_choices_resize_batch_before_padding(self) -> None:
-        """Factory collator can apply one square multiscale resize to the whole batch."""
+    def test_resize_size_choices_preserves_aspect_ratio_by_default(self) -> None:
+        """Factory collator preserves aspect ratio for batch-level multiscale resize."""
         collate = make_collate_fn(block_size=32, resize_size_choices=[128])
+        samples, targets = collate(self._batch((3, 100, 200), (3, 150, 180)))
+
+        assert samples.tensors.shape[-2:] == (160, 256)
+        assert torch.equal(targets[0]["size"], torch.tensor([128, 256]))
+        assert torch.equal(targets[1]["size"], torch.tensor([128, 154]))
+        assert samples.mask[0, :128, :256].any().item() is False
+        assert samples.mask[0, 128:, :].all().item() is True
+        assert samples.mask[1, :128, :154].any().item() is False
+        assert samples.mask[1, :, 154:].all().item() is True
+
+    def test_resize_size_choices_can_resize_square_before_padding(self) -> None:
+        """Factory collator can still apply square resizing for the square path."""
+        collate = make_collate_fn(block_size=32, resize_size_choices=[128], preserve_aspect_ratio=False)
         samples, targets = collate(self._batch((3, 100, 200), (3, 150, 180)))
 
         assert samples.tensors.shape[-2:] == (128, 128)

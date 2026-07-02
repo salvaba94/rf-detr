@@ -144,6 +144,7 @@ def _make_batch(batch_size=2, channels=3, h=16, w=16):
             "labels": torch.tensor([1]),
             "image_id": torch.tensor(i),
             "orig_size": torch.tensor([h, w]),
+            "size": torch.tensor([h, w]),
         }
         for i in range(batch_size)
     ]
@@ -1284,6 +1285,159 @@ class TestValidationStep:
         logged_keys = [c[0][0] for c in module.log.call_args_list]
         assert "val/loss" not in logged_keys
         assert "results" in result and "targets" in result
+
+    def test_sahi_validation_uses_sliced_prediction_library(self, tmp_path):
+        """validation_mode='sahi' should call SAHI and return COCO-style prediction tensors."""
+        from types import SimpleNamespace
+
+        from sahi.prediction import ObjectPrediction
+
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=False,
+            validation_mode="sahi",
+            sahi_slice_height=8,
+            sahi_slice_width=8,
+            validation_batch_size=2,
+            class_names=["zero", "one"],
+        )
+        module, fake_model, fake_criterion, fake_pp = _build_module(
+            model_config=_base_model_config(num_classes=2, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+        samples, targets = _make_batch(batch_size=1, h=16, w=16)
+        fake_model.return_value = {}
+        sahi_result = SimpleNamespace(
+            object_prediction_list=[
+                ObjectPrediction(bbox=[1.0, 2.0, 5.0, 6.0], category_id=1, category_name="one", score=0.9)
+            ]
+        )
+
+        with patch("rfdetr.training.module_model.get_sliced_prediction", return_value=sahi_result) as mock_sahi:
+            result = module.validation_step((samples, targets), batch_idx=0)
+
+        mock_sahi.assert_called_once()
+        assert mock_sahi.call_args.kwargs["batch_size"] == 2
+        fake_criterion.assert_not_called()
+        fake_pp.assert_not_called()
+        assert result["results"][0]["boxes"].tolist() == [[1.0, 2.0, 5.0, 6.0]]
+        assert result["results"][0]["scores"].tolist() == [pytest.approx(0.9)]
+        assert result["results"][0]["labels"].tolist() == [1]
+
+    def test_sahi_validation_skips_full_frame_val_loss(self, tmp_path):
+        """SAHI validation should not run an extra full-image loss forward before sliced inference."""
+        from types import SimpleNamespace
+
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=True,
+            validation_mode="sahi",
+            sahi_slice_height=8,
+            sahi_slice_width=8,
+            class_names=["zero", "one"],
+        )
+        module, fake_model, fake_criterion, _ = _build_module(
+            model_config=_base_model_config(num_classes=2, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+        samples, targets = _make_batch(batch_size=1, h=16, w=16)
+        sahi_result = SimpleNamespace(object_prediction_list=[])
+
+        with patch("rfdetr.training.module_model.get_sliced_prediction", return_value=sahi_result):
+            module.validation_step((samples, targets), batch_idx=0)
+
+        fake_model.assert_not_called()
+        fake_criterion.assert_not_called()
+
+    def test_sahi_validation_scales_predictions_to_original_image_size(self, tmp_path):
+        """SAHI boxes from transformed validation tensors must be rescaled for metric targets."""
+        from types import SimpleNamespace
+
+        from sahi.prediction import ObjectPrediction
+
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=False,
+            validation_mode="sahi",
+            sahi_slice_height=8,
+            sahi_slice_width=8,
+            class_names=["zero", "one"],
+        )
+        module, _, _, _ = _build_module(
+            model_config=_base_model_config(num_classes=2, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+        samples, targets = _make_batch(batch_size=1, h=8, w=8)
+        targets[0]["orig_size"] = torch.tensor([16, 24])
+        targets[0]["size"] = torch.tensor([8, 8])
+        sahi_result = SimpleNamespace(
+            object_prediction_list=[
+                ObjectPrediction(bbox=[1.0, 2.0, 5.0, 6.0], category_id=1, category_name="one", score=0.9)
+            ]
+        )
+
+        with patch("rfdetr.training.module_model.get_sliced_prediction", return_value=sahi_result) as mock_sahi:
+            result = module.validation_step((samples, targets), batch_idx=0)
+
+        image_arg = mock_sahi.call_args.args[0]
+        assert image_arg.shape[:2] == (8, 8)
+        assert result["results"][0]["boxes"].tolist() == [[3.0, 4.0, 15.0, 12.0]]
+
+    def test_sahi_validation_uses_shifted_slice_coordinates(self, tmp_path):
+        """Slice-local SAHI boxes must be shifted back into full-image coordinates before scoring."""
+        from sahi.prediction import ObjectPrediction
+
+        tc = _base_train_config(tmp_path, validation_mode="sahi", class_names=["zero"])
+        module, _, _, _ = _build_module(
+            model_config=_base_model_config(num_classes=1, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+        prediction = ObjectPrediction(
+            bbox=[1.0, 2.0, 3.0, 4.0],
+            category_id=0,
+            category_name="zero",
+            score=0.9,
+            shift_amount=[5, 7],
+            full_shape=[20, 30],
+        )
+
+        result = module._sahi_prediction_to_result([prediction], device=torch.device("cpu"))
+
+        assert result["boxes"].tolist() == [[6.0, 9.0, 8.0, 11.0]]
+
+    def test_sahi_adapter_clamps_boxes_before_object_prediction(self):
+        """RF-DETR boxes outside slice bounds should be clamped before SAHI validation."""
+        from rfdetr.training.module_model import SAHIRFDETRDetectionModel
+
+        model = nn.Linear(1, 1)
+        adapter = SAHIRFDETRDetectionModel(
+            model=model,
+            postprocess=MagicMock(),
+            block_size=4,
+            category_names=["object"],
+            confidence_threshold=0.1,
+            max_detections=10,
+        )
+        adapter._original_shapes = [(10, 12, 3)]
+        adapter._original_predictions = [
+            {
+                "boxes": torch.tensor([[-3.0, -2.0, 20.0, 11.0]]),
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([0]),
+            }
+        ]
+
+        adapter._create_object_prediction_list_from_original_predictions(
+            shift_amount_list=[[0, 0]],
+            full_shape_list=[[10, 12]],
+        )
+
+        assert len(adapter.object_prediction_list) == 1
+        assert adapter.object_prediction_list[0].bbox.to_xyxy() == [0.0, 0.0, 12.0, 10.0]
 
 
 class TestTestStep:

@@ -31,20 +31,31 @@ class DatasetGridCallback(Callback):
 
 
 class PredictionGridCallback(Callback):
-    """Save validation prediction grids with ground-truth and predicted boxes."""
+    """Save validation prediction grids with predicted boxes."""
 
-    def __init__(self, output_dir: str, max_batches: int = 3, max_images: int = 9) -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        max_batches: int = 3,
+        max_images: int = 9,
+        score_threshold: float = 0.25,
+        max_predictions: int = 50,
+    ) -> None:
         """Initialize the callback.
 
         Args:
             output_dir: Training output directory.
             max_batches: Maximum number of validation batches to save per epoch.
             max_images: Maximum number of images to draw from each validation batch.
+            score_threshold: Minimum prediction confidence to draw.
+            max_predictions: Maximum number of predictions to draw per image.
         """
         super().__init__()
         self.output_dir = Path(output_dir)
         self.max_batches = max_batches
         self.max_images = max_images
+        self.score_threshold = score_threshold
+        self.max_predictions = max_predictions
 
     def on_validation_batch_end(
         self,
@@ -56,7 +67,12 @@ class PredictionGridCallback(Callback):
         dataloader_idx: int = 0,
     ) -> None:
         """Save prediction preview grids from the first few validation batches."""
-        if not trainer.is_global_zero or batch_idx >= self.max_batches or dataloader_idx != 0:
+        if (
+            not trainer.is_global_zero
+            or getattr(trainer, "sanity_checking", False) is True
+            or batch_idx >= self.max_batches
+            or dataloader_idx != 0
+        ):
             return
         epoch = int(trainer.current_epoch)
         if not isinstance(outputs, dict) or "results" not in outputs or "targets" not in outputs:
@@ -72,13 +88,11 @@ class PredictionGridCallback(Callback):
             )
 
     def _save_prediction_grid(self, batch: Any, outputs: dict[str, Any], *, epoch: int, batch_idx: int) -> None:
-        """Render and save a grid from validation images, targets, and predictions."""
+        """Render and save a grid from validation images and predictions."""
         import matplotlib.pyplot as plt
         import numpy as np
         import supervision as sv
         import torchvision.transforms as T  # noqa: N812
-
-        from rfdetr.utilities.box_ops import box_cxcywh_to_xyxy
 
         samples, _ = batch
         images = samples.tensors
@@ -93,7 +107,7 @@ class PredictionGridCallback(Callback):
             std=[1 / 0.229, 1 / 0.224, 1 / 0.225],
         )
         box_annotator = sv.BoxAnnotator(thickness=2)
-        label_annotator = sv.LabelAnnotator(text_scale=0.4, text_padding=2)
+        label_annotator = sv.LabelAnnotator(text_scale=0.7, text_padding=4)
 
         columns = 3
         rows = max(1, (count + columns - 1) // columns)
@@ -113,27 +127,12 @@ class PredictionGridCallback(Callback):
                 if isinstance(size, torch.Tensor)
                 else (int(image_tensor.shape[-2]), int(image_tensor.shape[-1]))
             )
-            image = inv_normalize(image_tensor)[:, :height, :width].detach().cpu().numpy()
+            image = inv_normalize(image_tensor).detach().float()[:, :height, :width].cpu().numpy()
             scene = np.ascontiguousarray((np.clip(image.transpose(1, 2, 0), 0.0, 1.0) * 255).astype(np.uint8))
-
-            gt_boxes = target.get("boxes", torch.zeros((0, 4), dtype=torch.float32))
-            if isinstance(gt_boxes, torch.Tensor) and gt_boxes.numel() > 0:
-                gt_xyxy = box_cxcywh_to_xyxy(gt_boxes.detach().cpu()) * torch.tensor(
-                    [width, height, width, height],
-                    dtype=torch.float32,
-                )
-                class_ids = target["labels"].detach().cpu().numpy().astype(int)
-                detections = sv.Detections(xyxy=gt_xyxy.numpy().astype(np.float32), class_id=class_ids)
-                scene = box_annotator.annotate(scene=scene, detections=detections)
-                scene = label_annotator.annotate(
-                    scene=scene,
-                    detections=detections,
-                    labels=[f"gt {class_id}" for class_id in class_ids],
-                )
 
             pred_boxes = result.get("boxes", torch.zeros((0, 4), dtype=torch.float32))
             if isinstance(pred_boxes, torch.Tensor) and pred_boxes.numel() > 0:
-                pred_xyxy = pred_boxes.detach().cpu().numpy().astype(np.float32)
+                pred_xyxy = pred_boxes.detach().float().cpu().numpy().astype(np.float32)
                 orig_size = target.get("orig_size", size)
                 if isinstance(orig_size, torch.Tensor):
                     orig_height, orig_width = int(orig_size[0]), int(orig_size[1])
@@ -142,8 +141,19 @@ class PredictionGridCallback(Callback):
                         pred_xyxy[:, [1, 3]] *= height / orig_height
                 scores = result.get("scores", torch.zeros((pred_xyxy.shape[0],), dtype=torch.float32))
                 labels = result.get("labels", torch.zeros((pred_xyxy.shape[0],), dtype=torch.int64))
+                confidences = scores.detach().float().cpu().numpy().astype(float)
+                keep = confidences >= self.score_threshold
+                if keep.any():
+                    order = np.argsort(-confidences[keep])[: self.max_predictions]
+                    kept_indices = np.flatnonzero(keep)[order]
+                    pred_xyxy = pred_xyxy[kept_indices]
+                    confidences = confidences[kept_indices]
+                    labels = labels[torch.as_tensor(kept_indices, device=labels.device)]
+                else:
+                    pred_xyxy = pred_xyxy[:0]
+                    confidences = confidences[:0]
+                    labels = labels[:0]
                 class_ids = labels.detach().cpu().numpy().astype(int)
-                confidences = scores.detach().cpu().numpy().astype(float)
                 detections = sv.Detections(xyxy=pred_xyxy, class_id=class_ids, confidence=confidences)
                 scene = box_annotator.annotate(scene=scene, detections=detections)
                 scene = label_annotator.annotate(
@@ -156,7 +166,7 @@ class PredictionGridCallback(Callback):
                 )
 
             axis.imshow(scene)
-            axis.set_title(f"sample {index}: GT + predictions", fontsize=10)
+            axis.set_title(f"sample {index}: pred >= {self.score_threshold:.2f}", fontsize=10)
             axis.axis("off")
 
         fig.tight_layout()

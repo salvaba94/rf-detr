@@ -81,8 +81,8 @@ If you plan to contribute to RF-DETR or modify the codebase locally, set up a lo
         # Sync environment (creates .venv, installs pinned Python, and installs dependencies)
         uv sync
 
-        # Install the package in development mode with all extras
-        uv pip install -e . --all-extras
+        # Install the package in development mode with training and test dependencies
+        uv sync --group tests --extra train --extra cli --extra loggers --extra visual
         ```
 
 ## Additional Notes

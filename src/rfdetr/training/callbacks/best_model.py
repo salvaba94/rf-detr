@@ -408,6 +408,9 @@ class BestModelCallback(ModelCheckpoint):
             trainer: The Lightning Trainer instance.
             pl_module: The ``RFDETRModelModule`` being trained.
         """
+        if getattr(trainer, "sanity_checking", False) is True:
+            return
+
         # Stash before the skip guard — eligible epochs still need this reference
         # inside _save_checkpoint (which receives no pl_module param).
         self._current_pl_module = pl_module
@@ -649,6 +652,9 @@ class RFDETREarlyStopping(EarlyStopping):
             trainer: The Lightning Trainer instance.
             pl_module: The ``RFDETRModelModule`` being trained.
         """
+        if getattr(trainer, "sanity_checking", False) is True:
+            return
+
         if trainer.current_epoch < self._skip_best_epochs:
             return
 

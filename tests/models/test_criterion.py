@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-"""Unit tests for SetCriterion edge paths: _output_device and num_boxes_for_targets."""
+"""Unit tests for SetCriterion edge paths and diagnostics."""
 
 import pytest
 import torch
@@ -29,6 +29,17 @@ def _bare_criterion() -> SetCriterion:
     criterion.matcher = _MatcherStub()
     criterion.num_keypoints_per_class = []
     return criterion
+
+
+def _cardinality_criterion() -> SetCriterion:
+    """Return a minimal initialized criterion for diagnostic loss tests."""
+    return SetCriterion(
+        num_classes=3,
+        matcher=None,
+        weight_dict={},
+        focal_alpha=0.25,
+        losses=["cardinality"],
+    )
 
 
 class TestOutputDevice:
@@ -104,3 +115,31 @@ class TestNumBoxesForTargets:
 
         # 2 + 1 = 3 boxes; single-process so no all-reduce
         assert result.item() == pytest.approx(3.0)
+
+
+class TestCardinalityDiagnostic:
+    """Tests for sigmoid-head cardinality diagnostics."""
+
+    def test_counts_sigmoid_confident_queries(self) -> None:
+        """Cardinality diagnostic counts queries above sigmoid threshold, not argmax classes."""
+        criterion = _cardinality_criterion()
+        logits = torch.full((1, 4, 3), -10.0, requires_grad=True)
+        logits.data[0, 0, 1] = 10.0
+        logits.data[0, 2, 2] = 10.0
+        outputs = {"pred_logits": logits}
+        targets = [{"labels": torch.tensor([0, 2])}]
+
+        losses = criterion.loss_cardinality(outputs, targets, indices=None, num_boxes=None)
+
+        assert losses["cardinality_error"].item() == 0.0
+        assert not losses["cardinality_error"].requires_grad
+
+    def test_low_logits_predict_zero_objects(self) -> None:
+        """All-low sigmoid logits should produce zero predicted objects."""
+        criterion = _cardinality_criterion()
+        outputs = {"pred_logits": torch.full((1, 4, 3), -10.0)}
+        targets = [{"labels": torch.tensor([0, 2])}]
+
+        losses = criterion.loss_cardinality(outputs, targets, indices=None, num_boxes=None)
+
+        assert losses["cardinality_error"].item() == 2.0

@@ -530,14 +530,12 @@ def _build_train_resize_config(
             }
         }
     else:
-        cap = max_size or 1333
         # SmallestMaxSize accepts a list and picks randomly — no OneOf needed
         size_param: Any = scales[0] if len(scales) == 1 else scales
         option_a = {
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": size_param}},
-                    {"LongestMaxSize": {"max_size": cap}},
                 ]
             }
         }
@@ -547,7 +545,6 @@ def _build_train_resize_config(
                     {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
                     {"RandomSizedCrop": {"min_max_height": [384, 600], "height": 384, "width": 384}},
                     {"SmallestMaxSize": {"max_size": size_param}},
-                    {"LongestMaxSize": {"max_size": cap}},
                 ]
             }
         }
@@ -582,6 +579,7 @@ def make_coco_transforms(
     eval_aug_config: dict[str, Any] | list[dict[str, Any]] | None = None,
     gpu_postprocess: bool = False,
     keypoint_flip_pairs: list[int] | None = None,
+    preserve_eval_size: bool = False,
 ) -> Compose:
     """Build the standard COCO transform pipeline for a given dataset split.
 
@@ -646,9 +644,11 @@ def make_coco_transforms(
 
     if image_set == "train":
         resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = AlbumentationsWrapper.from_config(
-            _build_train_resize_config(scales, square=False, max_size=1333)
-        )
+        resize_wrappers = []
+        if not (multi_scale and skip_random_resize):
+            resize_wrappers = AlbumentationsWrapper.from_config(
+                _build_train_resize_config(scales, square=False, max_size=1333)
+            )
         pipeline = []
         if not gpu_postprocess and pre_resize_aug_config:
             pre_resize_aug_wrappers = AlbumentationsWrapper.from_config(
@@ -667,12 +667,12 @@ def make_coco_transforms(
         return Compose(pipeline)
 
     if image_set in ("val", "test"):
-        resize_wrappers = AlbumentationsWrapper.from_config(
-            [
-                {"SmallestMaxSize": {"max_size": resolution}},
-                {"LongestMaxSize": {"max_size": 1333}},
-            ]
-        )
+        resize_wrappers = []
+        if not preserve_eval_size:
+            resize_config = [{"SmallestMaxSize": {"max_size": resolution}}]
+            if eval_pre_resize_aug_config is None and eval_aug_config is None:
+                resize_config.append({"LongestMaxSize": {"max_size": 1333}})
+            resize_wrappers = AlbumentationsWrapper.from_config(resize_config)
         pipeline = []
         if eval_pre_resize_aug_config is not None:
             pipeline += [
@@ -710,6 +710,7 @@ def make_coco_transforms_square_div_64(
     eval_aug_config: dict[str, Any] | list[dict[str, Any]] | None = None,
     gpu_postprocess: bool = False,
     keypoint_flip_pairs: list[int] | None = None,
+    preserve_eval_size: bool = False,
 ) -> Compose:
     """Create COCO transforms with square resizing where the output size is divisible by 64.
 
@@ -777,7 +778,11 @@ def make_coco_transforms_square_div_64(
         return Compose(pipeline)
 
     if image_set in ("val", "test", "val_speed"):
-        resize_wrappers = AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution}}])
+        resize_wrappers = []
+        if not preserve_eval_size:
+            resize_wrappers = AlbumentationsWrapper.from_config(
+                [{"Resize": {"height": resolution, "width": resolution}}]
+            )
         if eval_aug_config is None:
             if eval_pre_resize_aug_config is None:
                 return Compose([*resize_wrappers, to_image, to_float, normalize])
@@ -810,6 +815,41 @@ def make_coco_transforms_square_div_64(
     raise ValueError(f"unknown {image_set}")
 
 
+def _disable_eval_crop_for_sahi(
+    image_set: str,
+    validation_mode: str,
+    eval_pre_resize_aug_config: Any,
+) -> Any:
+    """Return eval crop config after applying SAHI validation semantics.
+
+    Args:
+        image_set: Dataset split being built.
+        validation_mode: Validation strategy from ``TrainConfig``.
+        eval_pre_resize_aug_config: User-provided eval pre-resize augmentations.
+
+    Returns:
+        ``None`` for validation/test splits in SAHI mode, otherwise the original config.
+    """
+    if image_set.split("_")[0] in {"val", "test"} and validation_mode == "sahi":
+        if eval_pre_resize_aug_config is not None:
+            logger.info("validation_mode='sahi': ignoring eval_pre_resize_aug_config for full-image sliced eval.")
+        return None
+    return eval_pre_resize_aug_config
+
+
+def _preserve_eval_size_for_sahi(image_set: str, validation_mode: str) -> bool:
+    """Return whether eval transforms should keep original image size for SAHI slicing.
+
+    Args:
+        image_set: Dataset split being built.
+        validation_mode: Validation strategy from ``TrainConfig``.
+
+    Returns:
+        ``True`` for validation/test splits in SAHI mode.
+    """
+    return image_set.split("_")[0] in {"val", "test"} and validation_mode == "sahi"
+
+
 def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     root = Path(getattr(args, "dataset_dir", None) or args.coco_path)
     if not root.exists():
@@ -833,9 +873,14 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
     pre_resize_aug_config = getattr(args, "pre_resize_aug_config", None)
     aug_config = getattr(args, "aug_config", None)
-    eval_pre_resize_aug_config = getattr(args, "eval_pre_resize_aug_config", None)
+    eval_pre_resize_aug_config = _disable_eval_crop_for_sahi(
+        image_set,
+        getattr(args, "validation_mode", "standard"),
+        getattr(args, "eval_pre_resize_aug_config", None),
+    )
+    preserve_eval_size = _preserve_eval_size_for_sahi(image_set, getattr(args, "validation_mode", "standard"))
     eval_aug_config = getattr(args, "eval_aug_config", None)
-    keypoint_flip_pairs: list[int] = getattr(args, "keypoint_flip_pairs", []) or []
+    keypoint_flip_pairs: list[int] | None = (getattr(args, "keypoint_flip_pairs", []) or []) if has_keypoints else None
     augmentation_backend = getattr(args, "augmentation_backend", "cpu")
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(augmentation_backend)
     if resolved_augmentation_backend != augmentation_backend and resolved_augmentation_backend == "cpu":
@@ -864,6 +909,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
+                preserve_eval_size=preserve_eval_size,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
@@ -892,6 +938,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
+                preserve_eval_size=preserve_eval_size,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
@@ -945,10 +992,17 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     # Roboflow detection exports omit keypoint schema/flip-pair fields; missing values mean detection-only.
     include_keypoints = getattr(args, "use_grouppose_keypoints", False)
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
-    keypoint_flip_pairs: list[int] = getattr(args, "keypoint_flip_pairs", []) or []
+    keypoint_flip_pairs: list[int] | None = (
+        (getattr(args, "keypoint_flip_pairs", []) or []) if include_keypoints else None
+    )
     pre_resize_aug_config = getattr(args, "pre_resize_aug_config", None)
     aug_config = getattr(args, "aug_config", None)
-    eval_pre_resize_aug_config = getattr(args, "eval_pre_resize_aug_config", None)
+    eval_pre_resize_aug_config = _disable_eval_crop_for_sahi(
+        image_set,
+        getattr(args, "validation_mode", "standard"),
+        getattr(args, "eval_pre_resize_aug_config", None),
+    )
+    preserve_eval_size = _preserve_eval_size_for_sahi(image_set, getattr(args, "validation_mode", "standard"))
     eval_aug_config = getattr(args, "eval_aug_config", None)
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
     gpu_postprocess = resolved_augmentation_backend != "cpu"
@@ -972,6 +1026,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
+                preserve_eval_size=preserve_eval_size,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
@@ -997,6 +1052,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 eval_aug_config=eval_aug_config,
                 gpu_postprocess=gpu_postprocess,
                 keypoint_flip_pairs=keypoint_flip_pairs,
+                preserve_eval_size=preserve_eval_size,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,

@@ -250,10 +250,9 @@ class COCOEvalCallback(Callback):
             trainer: The PTL Trainer.
             pl_module: The LightningModule.
         """
-        self.map_metric.reset()
-        self._f1_local = init_matching_accumulator()
-        self._reset_keypoint_split("val")
-        self._reset_keypoint_split("val_ema")
+        self._reset_validation_accumulators()
+        if getattr(trainer, "sanity_checking", False) is True:
+            return
         self._prepare_ema_metric(trainer, pl_module)
 
     def on_test_epoch_start(self, trainer: Any, pl_module: Any) -> None:
@@ -361,6 +360,9 @@ class COCOEvalCallback(Callback):
             batch: The device-transferred batch ``(samples, targets)``.
             batch_idx: Batch index within the validation epoch.
         """
+        if getattr(trainer, "sanity_checking", False) is True:
+            return
+
         preds: list[dict[str, torch.Tensor]] = self._convert_preds(outputs["results"])
         targets = self._convert_targets(outputs["targets"])
 
@@ -404,6 +406,10 @@ class COCOEvalCallback(Callback):
             trainer: The PTL Trainer.
             pl_module: The LightningModule.
         """
+        if getattr(trainer, "sanity_checking", False) is True:
+            self._reset_validation_accumulators()
+            return
+
         if self._eval_interval > 1:
             current_epoch = int(getattr(trainer, "current_epoch", 0)) + 1
             max_epochs = getattr(trainer, "max_epochs", None)
@@ -464,6 +470,16 @@ class COCOEvalCallback(Callback):
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _reset_validation_accumulators(self) -> None:
+        """Clear validation metric state without logging a validation result."""
+        self.map_metric.reset()
+        if self.map_metric_ema is not None:
+            self.map_metric_ema.reset()
+        self._ema_has_updates = False
+        self._f1_local = init_matching_accumulator()
+        self._reset_keypoint_split("val")
+        self._reset_keypoint_split("val_ema")
 
     def _compute_and_log(self, trainer: Any, pl_module: Any, split: str, *, metric: Any | None = None) -> None:
         """Shared epoch-end logic for validation and test evaluation loops.

@@ -182,6 +182,7 @@ class SetCriterion(nn.Module):
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.num_keypoints_per_class = num_keypoints_per_class or []
+        self.cardinality_threshold = 0.5
 
     @staticmethod
     def _output_device(outputs: dict[str, Any]) -> torch.device:
@@ -410,8 +411,10 @@ class SetCriterion(nn.Module):
         pred_logits = outputs["pred_logits"]
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count the number of predictions that are NOT "no-object" (which is the last class)
-        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        # RF-DETR uses sigmoid/focal classification, so there is no softmax
+        # no-object class to count with argmax.  Count a query as an object when
+        # any class probability crosses a fixed diagnostic threshold.
+        card_pred = (pred_logits.sigmoid().amax(dim=-1) > self.cardinality_threshold).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {"cardinality_error": card_err}
         return losses

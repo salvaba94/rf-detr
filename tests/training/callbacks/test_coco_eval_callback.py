@@ -277,6 +277,38 @@ class TestOnTestBatchEnd:
         cb.on_test_batch_end(_make_trainer(), _make_pl_module(), outputs, None, 0, dataloader_idx=0)
 
 
+class TestSanityCheck:
+    """Validation sanity checks must not publish partial validation metrics."""
+
+    def test_validation_batch_end_ignores_sanity_check(self) -> None:
+        """Sanity validation batches do not update mAP or F1 state."""
+        cb = COCOEvalCallback()
+        cb.setup(_make_trainer(), _make_pl_module(), stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        trainer = _make_trainer()
+        trainer.sanity_checking = True
+        outputs = {"results": _detection_preds(0), "targets": _detection_targets(label=1)}
+
+        cb.on_validation_batch_end(trainer, _make_pl_module(), outputs, None, 0)
+
+        cb.map_metric.update.assert_not_called()
+        assert sum(v["total_gt"] for v in cb._f1_local.values()) == 0
+
+    def test_validation_epoch_end_ignores_sanity_check(self) -> None:
+        """Sanity validation epoch end resets state without computing/logging metrics."""
+        cb = COCOEvalCallback()
+        cb.setup(_make_trainer(), _make_pl_module(), stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        trainer = _make_trainer()
+        trainer.sanity_checking = True
+
+        with patch.object(cb, "_compute_and_log") as compute_and_log:
+            cb.on_validation_epoch_end(trainer, _make_pl_module())
+
+        compute_and_log.assert_not_called()
+        cb.map_metric.reset.assert_called_once()
+
+
 class TestOnTrainBatchEnd:
     """Train-loop-specific behaviour for optional train mAP logging."""
 

@@ -18,6 +18,52 @@ from rfdetr.utilities.logger import get_logger
 logger = get_logger()
 
 
+class MLFlowSystemMonitorCallback(Callback):
+    """Start MLflow's native system metrics monitor for the active Lightning run."""
+
+    def __init__(self) -> None:
+        """Initialize the callback."""
+        super().__init__()
+        self.system_monitor: Any | None = None
+
+    def on_fit_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Start MLflow system metric collection for the active MLflow run."""
+        if not trainer.is_global_zero:
+            return
+        mlflow_logger = RFDETRMLflowArtifactCallback._get_mlflow_logger(trainer)
+        if mlflow_logger is None:
+            logger.warning("MLflow system metrics disabled: no MLFlowLogger is attached to the trainer.")
+            return
+        try:
+            from mlflow.system_metrics.system_metrics_monitor import SystemMetricsMonitor
+        except ModuleNotFoundError as exc:
+            logger.warning("MLflow system metrics disabled: %s. Install MLflow system metrics dependencies.", exc)
+            return
+        except Exception as exc:  # pragma: no cover - defensive optional dependency guard
+            logger.warning("MLflow system metrics disabled: %s", exc)
+            return
+
+        try:
+            self.system_monitor = SystemMetricsMonitor(run_id=mlflow_logger.run_id)
+            self.system_monitor.start()
+            logger.info("Started MLflow system metrics monitor for run %s.", mlflow_logger.run_id)
+        except Exception as exc:  # pragma: no cover - defensive optional dependency guard
+            self.system_monitor = None
+            logger.warning("MLflow system metrics disabled: %s", exc)
+
+    def on_fit_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Stop MLflow system metric collection."""
+        if not trainer.is_global_zero or self.system_monitor is None:
+            return
+        try:
+            self.system_monitor.finish()
+            logger.info("Stopped MLflow system metrics monitor.")
+        except Exception as exc:  # pragma: no cover - defensive optional dependency guard
+            logger.warning("Failed to stop MLflow system metrics monitor cleanly: %s", exc)
+        finally:
+            self.system_monitor = None
+
+
 class RFDETRMLflowArtifactCallback(Callback):
     """Upload RF-DETR run artifacts to the active MLflow run.
 

@@ -3,17 +3,20 @@
 
 model:
   model_config:
-    class_path: rfdetr.config.RFDETRNanoConfig
+    class_path: rfdetr.config.RFDETRMediumConfig
     init_args:
-      num_classes: 6
+      num_classes: 4
       amp: true
-      resolution: 640
+      resolution: 576
+      num_queries: 100
+      num_select: 100
+
 
   train_config:
     class_path: rfdetr.config.TrainConfig
     init_args:
       dataset_dir: ../airborne-object-tracking/exports/rf_detr_coco/
-      output_dir: output/rfdetr_nano_airborne_fast
+      output_dir: output/rfdetr_medium_airborne_fast
 
       epochs: 25
       batch_size: 32
@@ -23,19 +26,20 @@ model:
       progress_bar: rich
 
       augmentation_backend: cpu
-      square_resize_div_64: false
       pre_resize_aug_config:
         - TiledCroppingWithMasks:
-            height: 640
-            width: 640
-            p: 0.8
+            height: 576
+            width: 576
+            p: 0.9
       aug_config:
         - CopyPaste:
-            p: 0.3
+            p: 0.1
             max_paste_objects: 3
             max_iou: 0.3
         - HorizontalFlip:
             p: 0.5
+
+      square_resize_div_64: false
       multi_scale: true
       do_random_resize_via_padding: false
 
@@ -46,11 +50,11 @@ model:
         log_artifacts: true
         log_system_metrics: true
       train_log_on_step: true
-      validate_before_fit: true
+      validate_before_fit: false
       validation_mode: sahi
       sahi:
-        slice_height: 640
-        slice_width: 640
+        slice_height: 576
+        slice_width: 576
         overlap_height_ratio: 0.2
         overlap_width_ratio: 0.2
         nms_iou_threshold: 0.5

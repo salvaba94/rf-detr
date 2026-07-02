@@ -575,6 +575,53 @@ class TestBuildRoboflowFromCocoBackendResolution:
         assert mock_transforms.call_args.kwargs["gpu_postprocess"] is False
 
     @pytest.mark.parametrize(
+        ("validation_mode", "expected_eval_pre_resize"),
+        [
+            pytest.param("standard", [{"TiledCroppingWithMasks": {"height": 576, "width": 576, "p": 1.0}}], id="standard"),
+            pytest.param("sahi", None, id="sahi"),
+        ],
+    )
+    def test_sahi_validation_suppresses_eval_pre_resize_crop(
+        self,
+        tmp_path: Path,
+        validation_mode: str,
+        expected_eval_pre_resize: object,
+    ) -> None:
+        """SAHI validation should evaluate full transformed frames, not cropped eval samples."""
+        from unittest.mock import MagicMock, patch
+
+        from rfdetr.datasets.coco import build_roboflow_from_coco
+
+        crop_config = [{"TiledCroppingWithMasks": {"height": 576, "width": 576, "p": 1.0}}]
+        args = types.SimpleNamespace(
+            dataset_dir=str(tmp_path),
+            augmentation_backend="cpu",
+            square_resize_div_64=False,
+            segmentation_head=False,
+            multi_scale=False,
+            expanded_scales=False,
+            do_random_resize_via_padding=False,
+            patch_size=16,
+            num_windows=4,
+            use_grouppose_keypoints=False,
+            aug_config=None,
+            eval_pre_resize_aug_config=crop_config,
+            validation_mode=validation_mode,
+        )
+
+        with (
+            patch("rfdetr.datasets.coco.make_coco_transforms") as mock_transforms,
+            patch("rfdetr.datasets.coco.CocoDetection") as mock_coco,
+        ):
+            mock_transforms.return_value = MagicMock()
+            mock_coco.return_value = MagicMock()
+
+            build_roboflow_from_coco("val", args, resolution=576)
+
+        assert mock_transforms.call_args.kwargs["eval_pre_resize_aug_config"] == expected_eval_pre_resize
+        assert mock_transforms.call_args.kwargs["preserve_eval_size"] is (validation_mode == "sahi")
+
+    @pytest.mark.parametrize(
         ("square_resize_div_64", "transform_factory"),
         [
             pytest.param(False, "make_coco_transforms", id="standard_resize"),

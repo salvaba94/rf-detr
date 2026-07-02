@@ -125,7 +125,7 @@ class TestBuildTrainResizeConfigSquareMultiScale:
 
 
 class TestBuildTrainResizeConfigNonSquareSingleScale:
-    """Square=False, single scale — SmallestMaxSize uses scalar, default cap 1333."""
+    """Square=False, single scale — SmallestMaxSize uses scalar without forced long-side upscaling."""
 
     def test_option_a_uses_scalar_size(self):
         result = _build_train_resize_config([640], square=False)
@@ -134,7 +134,6 @@ class TestBuildTrainResizeConfigNonSquareSingleScale:
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": 640}},
-                    {"LongestMaxSize": {"max_size": 1333}},
                 ]
             }
         }
@@ -148,15 +147,14 @@ class TestBuildTrainResizeConfigNonSquareSingleScale:
                     {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
                     {"RandomSizedCrop": {"min_max_height": [384, 600], "height": 384, "width": 384}},
                     {"SmallestMaxSize": {"max_size": 640}},
-                    {"LongestMaxSize": {"max_size": 1333}},
                 ]
             }
         }
 
-    def test_custom_max_size(self):
+    def test_custom_max_size_does_not_force_long_side_resize(self):
         result = _build_train_resize_config([640], square=False, max_size=800)
         option_a = result[0]["OneOf"]["transforms"][0]
-        assert option_a["Sequential"]["transforms"][1] == {"LongestMaxSize": {"max_size": 800}}
+        assert option_a["Sequential"]["transforms"] == [{"SmallestMaxSize": {"max_size": 640}}]
 
 
 class TestBuildTrainResizeConfigNonSquareMultiScale:
@@ -169,7 +167,6 @@ class TestBuildTrainResizeConfigNonSquareMultiScale:
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": [480, 640]}},
-                    {"LongestMaxSize": {"max_size": 1333}},
                 ]
             }
         }
@@ -183,17 +180,16 @@ class TestBuildTrainResizeConfigNonSquareMultiScale:
                     {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
                     {"RandomSizedCrop": {"min_max_height": [384, 600], "height": 384, "width": 384}},
                     {"SmallestMaxSize": {"max_size": [480, 640]}},
-                    {"LongestMaxSize": {"max_size": 1333}},
                 ]
             }
         }
 
-    def test_custom_max_size_propagates_to_both_options(self):
+    def test_custom_max_size_does_not_add_train_long_side_resize(self):
         result = _build_train_resize_config([480, 640], square=False, max_size=1000)
         option_a = result[0]["OneOf"]["transforms"][0]
         option_b = result[0]["OneOf"]["transforms"][1]
-        assert option_a["Sequential"]["transforms"][1] == {"LongestMaxSize": {"max_size": 1000}}
-        assert option_b["Sequential"]["transforms"][3] == {"LongestMaxSize": {"max_size": 1000}}
+        assert option_a["Sequential"]["transforms"] == [{"SmallestMaxSize": {"max_size": [480, 640]}}]
+        assert option_b["Sequential"]["transforms"][-1] == {"SmallestMaxSize": {"max_size": [480, 640]}}
 
 
 class TestBuildTrainResizeConfigNonSquareScaleJitter:

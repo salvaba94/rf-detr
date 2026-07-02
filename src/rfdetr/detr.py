@@ -828,6 +828,8 @@ class RFDETR:
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
         trainer = build_trainer(config, self.model_config, **trainer_kwargs)
+        if config.validate_before_fit:
+            trainer.validate(module, datamodule, ckpt_path=config.resume or None)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.

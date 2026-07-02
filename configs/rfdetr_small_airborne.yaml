@@ -3,41 +3,57 @@
 
 model:
   model_config:
-    class_path: rfdetr.config.RFDETRNanoConfig
+    class_path: rfdetr.config.RFDETRSmallConfig
     init_args:
-      num_classes: 6
+      num_classes: 4
       amp: true
       resolution: 640
+      num_queries: 50
+      num_select: 50
 
   train_config:
     class_path: rfdetr.config.TrainConfig
     init_args:
       dataset_dir: ../airborne-object-tracking/exports/rf_detr_coco/
-      output_dir: output/rfdetr_nano_airborne_fast
+      output_dir: output/rfdetr_small_airborne_fast
 
-      epochs: 25
-      batch_size: 32
-      validation_batch_size: 1
+      epochs: 15
+      batch_size: 16
+      validation_batch_size: 4
       grad_accum_steps: 1
-      num_workers: 8
+      num_workers: 4
       progress_bar: rich
 
+      lr: 0.00005
+      lr_encoder: 0.000075
+      lr_scheduler: cosine
+      lr_min_factor: 0.05
+      warmup_epochs: 1.0
+
+      early_stopping: true
+      early_stopping_patience: 3
+      early_stopping_min_delta: 0.002
+      early_stopping_use_ema: false
+
+      use_ema: true
+      ema_decay: 0.99
+
       augmentation_backend: cpu
-      square_resize_div_64: false
+      #square_resize_div_64: false
       pre_resize_aug_config:
         - TiledCroppingWithMasks:
             height: 640
             width: 640
-            p: 0.8
+            p: 0.9
       aug_config:
         - CopyPaste:
-            p: 0.3
+            p: 0.1
             max_paste_objects: 3
             max_iou: 0.3
         - HorizontalFlip:
             p: 0.5
-      multi_scale: true
-      do_random_resize_via_padding: false
+      multi_scale: false
+      #do_random_resize_via_padding: false
 
       tensorboard: false
       wandb: false
@@ -45,8 +61,6 @@ model:
         enabled: true
         log_artifacts: true
         log_system_metrics: true
-      train_log_on_step: true
-      validate_before_fit: true
       validation_mode: sahi
       sahi:
         slice_height: 640
@@ -54,7 +68,7 @@ model:
         overlap_height_ratio: 0.2
         overlap_width_ratio: 0.2
         nms_iou_threshold: 0.5
-        confidence_threshold: 0.001
+        confidence_threshold: 0.25
       save_dataset_grids: true
       prediction_grid_score_threshold: 0.5
       prediction_grid_max_predictions: 50

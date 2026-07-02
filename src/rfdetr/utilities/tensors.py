@@ -300,6 +300,7 @@ def _collate_with_block_size(
     batch: list[tuple[Any, ...]],
     block_size: int | None = None,
     resize_size_choices: tuple[int, ...] | None = None,
+    preserve_aspect_ratio: bool = True,
 ) -> tuple[Any, ...]:
     """Module-level collate helper used as the base for :func:`make_collate_fn`.
 
@@ -310,8 +311,11 @@ def _collate_with_block_size(
         batch: List of ``(image, target)`` pairs from a dataset.
         block_size: When set, round batch ``H`` and ``W`` up to the next multiple of this value before padding.  See
             :func:`nested_tensor_from_tensor_list`.
-        resize_size_choices: Optional square sizes. When provided, one size is sampled per batch and every image is
-            resized to that size before padding.
+        resize_size_choices: Optional sizes. When provided, one size is sampled
+            per batch and every image is resized before padding.
+        preserve_aspect_ratio: If ``True``, resize each image so its shorter
+            side equals the sampled size. If ``False``, resize every image to a
+            square ``size x size``.
 
     Returns:
         Tuple of ``(NestedTensor_of_images, tuple_of_targets)``.
@@ -319,7 +323,12 @@ def _collate_with_block_size(
     batch = list(zip(*batch))
     if resize_size_choices:
         size = int(resize_size_choices[int(torch.randint(0, len(resize_size_choices), ()).item())])
-        images, targets = _resize_collate_batch(list(batch[0]), list(batch[1]), size)
+        images, targets = _resize_collate_batch(
+            list(batch[0]),
+            list(batch[1]),
+            size,
+            preserve_aspect_ratio=preserve_aspect_ratio,
+        )
         batch[0] = images
         batch[1] = tuple(targets)
     batch[0] = nested_tensor_from_tensor_list(batch[0], block_size=block_size)
@@ -330,13 +339,17 @@ def _resize_collate_batch(
     images: list[Tensor],
     targets: list[dict[str, Any]],
     size: int,
+    *,
+    preserve_aspect_ratio: bool,
 ) -> tuple[list[Tensor], list[dict[str, Any]]]:
-    """Resize every image in a batch to one square size before padding.
+    """Resize every image in a batch before padding.
 
     Args:
         images: Image tensors in ``C,H,W`` format.
         targets: Per-image target dictionaries.
-        size: Output square size.
+        size: Output square size, or output short side when
+            ``preserve_aspect_ratio=True``.
+        preserve_aspect_ratio: Whether to preserve each image's aspect ratio.
 
     Returns:
         Resized images and shallow-copied targets with updated ``size`` metadata.
@@ -344,20 +357,28 @@ def _resize_collate_batch(
     resized_images: list[Tensor] = []
     resized_targets: list[dict[str, Any]] = []
     for image, target in zip(images, targets):
+        _, height, width = image.shape
+        if preserve_aspect_ratio:
+            scale = float(size) / float(min(height, width))
+            resized_height = int(round(height * scale))
+            resized_width = int(round(width * scale))
+        else:
+            resized_height = size
+            resized_width = size
         resized_image = F.interpolate(
             image.unsqueeze(0),
-            size=(size, size),
+            size=(resized_height, resized_width),
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
         resized_target = target.copy()
-        resized_target["size"] = torch.as_tensor([size, size], dtype=torch.int64)
+        resized_target["size"] = torch.as_tensor([resized_height, resized_width], dtype=torch.int64)
         if "masks" in resized_target and torch.is_tensor(resized_target["masks"]):
             masks = resized_target["masks"]
             if masks.numel() > 0:
                 resized_target["masks"] = F.interpolate(
                     masks.unsqueeze(1).float(),
-                    size=(size, size),
+                    size=(resized_height, resized_width),
                     mode="nearest",
                 ).squeeze(1).to(masks.dtype)
         resized_images.append(resized_image)
@@ -384,6 +405,7 @@ def collate_fn(batch: list[tuple[Any, ...]]) -> tuple[Any, ...]:
 def make_collate_fn(
     block_size: int | None = None,
     resize_size_choices: list[int] | tuple[int, ...] | None = None,
+    preserve_aspect_ratio: bool = True,
 ) -> Callable[[list[tuple[Any, ...]]], tuple[Any, ...]]:
     """Build a collate function that rounds batch ``H``/``W`` up to *block_size*.
 
@@ -397,10 +419,18 @@ def make_collate_fn(
     Args:
         block_size: When set, batch ``H`` and ``W`` are rounded up to the next
             multiple of this value before padding.  The rounded-up strip is marked as padding in the NestedTensor mask.
-        resize_size_choices: Optional square sizes. When set, one size is sampled per batch and applied before padding.
+        resize_size_choices: Optional sizes. When set, one size is sampled per
+            batch and applied before padding.
+        preserve_aspect_ratio: Preserve image aspect ratios for batch-level
+            resizing. Set to ``False`` only for explicit square-resize training.
 
     Returns:
         A collate callable suitable for ``torch.utils.data.DataLoader``.
     """
     resize_choices_tuple = tuple(resize_size_choices) if resize_size_choices is not None else None
-    return partial(_collate_with_block_size, block_size=block_size, resize_size_choices=resize_choices_tuple)
+    return partial(
+        _collate_with_block_size,
+        block_size=block_size,
+        resize_size_choices=resize_choices_tuple,
+        preserve_aspect_ratio=preserve_aspect_ratio,
+    )

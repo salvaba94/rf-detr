@@ -191,6 +191,7 @@ if alb is not None:
             ignore_values: list[int] | None = None,
             ignore_channels: list[int] | None = None,
             allow_empty: bool = False,
+            deterministic: bool = False,
             min_visibility: float = 0.05,
             min_area: float = 1.0,
             p: float = 0.5,
@@ -220,6 +221,7 @@ if alb is not None:
             self.height_range = self._validate_size_range(height_range, "height_range")
             self.width_range = self._validate_size_range(width_range, "width_range")
             self.allow_empty = bool(allow_empty)
+            self.deterministic_crop = bool(deterministic)
             self.min_visibility = float(min_visibility)
             self.min_area = float(min_area)
 
@@ -265,6 +267,35 @@ if alb is not None:
             self.width = min(self.width, mask_width)
             return mask
 
+        def _clamp_crop_size(self, image_height: int, image_width: int) -> None:
+            """Ensure crop dimensions fit the current image."""
+            self.height = min(self.height, image_height)
+            self.width = min(self.width, image_width)
+
+        def _random_crop_coords(self, image_height: int, image_width: int) -> dict[str, tuple[int, int, int, int]]:
+            """Return a random crop when no foreground guidance is available."""
+            self._clamp_crop_size(image_height, image_width)
+            max_x = max(image_width - self.width, 0)
+            max_y = max(image_height - self.height, 0)
+            x_min = self.py_random.randint(0, max_x) if max_x > 0 else 0
+            y_min = self.py_random.randint(0, max_y) if max_y > 0 else 0
+            return {"crop_coords": (x_min, y_min, x_min + self.width, y_min + self.height)}
+
+        def _deterministic_crop_coords(self, mask: np.ndarray) -> dict[str, tuple[int, int, int, int]]:
+            """Return a stable foreground-centered crop for evaluation."""
+            mask_2d = mask.any(axis=-1) if mask.ndim == 3 else mask
+            ys, xs = np.nonzero(mask_2d)
+            if len(xs) == 0 or len(ys) == 0:
+                image_height, image_width = mask_2d.shape[:2]
+                return self._random_crop_coords(image_height, image_width)
+
+            image_height, image_width = mask_2d.shape[:2]
+            center_x = int(round((int(xs.min()) + int(xs.max())) / 2))
+            center_y = int(round((int(ys.min()) + int(ys.max())) / 2))
+            x_min = min(max(center_x - self.width // 2, 0), max(image_width - self.width, 0))
+            y_min = min(max(center_y - self.height // 2, 0), max(image_height - self.height, 0))
+            return {"crop_coords": (x_min, y_min, x_min + self.width, y_min + self.height)}
+
         def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
             """Select random size and then delegate crop sampling to Albumentations."""
             self._random_size()
@@ -278,12 +309,14 @@ if alb is not None:
                 if self.allow_empty:
                     return super().get_params_dependent_on_data(params, data)
                 image_height, image_width = params["shape"][:2]
-                return {"crop_coords": (0, 0, image_width, image_height)}
+                return self._random_crop_coords(image_height, image_width)
 
             processed_mask = self._preprocess_mask(np.asarray(mask).copy())
             if not self.allow_empty and not processed_mask.any():
                 image_height, image_width = params["shape"][:2]
-                return {"crop_coords": (0, 0, image_width, image_height)}
+                return self._random_crop_coords(image_height, image_width)
+            if self.deterministic_crop:
+                return self._deterministic_crop_coords(processed_mask)
             data = dict(data)
             data["mask"] = processed_mask
             return super().get_params_dependent_on_data(params, data)

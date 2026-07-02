@@ -102,6 +102,7 @@ _TC_NON_NAMESPACE_FIELDS = {
     "dont_save_weights",
     "pin_memory",
     "persistent_workers",
+    "validation_batch_size",
     "lr_scheduler",
     "lr_min_factor",
     # Dataset class labels.

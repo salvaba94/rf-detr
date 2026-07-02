@@ -1803,8 +1803,8 @@ class TestTiledCroppingWithMasks:
         torch.testing.assert_close(aug_target["keypoints"][0, 0], expected_visible)
         torch.testing.assert_close(aug_target["keypoints"][0, 1], target["keypoints"][0, 1])
 
-    def test_no_boxes_returns_unchanged_by_default(self):
-        """No-box inputs should be unchanged when allow_empty is False."""
+    def test_no_boxes_use_random_crop_fallback(self):
+        """No-box inputs should still produce a fixed-size random tile."""
         wrapper = AlbumentationsWrapper(TiledCroppingWithMasks(height=40, width=40, p=1.0))
         image = Image.new("RGB", (100, 100))
         target = {
@@ -1814,9 +1814,28 @@ class TestTiledCroppingWithMasks:
 
         aug_image, aug_target = wrapper(image, target)
 
-        assert aug_image.size == (100, 100)
+        assert aug_image.size == (40, 40)
         assert aug_target["boxes"].shape == (0, 4)
         assert aug_target["labels"].shape == (0,)
+
+    def test_deterministic_crop_is_stable_and_keeps_foreground(self):
+        """Deterministic tiled crops should be repeatable and retain object boxes."""
+        wrapper = AlbumentationsWrapper(
+            TiledCroppingWithMasks(height=50, width=50, p=1.0, deterministic=True, edge_bias_prob=0.0)
+        )
+        image = Image.new("RGB", (100, 100))
+        target = {
+            "boxes": torch.tensor([[60.0, 60.0, 90.0, 90.0]], dtype=torch.float32),
+            "labels": torch.tensor([1]),
+        }
+
+        first_image, first_target = wrapper(image, target)
+        second_image, second_target = wrapper(image, target)
+
+        assert first_image.size == (50, 50)
+        assert second_image.size == (50, 50)
+        torch.testing.assert_close(first_target["boxes"], second_target["boxes"])
+        assert first_target["labels"].tolist() == [1]
 
     def test_from_config_instantiates_tiled_cropping_with_masks(self):
         """TiledCroppingWithMasks should be available through RF-DETR aug_config."""
@@ -2331,6 +2350,21 @@ class TestMakeCocoTransformsAugConfig:
         assert names == ["TiledCroppingWithMasks", "SmallestMaxSize", "LongestMaxSize"]
         assert any(isinstance(t, UseTransformedSizeAsOrigSize) for t in pipeline.transforms)
 
+    def test_eval_pre_resize_aug_config_accepts_deterministic_tiled_crop(self):
+        """eval_pre_resize_aug_config should preserve deterministic tiled-crop options."""
+        pipeline = make_coco_transforms(
+            "val",
+            640,
+            eval_pre_resize_aug_config=[
+                {"TiledCroppingWithMasks": {"height": 640, "width": 640, "p": 1.0, "deterministic": True}}
+            ],
+        )
+        wrapper = next(t for t in pipeline.transforms if isinstance(t, AlbumentationsWrapper))
+        tiled_crop = wrapper.transform.transforms[0]
+
+        assert isinstance(tiled_crop, TiledCroppingWithMasks)
+        assert tiled_crop.deterministic_crop is True
+
     def test_use_transformed_size_as_orig_size(self):
         """Crop-space eval must postprocess and score against transformed image size."""
         transform = UseTransformedSizeAsOrigSize()
@@ -2374,6 +2408,27 @@ class TestMakeCocoTransformsOutputSize:
         tensor, _ = transform(self._make_image(), None)
         assert tensor.shape[-2:] == (self._RESOLUTION, self._RESOLUTION)
 
+    def test_nonsquare_train_tiled_crop_is_not_upscaled_to_long_side_cap(self) -> None:
+        """A 640px train tile must stay near the requested scale, not be expanded to the validation cap."""
+        transform = make_coco_transforms(
+            "train",
+            self._RESOLUTION,
+            pre_resize_aug_config=[
+                {"TiledCroppingWithMasks": {"height": self._RESOLUTION, "width": self._RESOLUTION, "p": 1.0}},
+            ],
+            aug_config={},
+        )
+        target = {
+            "boxes": torch.tensor([[900.0, 500.0, 1300.0, 900.0]], dtype=torch.float32),
+            "labels": torch.tensor([1], dtype=torch.int64),
+            "orig_size": torch.tensor([self._INPUT_H, self._INPUT_W], dtype=torch.int64),
+            "size": torch.tensor([self._INPUT_H, self._INPUT_W], dtype=torch.int64),
+        }
+
+        tensor, _ = transform(self._make_image(), target)
+
+        assert max(tensor.shape[-2:]) == self._RESOLUTION
+
     def test_nonsquare_val_resizes_and_caps_longest_side(self) -> None:
         """Non-square val transform resizes the image and keeps the longest side within 1333 px.
 
@@ -2408,6 +2463,13 @@ class TestMakeCocoTransformsOutputSize:
             f"Transform emitted original {self._INPUT_H}x{self._INPUT_W} — resize was not applied"
         )
 
+    def test_nonsquare_val_can_preserve_original_dimensions_for_sahi(self) -> None:
+        """SAHI validation must slice the original frame, not the resized validation tensor."""
+        transform = make_coco_transforms("val", self._RESOLUTION, preserve_eval_size=True)
+        tensor, _ = transform(self._make_image(), None)
+        height, width = tensor.shape[-2], tensor.shape[-1]
+        assert (height, width) == (self._INPUT_H, self._INPUT_W)
+
     def test_square_val_does_not_pass_original_dimensions(self) -> None:
         """Square val transform must not emit the original 1920x1080 dimensions — the core regression."""
         transform = make_coco_transforms_square_div_64("val", self._RESOLUTION)
@@ -2416,6 +2478,13 @@ class TestMakeCocoTransformsOutputSize:
         assert (height, width) != (self._INPUT_H, self._INPUT_W), (
             f"Transform emitted original {self._INPUT_H}x{self._INPUT_W} — resize was not applied"
         )
+
+    def test_square_val_can_preserve_original_dimensions_for_sahi(self) -> None:
+        """Square-resize datasets also preserve full frames when SAHI validation is enabled."""
+        transform = make_coco_transforms_square_div_64("val", self._RESOLUTION, preserve_eval_size=True)
+        tensor, _ = transform(self._make_image(), None)
+        height, width = tensor.shape[-2], tensor.shape[-1]
+        assert (height, width) == (self._INPUT_H, self._INPUT_W)
 
     def test_output_is_float_tensor(self) -> None:
         """Transform pipeline produces a float32 tensor, not a PIL Image."""

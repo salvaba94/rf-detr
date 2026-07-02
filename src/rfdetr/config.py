@@ -705,7 +705,7 @@ class TrainConfig(BaseConfig):
     progress_bar: Optional[Literal["tqdm", "rich"]] = None  # Progress bar style: "rich", "tqdm", or None to disable.
     tensorboard: bool = True
     wandb: bool = False
-    mlflow: bool = False
+    mlflow: bool | Dict[str, Any] = False
     mlflow_tracking_uri: Optional[str] = Field(default_factory=lambda: os.getenv("MLFLOW_TRACKING_URI"))
     mlflow_log_artifacts: bool = True
     mlflow_log_system_metrics: bool = True
@@ -714,16 +714,28 @@ class TrainConfig(BaseConfig):
     run: Optional[str] = None
     class_names: Optional[List[str]] = None
     run_test: bool = False
+    validate_before_fit: bool = False
     segmentation_head: bool = False
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
+    validation_batch_size: Optional[int] = Field(default=None, ge=1)
+    validation_mode: Literal["standard", "sahi"] = "standard"
+    sahi_slice_height: Optional[int] = Field(default=None, ge=1)
+    sahi_slice_width: Optional[int] = Field(default=None, ge=1)
+    sahi_overlap_height_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)
+    sahi_overlap_width_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)
+    sahi_nms_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    sahi_confidence_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
+    sahi: Optional[Dict[str, Any]] = None
     pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False
+    prediction_grid_score_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    prediction_grid_max_predictions: int = Field(default=50, ge=1)
     notes: Optional[Any] = Field(
         default=None,
         description=(
@@ -734,6 +746,66 @@ class TrainConfig(BaseConfig):
             "all other types are JSON-encoded."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_nested_mlflow_config(cls, data: Any) -> Any:
+        """Expand a nested ``mlflow`` YAML block into flat TrainConfig fields.
+
+        Args:
+            data: Raw config data received by Pydantic.
+
+        Returns:
+            Config data with supported ``mlflow`` keys mapped to internal fields.
+        """
+        if not isinstance(data, dict):
+            return data
+        mlflow = data.get("mlflow")
+        if not isinstance(mlflow, dict):
+            return data
+        expanded = dict(data)
+        mapping = {
+            "enabled": "mlflow",
+            "tracking_uri": "mlflow_tracking_uri",
+            "log_artifacts": "mlflow_log_artifacts",
+            "log_system_metrics": "mlflow_log_system_metrics",
+        }
+        for nested_key, field_name in mapping.items():
+            if nested_key in mlflow:
+                expanded[field_name] = mlflow[nested_key]
+        if "enabled" not in mlflow:
+            expanded["mlflow"] = True
+        return expanded
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_nested_sahi_config(cls, data: Any) -> Any:
+        """Expand a nested ``sahi`` YAML block into flat TrainConfig fields.
+
+        Args:
+            data: Raw config data received by Pydantic.
+
+        Returns:
+            Config data with supported ``sahi`` keys mapped to their internal fields.
+        """
+        if not isinstance(data, dict):
+            return data
+        sahi = data.get("sahi")
+        if not isinstance(sahi, dict):
+            return data
+        expanded = dict(data)
+        mapping = {
+            "slice_height": "sahi_slice_height",
+            "slice_width": "sahi_slice_width",
+            "overlap_height_ratio": "sahi_overlap_height_ratio",
+            "overlap_width_ratio": "sahi_overlap_width_ratio",
+            "nms_iou_threshold": "sahi_nms_iou_threshold",
+            "confidence_threshold": "sahi_confidence_threshold",
+        }
+        for nested_key, field_name in mapping.items():
+            if nested_key in sahi and field_name not in expanded:
+                expanded[field_name] = sahi[nested_key]
+        return expanded
 
     @model_validator(mode="after")
     def _warn_deprecated_train_config_fields(self) -> "TrainConfig":

@@ -70,6 +70,20 @@ class TestDatasetGridCallback:
         assert any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
         assert any(isinstance(cb, PredictionGridCallback) for cb in trainer.callbacks)
 
+    def test_prediction_grid_callback_uses_configured_threshold(self, base_model_config, base_train_config):
+        """Prediction grid confidence filter and cap come from TrainConfig."""
+        mc = base_model_config()
+        tc = base_train_config(
+            save_dataset_grids=True,
+            prediction_grid_score_threshold=0.4,
+            prediction_grid_max_predictions=12,
+        )
+        trainer = build_trainer(tc, mc, accelerator="cpu")
+
+        callback = next(cb for cb in trainer.callbacks if isinstance(cb, PredictionGridCallback))
+        assert callback.score_threshold == 0.4
+        assert callback.max_predictions == 12
+
     def test_dataset_grid_callback_skipped_when_disabled(self, base_model_config, base_train_config):
         """save_dataset_grids=False must not add image grid callbacks."""
         mc = base_model_config()
@@ -88,6 +102,17 @@ class TestDatasetGridCallback:
         callback.on_train_epoch_start(trainer, Mock())
 
         datamodule._maybe_save_dataset_grids.assert_called_once_with(epoch=3)
+
+    def test_prediction_grid_callback_skips_sanity_check(self):
+        """Prediction grids are saved only for real validation, not Lightning sanity batches."""
+        callback = PredictionGridCallback(output_dir="output")
+        callback._save_prediction_grid = Mock()
+        trainer = Mock(is_global_zero=True, sanity_checking=True, current_epoch=0)
+        outputs = {"results": [], "targets": []}
+
+        callback.on_validation_batch_end(trainer, Mock(), outputs, batch=None, batch_idx=0)
+
+        callback._save_prediction_grid.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

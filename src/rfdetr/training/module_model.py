@@ -11,8 +11,12 @@ import math
 import warnings
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 from pytorch_lightning import LightningModule, seed_everything
+from sahi.models.base import DetectionModel
+from sahi.predict import get_sliced_prediction
+from sahi.prediction import ObjectPrediction
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
@@ -20,6 +24,7 @@ from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_c
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.tensors import nested_tensor_from_tensor_list
 
 logger = get_logger()
 
@@ -34,6 +39,165 @@ _TRAIN_PROGRESS_LOSS_ALIASES: dict[str, str] = {
     "loss_keypoints_visible": "kp_vis",
     "loss_keypoints_nll": "kp_nll",
 }
+
+_IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32)
+_IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32)
+
+
+class SAHIRFDETRDetectionModel(DetectionModel):
+    """SAHI adapter that runs sliced inference through an in-memory RF-DETR module."""
+
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        postprocess: Any,
+        block_size: int,
+        category_names: list[str],
+        confidence_threshold: float,
+        max_detections: int,
+    ) -> None:
+        self.postprocess = postprocess
+        self.block_size = block_size
+        self.category_names = category_names
+        self.max_detections = max_detections
+        super().__init__(
+            model=model,
+            confidence_threshold=confidence_threshold,
+            category_mapping={str(index): name for index, name in enumerate(category_names)},
+            load_at_init=True,
+        )
+
+    def load_model(self) -> None:
+        """Reject path-based loading because the Lightning module already owns the model."""
+        raise ValueError("SAHIRFDETRDetectionModel requires an in-memory RF-DETR model.")
+
+    def set_model(self, model: torch.nn.Module, **kwargs: Any) -> None:
+        """Attach an existing RF-DETR model to the SAHI adapter.
+
+        Args:
+            model: In-memory RF-DETR model.
+            **kwargs: Unused SAHI extension hook.
+        """
+        self.model = model
+
+    def perform_inference(self, image: np.ndarray) -> None:
+        """Run RF-DETR inference on a single SAHI slice.
+
+        Args:
+            image: Slice image in HWC uint8 format.
+        """
+        self.perform_batch_inference([image])
+
+    def perform_batch_inference(self, images: list[np.ndarray]) -> None:
+        """Run RF-DETR inference on a batch of SAHI slices.
+
+        Args:
+            images: Slice images in HWC uint8 format.
+        """
+        if not images:
+            self._original_predictions = []
+            self._original_shapes = []
+            return
+        self._original_shapes = [image.shape for image in images]
+        device = next(self.model.parameters()).device
+        tensors = [self._image_to_tensor(image, device=device) for image in images]
+        samples = nested_tensor_from_tensor_list(tensors, block_size=self.block_size)
+        sizes = torch.as_tensor(
+            [[image.shape[0], image.shape[1]] for image in images],
+            dtype=torch.float32,
+            device=device,
+        )
+        with torch.no_grad():
+            outputs = self.model(samples)
+            self._original_predictions = self.postprocess(outputs, sizes)
+
+    def _create_object_prediction_list_from_original_predictions(
+        self,
+        shift_amount_list: list[list[int | float]] | None = None,
+        full_shape_list: list[list[int | float]] | None = None,
+    ) -> None:
+        """Convert RF-DETR predictions to SAHI object predictions.
+
+        Args:
+            shift_amount_list: Per-slice offsets supplied by SAHI.
+            full_shape_list: Full image shapes supplied by SAHI.
+        """
+        shift_amount_list = shift_amount_list or [[0, 0]]
+        predictions = self._original_predictions or []
+        object_predictions_per_image: list[list[ObjectPrediction]] = []
+        for index, prediction in enumerate(predictions):
+            shift_amount = shift_amount_list[index] if index < len(shift_amount_list) else [0, 0]
+            full_shape = full_shape_list[index] if full_shape_list and index < len(full_shape_list) else None
+            boxes = prediction.get("boxes", torch.empty((0, 4))).detach().float().cpu()
+            scores = prediction.get("scores", torch.empty(0)).detach().float().cpu()
+            labels = prediction.get("labels", torch.empty(0, dtype=torch.long)).detach().long().cpu()
+            if boxes.numel():
+                shape = self._original_shapes[index] if index < len(self._original_shapes or []) else None
+                if shape is not None:
+                    height, width = int(shape[0]), int(shape[1])
+                    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0.0, float(width))
+                    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0.0, float(height))
+                else:
+                    boxes = boxes.clamp_min(0.0)
+                finite = torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores)
+                boxes = boxes[finite]
+                scores = scores[finite]
+                labels = labels[finite]
+            if scores.numel():
+                keep = scores >= float(self.confidence_threshold)
+                boxes = boxes[keep]
+                scores = scores[keep]
+                labels = labels[keep]
+            if scores.numel() > self.max_detections:
+                keep = torch.topk(scores, self.max_detections).indices
+                boxes = boxes[keep]
+                scores = scores[keep]
+                labels = labels[keep]
+            object_predictions_per_image.append(
+                [
+                    ObjectPrediction(
+                        bbox=box.tolist(),
+                        category_id=int(label.item()),
+                        category_name=self._category_name(int(label.item())),
+                        score=float(score.item()),
+                        shift_amount=shift_amount,
+                        full_shape=full_shape,
+                    )
+                    for box, score, label in zip(boxes, scores, labels)
+                    if float(box[2] - box[0]) > 0.0 and float(box[3] - box[1]) > 0.0
+                ]
+            )
+        self._object_prediction_list_per_image = object_predictions_per_image
+
+    def _category_name(self, label: int) -> str:
+        """Return a display name for a zero-based category label.
+
+        Args:
+            label: Zero-based category label.
+
+        Returns:
+            Category name used by SAHI.
+        """
+        if 0 <= label < len(self.category_names):
+            return self.category_names[label]
+        return str(label)
+
+    @staticmethod
+    def _image_to_tensor(image: np.ndarray, *, device: torch.device) -> torch.Tensor:
+        """Convert a SAHI uint8 HWC image slice into a normalized RF-DETR tensor.
+
+        Args:
+            image: Slice image in HWC uint8 format.
+            device: Destination device.
+
+        Returns:
+            Normalized CHW tensor on ``device``.
+        """
+        tensor = torch.as_tensor(image, device=device).permute(2, 0, 1).float().div(255.0)
+        mean = _IMAGENET_MEAN.to(device=device)[:, None, None]
+        std = _IMAGENET_STD.to(device=device)[:, None, None]
+        return (tensor - mean) / std
 
 
 class RFDETRModelModule(LightningModule):
@@ -59,6 +223,7 @@ class RFDETRModelModule(LightningModule):
         # Allow partial state-dict loading when resuming from a .pth checkpoint
         # (which contains only model weights, not criterion/postprocess state).
         self.strict_loading = False
+        self._sahi_val_loss_warning_emitted = False
 
         # Model, criterion, and postprocessor.
         self.model = build_model_from_config(model_config, train_config)
@@ -457,6 +622,169 @@ class RFDETRModelModule(LightningModule):
         )
         self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
+    def _validation_uses_sahi(self) -> bool:
+        """Return whether validation should use SAHI sliced inference.
+
+        Returns:
+            ``True`` when ``TrainConfig.validation_mode`` is ``"sahi"``.
+        """
+        return getattr(self.train_config, "validation_mode", "standard") == "sahi"
+
+    def _make_sahi_detection_model(self) -> SAHIRFDETRDetectionModel:
+        """Build a SAHI adapter around the current RF-DETR model.
+
+        Returns:
+            SAHI detection model wrapper.
+        """
+        class_names = getattr(self.train_config, "class_names", None)
+        if not class_names:
+            class_names = [str(index) for index in range(int(self.model_config.num_classes))]
+        return SAHIRFDETRDetectionModel(
+            model=self.model,
+            postprocess=self.postprocess,
+            block_size=int(self.model_config.patch_size * self.model_config.num_windows),
+            category_names=list(class_names),
+            confidence_threshold=float(self.train_config.sahi_confidence_threshold),
+            max_detections=int(self.train_config.eval_max_dets),
+        )
+
+    @staticmethod
+    def _normalized_tensor_to_uint8_image(image: torch.Tensor) -> np.ndarray:
+        """Convert a normalized RF-DETR tensor into a uint8 HWC image for SAHI slicing.
+
+        Args:
+            image: Normalized CHW image tensor.
+
+        Returns:
+            HWC uint8 array.
+        """
+        mean = _IMAGENET_MEAN.to(device=image.device)[:, None, None]
+        std = _IMAGENET_STD.to(device=image.device)[:, None, None]
+        image = (image.detach().float() * std + mean).clamp(0.0, 1.0)
+        return image.mul(255.0).byte().permute(1, 2, 0).cpu().numpy()
+
+    def _sahi_prediction_to_result(
+        self,
+        object_predictions: list[ObjectPrediction],
+        *,
+        device: torch.device,
+        image_size: torch.Tensor | None = None,
+        orig_size: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Convert SAHI object predictions to torchmetrics-compatible tensors.
+
+        Args:
+            object_predictions: SAHI merged predictions for one image.
+            device: Destination device for returned tensors.
+            image_size: Transformed image size used for sliced inference.
+            orig_size: Original image size used by metric targets.
+
+        Returns:
+            Prediction dictionary with ``boxes``, ``scores``, and ``labels`` tensors.
+        """
+        if not object_predictions:
+            return {
+                "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
+                "scores": torch.empty(0, dtype=torch.float32, device=device),
+                "labels": torch.empty(0, dtype=torch.long, device=device),
+            }
+        shifted_predictions = [
+            prediction.get_shifted_object_prediction()
+            if hasattr(prediction, "get_shifted_object_prediction")
+            else prediction
+            for prediction in object_predictions
+        ]
+        boxes = torch.tensor(
+            [prediction.bbox.to_xyxy() for prediction in shifted_predictions],
+            dtype=torch.float32,
+            device=device,
+        )
+        scores = torch.tensor(
+            [float(prediction.score.value) for prediction in shifted_predictions],
+            dtype=torch.float32,
+            device=device,
+        )
+        labels = torch.tensor(
+            [int(prediction.category.id) for prediction in shifted_predictions],
+            dtype=torch.long,
+            device=device,
+        )
+        if scores.numel() > int(self.train_config.eval_max_dets):
+            keep = torch.topk(scores, int(self.train_config.eval_max_dets)).indices
+            boxes = boxes[keep]
+            scores = scores[keep]
+            labels = labels[keep]
+        if image_size is not None and orig_size is not None:
+            image_h, image_w = [float(value) for value in image_size.detach().cpu().tolist()]
+            orig_h, orig_w = [float(value) for value in orig_size.detach().cpu().tolist()]
+            if image_h > 0.0 and image_w > 0.0 and (image_h != orig_h or image_w != orig_w):
+                scale = boxes.new_tensor([orig_w / image_w, orig_h / image_h, orig_w / image_w, orig_h / image_h])
+                boxes = boxes * scale
+        return {"boxes": boxes, "scores": scores, "labels": labels}
+
+    def _validation_step_sahi(self, batch: Tuple, batch_idx: int) -> Dict[str, Any]:
+        """Run SAHI sliced inference for one validation batch.
+
+        Args:
+            batch: Tuple of (NestedTensor samples, list of target dicts).
+            batch_idx: Batch index within the validation epoch.
+
+        Returns:
+            Dict with ``results`` and ``targets`` for ``COCOEvalCallback``.
+        """
+        if getattr(self.model_config, "segmentation_head", False) or getattr(
+            self.model_config,
+            "use_grouppose_keypoints",
+            False,
+        ):
+            raise NotImplementedError("SAHI validation currently supports bbox detection models only.")
+
+        samples, targets = batch
+        if self.train_config.compute_val_loss:
+            if not self._sahi_val_loss_warning_emitted:
+                logger.info(
+                    "Skipping val/loss for validation_mode='sahi'; sliced validation reports mAP/F1 from tiled "
+                    "predictions instead of running an additional full-frame loss pass."
+                )
+                self._sahi_val_loss_warning_emitted = True
+
+        sahi_model = self._make_sahi_detection_model()
+        image_tensors = samples.tensors
+        results: list[dict[str, torch.Tensor]] = []
+        slice_height = self.train_config.sahi_slice_height or self.model_config.resolution
+        slice_width = self.train_config.sahi_slice_width or self.model_config.resolution
+        for image_tensor, target in zip(image_tensors, targets):
+            image_size = target.get("size", target["orig_size"])
+            height, width = [int(value) for value in image_size.tolist()]
+            image = self._normalized_tensor_to_uint8_image(image_tensor[:, :height, :width])
+            prediction = get_sliced_prediction(
+                image,
+                detection_model=sahi_model,
+                slice_height=int(slice_height),
+                slice_width=int(slice_width),
+                overlap_height_ratio=float(self.train_config.sahi_overlap_height_ratio),
+                overlap_width_ratio=float(self.train_config.sahi_overlap_width_ratio),
+                perform_standard_pred=False,
+                postprocess_type="NMS",
+                postprocess_match_metric="IOU",
+                postprocess_match_threshold=float(self.train_config.sahi_nms_iou_threshold),
+                verbose=0,
+                progress_bar=False,
+                auto_slice_resolution=False,
+                batch_size=int(self.train_config.validation_batch_size or 1),
+                force_postprocess_type=True,
+                confidence_threshold=float(self.train_config.sahi_confidence_threshold),
+            )
+            results.append(
+                self._sahi_prediction_to_result(
+                    prediction.object_prediction_list,
+                    device=target["boxes"].device,
+                    image_size=image_size,
+                    orig_size=target["orig_size"],
+                )
+            )
+        return {"results": results, "targets": targets}
+
     def validation_step(self, batch: Tuple, batch_idx: int) -> Dict[str, Any]:
         """Run forward pass and postprocess for one validation step.
 
@@ -470,6 +798,9 @@ class RFDETRModelModule(LightningModule):
         Returns:
             Dict with ``results`` (postprocessed predictions) and ``targets``.
         """
+        if self._validation_uses_sahi():
+            return self._validation_step_sahi(batch, batch_idx)
+
         samples, targets = batch
         outputs = self.model(samples)
         if self.train_config.compute_val_loss:

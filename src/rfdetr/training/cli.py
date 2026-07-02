@@ -25,6 +25,10 @@ from pytorch_lightning.cli import LightningArgumentParser, LightningCLI
 from rfdetr.training.module_data import RFDETRDataModule
 from rfdetr.training.module_model import RFDETRModelModule
 from rfdetr.training.trainer import build_trainer
+from rfdetr.utilities.logger import get_logger
+
+
+logger = get_logger()
 
 
 _TRAINER_PASSTHROUGH_KEYS = (
@@ -103,6 +107,15 @@ class RFDETRCli(LightningCLI):
             accelerator=accelerator,
             **trainer_kwargs,
         )
+
+    def before_fit(self) -> None:
+        """Optionally run validation once before the first training step."""
+        train_config = self.model.train_config
+        if not getattr(train_config, "validate_before_fit", False):
+            return
+        ckpt_path = train_config.resume or None
+        logger.info("Running validation before fit starts.")
+        self.trainer.validate(self.model, self.datamodule, ckpt_path=ckpt_path)
 
 
 def main() -> None:
