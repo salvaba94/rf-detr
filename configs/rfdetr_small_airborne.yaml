@@ -68,7 +68,7 @@ model:
         overlap_height_ratio: 0.2
         overlap_width_ratio: 0.2
         nms_iou_threshold: 0.5
-        confidence_threshold: 0.25
+        confidence_threshold: 0.5
       save_dataset_grids: true
       prediction_grid_score_threshold: 0.5
       prediction_grid_max_predictions: 50
