@@ -198,6 +198,7 @@ class TestModelConfigValidation:
         assert config.sahi_slice_height == 576
         assert config.sahi_slice_width == 640
         assert config.sahi_nms_iou_threshold == 0.45
+        assert config.validation_confidence_threshold == 0.01
         assert config.validation_batch_size == 2
 
     def test_nested_mlflow_config_is_accepted(self) -> None:

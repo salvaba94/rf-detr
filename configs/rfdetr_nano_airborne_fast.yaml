@@ -54,10 +54,9 @@ model:
         overlap_height_ratio: 0.2
         overlap_width_ratio: 0.2
         nms_iou_threshold: 0.5
-        confidence_threshold: 0.001
+      validation_confidence_threshold: 0.001
+      validation_max_predictions: 50
       save_dataset_grids: true
-      validation_prediction_grid_score_threshold: 0.5
-      validation_prediction_grid_max_predictions: 50
 
 trainer:
   accelerator: auto

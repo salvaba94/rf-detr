@@ -728,14 +728,14 @@ class TrainConfig(BaseConfig):
     sahi_nms_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     sahi_confidence_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
     sahi: Optional[Dict[str, Any]] = None
+    validation_confidence_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
+    validation_max_predictions: int = Field(default=500, ge=1)
     pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False
-    validation_prediction_grid_score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    validation_prediction_grid_max_predictions: int = Field(default=50, ge=1)
     notes: Optional[Any] = Field(
         default=None,
         description=(
@@ -790,17 +790,19 @@ class TrainConfig(BaseConfig):
         """
         if not isinstance(data, dict):
             return data
+        expanded = dict(data)
+        if "sahi_confidence_threshold" in expanded and "validation_confidence_threshold" not in expanded:
+            expanded["validation_confidence_threshold"] = expanded["sahi_confidence_threshold"]
         sahi = data.get("sahi")
         if not isinstance(sahi, dict):
-            return data
-        expanded = dict(data)
+            return expanded
         mapping = {
             "slice_height": "sahi_slice_height",
             "slice_width": "sahi_slice_width",
             "overlap_height_ratio": "sahi_overlap_height_ratio",
             "overlap_width_ratio": "sahi_overlap_width_ratio",
             "nms_iou_threshold": "sahi_nms_iou_threshold",
-            "confidence_threshold": "sahi_confidence_threshold",
+            "confidence_threshold": "validation_confidence_threshold",
         }
         for nested_key, field_name in mapping.items():
             if nested_key in sahi and field_name not in expanded:

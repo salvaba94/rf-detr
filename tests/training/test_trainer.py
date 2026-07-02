@@ -70,19 +70,15 @@ class TestDatasetGridCallback:
         assert any(isinstance(cb, DatasetGridCallback) for cb in trainer.callbacks)
         assert any(isinstance(cb, PredictionGridCallback) for cb in trainer.callbacks)
 
-    def test_prediction_grid_callback_uses_validation_config(self, base_model_config, base_train_config):
-        """Prediction grid confidence filter and cap come from validation TrainConfig fields."""
+    def test_prediction_grid_callback_uses_render_defaults(self, base_model_config, base_train_config):
+        """Prediction grid callback renders validation outputs without owning validation thresholds."""
         mc = base_model_config()
-        tc = base_train_config(
-            save_dataset_grids=True,
-            validation_prediction_grid_score_threshold=0.4,
-            validation_prediction_grid_max_predictions=12,
-        )
+        tc = base_train_config(save_dataset_grids=True)
         trainer = build_trainer(tc, mc, accelerator="cpu")
 
         callback = next(cb for cb in trainer.callbacks if isinstance(cb, PredictionGridCallback))
-        assert callback.score_threshold == 0.4
-        assert callback.max_predictions == 12
+        assert callback.score_threshold == 0.0
+        assert callback.max_predictions == 50
 
     def test_dataset_grid_callback_skipped_when_disabled(self, base_model_config, base_train_config):
         """save_dataset_grids=False must not add image grid callbacks."""

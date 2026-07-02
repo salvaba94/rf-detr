@@ -562,6 +562,39 @@ class RFDETRModelModule(LightningModule):
             for result in results
         ]
 
+    def _filter_validation_results(
+        self,
+        results: list[dict[str, torch.Tensor]],
+    ) -> list[dict[str, torch.Tensor]]:
+        """Apply validation confidence and count limits to postprocessed predictions.
+
+        Args:
+            results: Per-image postprocessed prediction dictionaries.
+
+        Returns:
+            Per-image dictionaries filtered by ``TrainConfig`` validation settings.
+        """
+        threshold = float(self.train_config.validation_confidence_threshold)
+        max_predictions = int(self.train_config.validation_max_predictions)
+        filtered_results: list[dict[str, torch.Tensor]] = []
+        for result in results:
+            scores = result.get("scores")
+            if not torch.is_tensor(scores) or scores.ndim == 0:
+                filtered_results.append(result)
+                continue
+            keep = torch.nonzero(scores >= threshold, as_tuple=False).flatten()
+            if keep.numel() > max_predictions:
+                order = torch.argsort(scores[keep], descending=True)[:max_predictions]
+                keep = keep[order]
+            filtered_result: dict[str, torch.Tensor] = {}
+            for key, value in result.items():
+                if torch.is_tensor(value) and value.shape[:1] == scores.shape[:1]:
+                    filtered_result[key] = value[keep]
+                else:
+                    filtered_result[key] = value
+            filtered_results.append(filtered_result)
+        return filtered_results
+
     def _log_train_progress_metrics(
         self,
         loss: torch.Tensor,
@@ -644,8 +677,8 @@ class RFDETRModelModule(LightningModule):
             postprocess=self.postprocess,
             block_size=int(self.model_config.patch_size * self.model_config.num_windows),
             category_names=list(class_names),
-            confidence_threshold=float(self.train_config.sahi_confidence_threshold),
-            max_detections=int(self.train_config.eval_max_dets),
+            confidence_threshold=float(self.train_config.validation_confidence_threshold),
+            max_detections=int(self.train_config.validation_max_predictions),
         )
 
     @staticmethod
@@ -709,8 +742,8 @@ class RFDETRModelModule(LightningModule):
             dtype=torch.long,
             device=device,
         )
-        if scores.numel() > int(self.train_config.eval_max_dets):
-            keep = torch.topk(scores, int(self.train_config.eval_max_dets)).indices
+        if scores.numel() > int(self.train_config.validation_max_predictions):
+            keep = torch.topk(scores, int(self.train_config.validation_max_predictions)).indices
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
@@ -773,7 +806,7 @@ class RFDETRModelModule(LightningModule):
                 auto_slice_resolution=False,
                 batch_size=int(self.train_config.validation_batch_size or 1),
                 force_postprocess_type=True,
-                confidence_threshold=float(self.train_config.sahi_confidence_threshold),
+                confidence_threshold=float(self.train_config.validation_confidence_threshold),
             )
             results.append(
                 self._sahi_prediction_to_result(
@@ -811,6 +844,7 @@ class RFDETRModelModule(LightningModule):
 
         orig_sizes = torch.stack([t["orig_size"] for t in targets])
         results = self.postprocess(outputs, orig_sizes)
+        results = self._filter_validation_results(results)
         return {"results": results, "targets": targets}
 
     @property

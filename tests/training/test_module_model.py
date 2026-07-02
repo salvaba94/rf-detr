@@ -1286,6 +1286,37 @@ class TestValidationStep:
         assert "val/loss" not in logged_keys
         assert "results" in result and "targets" in result
 
+    def test_validation_filters_predictions_by_confidence_and_count(self, tmp_path):
+        """Validation confidence/count settings apply before metrics and callbacks consume results."""
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=False,
+            validation_confidence_threshold=0.5,
+            validation_max_predictions=2,
+        )
+        module, fake_model, _, fake_pp = _build_module(train_config=tc, tmp_path=tmp_path)
+        samples, targets = _make_batch(batch_size=1)
+        fake_model.return_value = {}
+        fake_pp.return_value = [
+            {
+                "boxes": torch.tensor(
+                    [
+                        [0.0, 0.0, 1.0, 1.0],
+                        [1.0, 1.0, 2.0, 2.0],
+                        [2.0, 2.0, 3.0, 3.0],
+                        [3.0, 3.0, 4.0, 4.0],
+                    ]
+                ),
+                "scores": torch.tensor([0.4, 0.9, 0.7, 0.6]),
+                "labels": torch.tensor([0, 1, 2, 3]),
+            }
+        ]
+
+        result = module.validation_step((samples, targets), batch_idx=0)
+
+        assert result["results"][0]["scores"].tolist() == [pytest.approx(0.9), pytest.approx(0.7)]
+        assert result["results"][0]["labels"].tolist() == [1, 2]
+
     def test_sahi_validation_uses_sliced_prediction_library(self, tmp_path):
         """validation_mode='sahi' should call SAHI and return COCO-style prediction tensors."""
         from types import SimpleNamespace
@@ -1299,6 +1330,7 @@ class TestValidationStep:
             sahi_slice_height=8,
             sahi_slice_width=8,
             validation_batch_size=2,
+            validation_confidence_threshold=0.55,
             class_names=["zero", "one"],
         )
         module, fake_model, fake_criterion, fake_pp = _build_module(
@@ -1319,6 +1351,7 @@ class TestValidationStep:
 
         mock_sahi.assert_called_once()
         assert mock_sahi.call_args.kwargs["batch_size"] == 2
+        assert mock_sahi.call_args.kwargs["confidence_threshold"] == 0.55
         fake_criterion.assert_not_called()
         fake_pp.assert_not_called()
         assert result["results"][0]["boxes"].tolist() == [[1.0, 2.0, 5.0, 6.0]]
