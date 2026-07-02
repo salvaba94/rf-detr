@@ -8,6 +8,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -1442,6 +1443,35 @@ class TestValidationStep:
 
         assert result["boxes"].tolist() == [[6.0, 9.0, 8.0, 11.0]]
 
+    def test_sahi_prediction_to_result_preserves_masks(self, tmp_path):
+        """SAHI segmentation predictions must return mask tensors for segmentation mAP."""
+        from sahi.prediction import ObjectPrediction
+        from sahi.utils.cv import get_coco_segmentation_from_bool_mask
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:6, 1:5] = True
+        prediction = ObjectPrediction(
+            category_id=0,
+            category_name="zero",
+            segmentation=get_coco_segmentation_from_bool_mask(mask),
+            score=0.9,
+            shift_amount=[0, 0],
+            full_shape=[8, 8],
+        )
+        tc = _base_train_config(tmp_path, validation_mode="sahi", class_names=["zero"])
+        module, _, _, _ = _build_module(
+            model_config=_base_model_config(num_classes=1, segmentation_head=True, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+
+        result = module._sahi_prediction_to_result([prediction], device=torch.device("cpu"))
+
+        assert "masks" in result
+        assert result["masks"].shape == (1, 8, 8)
+        assert result["masks"].dtype is torch.bool
+        assert result["masks"][0, 2:6, 1:5].any()
+
     def test_sahi_adapter_clamps_boxes_before_object_prediction(self):
         """RF-DETR boxes outside slice bounds should be clamped before SAHI validation."""
         from rfdetr.training.module_model import SAHIRFDETRDetectionModel
@@ -1471,6 +1501,40 @@ class TestValidationStep:
 
         assert len(adapter.object_prediction_list) == 1
         assert adapter.object_prediction_list[0].bbox.to_xyxy() == [0.0, 0.0, 12.0, 10.0]
+
+    def test_sahi_adapter_preserves_rf_detr_masks(self):
+        """RF-DETR slice masks should be converted to SAHI object segmentations."""
+        from rfdetr.training.module_model import SAHIRFDETRDetectionModel
+
+        model = nn.Linear(1, 1)
+        adapter = SAHIRFDETRDetectionModel(
+            model=model,
+            postprocess=MagicMock(),
+            block_size=4,
+            category_names=["object"],
+            confidence_threshold=0.1,
+            max_detections=10,
+        )
+        mask = torch.zeros(1, 1, 12, 12, dtype=torch.bool)
+        mask[0, 0, 2:8, 3:9] = True
+        adapter._original_shapes = [(12, 12, 3)]
+        adapter._original_predictions = [
+            {
+                "boxes": torch.tensor([[3.0, 2.0, 9.0, 8.0]]),
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([0]),
+                "masks": mask,
+            }
+        ]
+
+        adapter._create_object_prediction_list_from_original_predictions(
+            shift_amount_list=[[0, 0]],
+            full_shape_list=[[12, 12]],
+        )
+
+        assert len(adapter.object_prediction_list) == 1
+        assert adapter.object_prediction_list[0].mask is not None
+        assert adapter.object_prediction_list[0].mask.bool_mask.any()
 
 
 class TestTestStep:

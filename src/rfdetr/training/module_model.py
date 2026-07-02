@@ -17,6 +17,7 @@ from pytorch_lightning import LightningModule, seed_everything
 from sahi.models.base import DetectionModel
 from sahi.predict import get_sliced_prediction
 from sahi.prediction import ObjectPrediction
+from sahi.utils.cv import get_coco_segmentation_from_bool_mask
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
@@ -132,6 +133,15 @@ class SAHIRFDETRDetectionModel(DetectionModel):
             boxes = prediction.get("boxes", torch.empty((0, 4))).detach().float().cpu()
             scores = prediction.get("scores", torch.empty(0)).detach().float().cpu()
             labels = prediction.get("labels", torch.empty(0, dtype=torch.long)).detach().long().cpu()
+            masks = prediction.get("masks")
+            if torch.is_tensor(masks):
+                masks = masks.detach().cpu().bool()
+                if masks.ndim == 4 and masks.shape[1] == 1:
+                    masks = masks.squeeze(1)
+                if masks.ndim != 3 or masks.shape[0] != boxes.shape[0]:
+                    masks = None
+            else:
+                masks = None
             if boxes.numel():
                 shape = self._original_shapes[index] if index < len(self._original_shapes or []) else None
                 if shape is not None:
@@ -144,30 +154,47 @@ class SAHIRFDETRDetectionModel(DetectionModel):
                 boxes = boxes[finite]
                 scores = scores[finite]
                 labels = labels[finite]
+                if masks is not None:
+                    masks = masks[finite]
             if scores.numel():
                 keep = scores >= float(self.confidence_threshold)
                 boxes = boxes[keep]
                 scores = scores[keep]
                 labels = labels[keep]
+                if masks is not None:
+                    masks = masks[keep]
             if scores.numel() > self.max_detections:
                 keep = torch.topk(scores, self.max_detections).indices
                 boxes = boxes[keep]
                 scores = scores[keep]
                 labels = labels[keep]
-            object_predictions_per_image.append(
-                [
+                if masks is not None:
+                    masks = masks[keep]
+            object_predictions: list[ObjectPrediction] = []
+            for prediction_index, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+                if float(box[2] - box[0]) <= 0.0 or float(box[3] - box[1]) <= 0.0:
+                    continue
+                segmentation = None
+                prediction_full_shape = full_shape
+                if masks is not None:
+                    mask_np = masks[prediction_index].numpy()
+                    segmentation = get_coco_segmentation_from_bool_mask(mask_np)
+                    if not segmentation:
+                        continue
+                    if prediction_full_shape is None:
+                        prediction_full_shape = list(mask_np.shape)
+                object_predictions.append(
                     ObjectPrediction(
                         bbox=box.tolist(),
                         category_id=int(label.item()),
                         category_name=self._category_name(int(label.item())),
+                        segmentation=segmentation,
                         score=float(score.item()),
                         shift_amount=shift_amount,
-                        full_shape=full_shape,
+                        full_shape=prediction_full_shape,
                     )
-                    for box, score, label in zip(boxes, scores, labels)
-                    if float(box[2] - box[0]) > 0.0 and float(box[3] - box[1]) > 0.0
-                ]
-            )
+                )
+            object_predictions_per_image.append(object_predictions)
         self._object_prediction_list_per_image = object_predictions_per_image
 
     def _category_name(self, label: int) -> str:
@@ -716,11 +743,17 @@ class RFDETRModelModule(LightningModule):
             Prediction dictionary with ``boxes``, ``scores``, and ``labels`` tensors.
         """
         if not object_predictions:
-            return {
+            result = {
                 "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
                 "scores": torch.empty(0, dtype=torch.float32, device=device),
                 "labels": torch.empty(0, dtype=torch.long, device=device),
             }
+            if getattr(self.model_config, "segmentation_head", False):
+                size = orig_size if orig_size is not None else image_size
+                if size is not None:
+                    height, width = [int(value) for value in size.detach().cpu().tolist()]
+                    result["masks"] = torch.empty((0, height, width), dtype=torch.bool, device=device)
+            return result
         shifted_predictions = [
             prediction.get_shifted_object_prediction()
             if hasattr(prediction, "get_shifted_object_prediction")
@@ -742,18 +775,41 @@ class RFDETRModelModule(LightningModule):
             dtype=torch.long,
             device=device,
         )
+        masks = None
+        mask_arrays = [
+            prediction.mask.bool_mask
+            for prediction in shifted_predictions
+            if getattr(prediction, "mask", None) is not None
+        ]
+        if len(mask_arrays) == len(shifted_predictions):
+            masks = torch.as_tensor(np.stack(mask_arrays), dtype=torch.bool, device=device)
         if scores.numel() > int(self.train_config.validation_max_predictions):
             keep = torch.topk(scores, int(self.train_config.validation_max_predictions)).indices
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
+            if masks is not None:
+                masks = masks[keep]
         if image_size is not None and orig_size is not None:
             image_h, image_w = [float(value) for value in image_size.detach().cpu().tolist()]
             orig_h, orig_w = [float(value) for value in orig_size.detach().cpu().tolist()]
             if image_h > 0.0 and image_w > 0.0 and (image_h != orig_h or image_w != orig_w):
                 scale = boxes.new_tensor([orig_w / image_w, orig_h / image_h, orig_w / image_w, orig_h / image_h])
                 boxes = boxes * scale
-        return {"boxes": boxes, "scores": scores, "labels": labels}
+                if masks is not None:
+                    masks = (
+                        torch.nn.functional.interpolate(
+                            masks.unsqueeze(1).float(),
+                            size=(int(orig_h), int(orig_w)),
+                            mode="nearest",
+                        )
+                        .squeeze(1)
+                        .bool()
+                    )
+        result = {"boxes": boxes, "scores": scores, "labels": labels}
+        if masks is not None:
+            result["masks"] = masks
+        return result
 
     def _validation_step_sahi(self, batch: Tuple, batch_idx: int) -> Dict[str, Any]:
         """Run SAHI sliced inference for one validation batch.
@@ -765,12 +821,8 @@ class RFDETRModelModule(LightningModule):
         Returns:
             Dict with ``results`` and ``targets`` for ``COCOEvalCallback``.
         """
-        if getattr(self.model_config, "segmentation_head", False) or getattr(
-            self.model_config,
-            "use_grouppose_keypoints",
-            False,
-        ):
-            raise NotImplementedError("SAHI validation currently supports bbox detection models only.")
+        if getattr(self.model_config, "use_grouppose_keypoints", False):
+            raise NotImplementedError("SAHI validation currently supports bbox and segmentation models only.")
 
         samples, targets = batch
         if self.train_config.compute_val_loss:
