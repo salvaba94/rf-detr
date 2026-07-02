@@ -574,7 +574,7 @@ class RFDETRModelModule(LightningModule):
         Returns:
             Per-image dictionaries filtered by ``TrainConfig`` validation settings.
         """
-        threshold = float(self.train_config.validation_confidence_threshold)
+        threshold = float(self.train_config.validation_score_threshold)
         max_predictions = int(self.train_config.validation_max_predictions)
         filtered_results: list[dict[str, torch.Tensor]] = []
         for result in results:
@@ -677,7 +677,7 @@ class RFDETRModelModule(LightningModule):
             postprocess=self.postprocess,
             block_size=int(self.model_config.patch_size * self.model_config.num_windows),
             category_names=list(class_names),
-            confidence_threshold=float(self.train_config.validation_confidence_threshold),
+            confidence_threshold=float(self.train_config.validation_score_threshold),
             max_detections=int(self.train_config.validation_max_predictions),
         )
 
@@ -806,7 +806,7 @@ class RFDETRModelModule(LightningModule):
                 auto_slice_resolution=False,
                 batch_size=int(self.train_config.validation_batch_size or 1),
                 force_postprocess_type=True,
-                confidence_threshold=float(self.train_config.validation_confidence_threshold),
+                confidence_threshold=float(self.train_config.validation_score_threshold),
             )
             results.append(
                 self._sahi_prediction_to_result(

@@ -1291,7 +1291,7 @@ class TestValidationStep:
         tc = _base_train_config(
             tmp_path,
             compute_val_loss=False,
-            validation_confidence_threshold=0.5,
+            validation_score_threshold=0.5,
             validation_max_predictions=2,
         )
         module, fake_model, _, fake_pp = _build_module(train_config=tc, tmp_path=tmp_path)
@@ -1330,7 +1330,7 @@ class TestValidationStep:
             sahi_slice_height=8,
             sahi_slice_width=8,
             validation_batch_size=2,
-            validation_confidence_threshold=0.55,
+            validation_score_threshold=0.55,
             class_names=["zero", "one"],
         )
         module, fake_model, fake_criterion, fake_pp = _build_module(
