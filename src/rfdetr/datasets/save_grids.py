@@ -24,7 +24,7 @@ logger = get_logger()
 
 
 class DatasetGridSaver:
-    """Utility for saving 3x3 image grids to visualize augmentation effects.
+    """Utility for saving image grids to visualize augmentation effects.
 
     Args:
         data_loader: Dataloader of the dataset to sample images from.
@@ -45,8 +45,8 @@ class DatasetGridSaver:
     def save_grid(self) -> None:
         """Create and save image grids to ``output_dir``.
 
-        Each grid is a 3x3 JPEG containing up to 9 images from a single batch, with bounding boxes and class labels
-        drawn on top.
+        Each grid contains up to 9 images from a single batch, with bounding boxes and class labels drawn on top.
+        The row count is based on the actual number of rendered samples so partial batches do not leave blank rows.
         """
         inv_normalize = T.Normalize(
             mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
@@ -63,20 +63,20 @@ class DatasetGridSaver:
             if batch_idx >= self.max_batches:
                 break
 
-            fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+            count = min(9, int(sample.tensors.shape[0]), len(target))
+            if count <= 0:
+                continue
+
+            columns = 3
+            rows = max(1, (count + columns - 1) // columns)
+            fig, axes = plt.subplots(rows, columns, figsize=(5 * columns, 5 * rows))
             fig.suptitle(f"{self.dataset_type} dataset, batch {batch_idx}")
-            axes = axes.flatten()
+            axes = np.asarray(axes, dtype=object).reshape(-1)
+            for axis in axes:
+                axis.axis("off")
 
-            sample_index = 0
-            for sample_index, (single_image, single_target) in enumerate(zip(sample.tensors, target)):
-                if sample_index >= 9:
-                    break
-                self._annotate_and_plot(
-                    single_image, single_target, axes[sample_index], inv_normalize, box_annotator, label_annotator
-                )
-
-            for i in range(sample_index, 9):
-                axes[i].axis("off")
+            for axis, (single_image, single_target) in zip(axes, zip(sample.tensors[:count], target[:count])):
+                self._annotate_and_plot(single_image, single_target, axis, inv_normalize, box_annotator, label_annotator)
 
             fig.tight_layout()
             plt.savefig(self.output_dir / f"{self.dataset_type}_batch{batch_idx}_grid.jpg", dpi=200)

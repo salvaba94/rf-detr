@@ -540,13 +540,24 @@ class TestMakeCollateFn:
         collate = make_collate_fn(block_size=32, resize_size_choices=[128])
         samples, targets = collate(self._batch((3, 100, 200), (3, 150, 180)))
 
-        assert samples.tensors.shape[-2:] == (160, 256)
+        assert samples.tensors.shape[-2:] == (128, 256)
         assert torch.equal(targets[0]["size"], torch.tensor([128, 256]))
         assert torch.equal(targets[1]["size"], torch.tensor([128, 154]))
         assert samples.mask[0, :128, :256].any().item() is False
         assert samples.mask[0, 128:, :].all().item() is True
         assert samples.mask[1, :128, :154].any().item() is False
         assert samples.mask[1, :, 154:].all().item() is True
+
+    def test_resize_size_choices_preserves_normalized_box_geometry(self) -> None:
+        """Multi-scale collate should update image size while leaving normalized boxes unchanged."""
+        collate = make_collate_fn(block_size=32, resize_size_choices=[128])
+        image = torch.zeros(3, 100, 200)
+        target = {"boxes": torch.tensor([[0.5, 0.5, 0.1, 0.2]]), "labels": torch.tensor([1])}
+
+        _samples, targets = collate([(image, target)])
+
+        assert torch.equal(targets[0]["boxes"], target["boxes"])
+        assert torch.equal(targets[0]["size"], torch.tensor([128, 256]))
 
     def test_resize_size_choices_can_resize_square_before_padding(self) -> None:
         """Factory collator can still apply square resizing for the square path."""

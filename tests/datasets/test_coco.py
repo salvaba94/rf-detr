@@ -20,7 +20,12 @@ import torch
 from PIL import Image
 
 from rfdetr.datasets._keypoint_schema import infer_coco_keypoint_schema
-from rfdetr.datasets.coco import ConvertCoco, build_coco, build_roboflow_from_coco
+from rfdetr.datasets.coco import (
+    ConvertCoco,
+    build_coco,
+    build_roboflow_from_coco,
+    compute_multi_scale_scales,
+)
 from rfdetr.detr import RFDETR
 
 # Minimal image shared across all tests
@@ -34,6 +39,20 @@ _ANNOTATIONS = [
     {"bbox": [10, 10, 30, 30], "category_id": 1, "area": 900, "iscrowd": 0},
     {"bbox": [50, 50, 20, 20], "category_id": 7, "area": 400, "iscrowd": 0},
 ]
+
+def test_compute_multi_scale_scales_accepts_explicit_offsets() -> None:
+    """Explicit offsets should control the multi-scale downscale/upscale range."""
+    scales = compute_multi_scale_scales(
+        resolution=640,
+        expanded_scales=True,
+        patch_size=16,
+        num_windows=4,
+        min_offset=-5,
+        max_offset=3,
+    )
+
+    assert scales == [320, 384, 448, 512, 576, 640, 704, 768, 832]
+
 
 _CAT2LABEL = {cat_id: i for i, cat_id in enumerate(sorted(_SPARSE_CAT_IDS))}
 # {1: 0, 2: 1, 3: 2, 7: 3, 8: 4}
@@ -577,17 +596,23 @@ class TestBuildRoboflowFromCocoBackendResolution:
     @pytest.mark.parametrize(
         ("validation_mode", "expected_eval_pre_resize"),
         [
-            pytest.param("standard", [{"TiledCroppingWithMasks": {"height": 576, "width": 576, "p": 1.0}}], id="standard"),
+            pytest.param(
+                "standard",
+                [{"TiledCroppingWithMasks": {"height": 576, "width": 576, "p": 1.0}}],
+                id="standard",
+            ),
             pytest.param("sahi", None, id="sahi"),
+            pytest.param("asahi", None, id="asahi"),
+            pytest.param("gsahi", None, id="gsahi"),
         ],
     )
-    def test_sahi_validation_suppresses_eval_pre_resize_crop(
+    def test_tiled_validation_suppresses_eval_pre_resize_crop(
         self,
         tmp_path: Path,
         validation_mode: str,
         expected_eval_pre_resize: object,
     ) -> None:
-        """SAHI validation should evaluate full transformed frames, not cropped eval samples."""
+        """Tiled validation should evaluate full transformed frames, not cropped eval samples."""
         from unittest.mock import MagicMock, patch
 
         from rfdetr.datasets.coco import build_roboflow_from_coco
@@ -619,7 +644,7 @@ class TestBuildRoboflowFromCocoBackendResolution:
             build_roboflow_from_coco("val", args, resolution=576)
 
         assert mock_transforms.call_args.kwargs["eval_pre_resize_aug_config"] == expected_eval_pre_resize
-        assert mock_transforms.call_args.kwargs["preserve_eval_size"] is (validation_mode == "sahi")
+        assert mock_transforms.call_args.kwargs["preserve_eval_size"] is (validation_mode != "standard")
 
     @pytest.mark.parametrize(
         ("square_resize_div_64", "transform_factory"),

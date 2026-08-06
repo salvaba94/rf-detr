@@ -8,13 +8,13 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
-import numpy as np
 import pytest
 import torch
 from torch import nn
 
 from rfdetr.config import RFDETRBaseConfig, TrainConfig
 from rfdetr.models.weights import apply_lora, load_pretrain_weights
+from rfdetr.training.optimizers import DualOptimizer
 from rfdetr.utilities.tensors import NestedTensor
 
 # ---------------------------------------------------------------------------
@@ -1318,18 +1318,19 @@ class TestValidationStep:
         assert result["results"][0]["scores"].tolist() == [pytest.approx(0.9), pytest.approx(0.7)]
         assert result["results"][0]["labels"].tolist() == [1, 2]
 
-    def test_sahi_validation_uses_sliced_prediction_library(self, tmp_path):
-        """validation_mode='sahi' should call SAHI and return COCO-style prediction tensors."""
-        from types import SimpleNamespace
-
-        from sahi.prediction import ObjectPrediction
-
+    def test_sahi_validation_uses_native_tiled_prediction(self, tmp_path):
+        """validation_mode='sahi' should route through native tiled prediction."""
         tc = _base_train_config(
             tmp_path,
             compute_val_loss=False,
             validation_mode="sahi",
-            sahi_slice_height=8,
-            sahi_slice_width=8,
+            sahi={
+                "slice_height": 8,
+                "slice_width": 8,
+                "tile_batch_size": 3,
+                "include_full_image": True,
+                "score_threshold": 0.05,
+            },
             validation_batch_size=2,
             validation_score_threshold=0.55,
             class_names=["zero", "one"],
@@ -1340,35 +1341,71 @@ class TestValidationStep:
             tmp_path=tmp_path,
         )
         samples, targets = _make_batch(batch_size=1, h=16, w=16)
-        fake_model.return_value = {}
-        sahi_result = SimpleNamespace(
-            object_prediction_list=[
-                ObjectPrediction(bbox=[1.0, 2.0, 5.0, 6.0], category_id=1, category_name="one", score=0.9)
-            ]
-        )
+        tiled_results = [
+            {
+                "boxes": torch.tensor([[1.0, 2.0, 5.0, 6.0]]),
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([1]),
+            }
+        ]
 
-        with patch("rfdetr.training.module_model.get_sliced_prediction", return_value=sahi_result) as mock_sahi:
+        with patch("rfdetr.training.module_model.predict_tiled", return_value=tiled_results) as mock_tiled:
             result = module.validation_step((samples, targets), batch_idx=0)
 
-        mock_sahi.assert_called_once()
-        assert mock_sahi.call_args.kwargs["batch_size"] == 2
-        assert mock_sahi.call_args.kwargs["confidence_threshold"] == 0.55
+        mock_tiled.assert_called_once()
+        assert mock_tiled.call_args.kwargs["model"] is fake_model
+        assert mock_tiled.call_args.kwargs["tile_batch_size"] == 3
+        assert mock_tiled.call_args.kwargs["include_full_image"] is True
+        assert mock_tiled.call_args.kwargs["score_threshold"] == 0.05
         fake_criterion.assert_not_called()
         fake_pp.assert_not_called()
         assert result["results"][0]["boxes"].tolist() == [[1.0, 2.0, 5.0, 6.0]]
         assert result["results"][0]["scores"].tolist() == [pytest.approx(0.9)]
         assert result["results"][0]["labels"].tolist() == [1]
 
-    def test_sahi_validation_skips_full_frame_val_loss(self, tmp_path):
-        """SAHI validation should not run an extra full-image loss forward before sliced inference."""
-        from types import SimpleNamespace
+    def test_tiled_validation_filters_predictions_by_confidence_and_count(self, tmp_path):
+        """Tiled validation results should be filtered before metrics and preview callbacks consume them."""
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=False,
+            validation_mode="sahi",
+            validation_score_threshold=0.1,
+            validation_max_predictions=2,
+        )
+        module, _, _, _ = _build_module(
+            model_config=_base_model_config(num_classes=3, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+        samples, targets = _make_batch(batch_size=1, h=16, w=16)
+        tiled_results = [
+            {
+                "boxes": torch.tensor(
+                    [
+                        [0.0, 0.0, 1.0, 1.0],
+                        [1.0, 1.0, 2.0, 2.0],
+                        [2.0, 2.0, 3.0, 3.0],
+                        [3.0, 3.0, 4.0, 4.0],
+                    ]
+                ),
+                "scores": torch.tensor([0.01, 0.4, 0.3, 0.2]),
+                "labels": torch.tensor([0, 1, 2, 0]),
+            }
+        ]
 
+        with patch("rfdetr.training.module_model.predict_tiled", return_value=tiled_results):
+            result = module.validation_step((samples, targets), batch_idx=0)
+
+        assert result["results"][0]["scores"].tolist() == [pytest.approx(0.4), pytest.approx(0.3)]
+        assert result["results"][0]["labels"].tolist() == [1, 2]
+
+    def test_sahi_validation_skips_full_frame_val_loss(self, tmp_path):
+        """Tiled validation should not run an extra full-image loss forward before sliced inference."""
         tc = _base_train_config(
             tmp_path,
             compute_val_loss=True,
             validation_mode="sahi",
-            sahi_slice_height=8,
-            sahi_slice_width=8,
+            sahi={"slice_height": 8, "slice_width": 8},
             class_names=["zero", "one"],
         )
         module, fake_model, fake_criterion, _ = _build_module(
@@ -1377,26 +1414,21 @@ class TestValidationStep:
             tmp_path=tmp_path,
         )
         samples, targets = _make_batch(batch_size=1, h=16, w=16)
-        sahi_result = SimpleNamespace(object_prediction_list=[])
+        tiled_results = [{"boxes": torch.empty((0, 4)), "scores": torch.empty(0), "labels": torch.empty(0, dtype=torch.long)}]
 
-        with patch("rfdetr.training.module_model.get_sliced_prediction", return_value=sahi_result):
+        with patch("rfdetr.training.module_model.predict_tiled", return_value=tiled_results):
             module.validation_step((samples, targets), batch_idx=0)
 
         fake_model.assert_not_called()
         fake_criterion.assert_not_called()
 
-    def test_sahi_validation_scales_predictions_to_original_image_size(self, tmp_path):
-        """SAHI boxes from transformed validation tensors must be rescaled for metric targets."""
-        from types import SimpleNamespace
-
-        from sahi.prediction import ObjectPrediction
-
+    def test_predict_validation_batch_with_model_uses_supplied_tiled_model(self, tmp_path):
+        """EMA validation can reuse native tiled prediction with the EMA model instance."""
         tc = _base_train_config(
             tmp_path,
             compute_val_loss=False,
             validation_mode="sahi",
-            sahi_slice_height=8,
-            sahi_slice_width=8,
+            sahi={"slice_height": 8, "slice_width": 8},
             class_names=["zero", "one"],
         )
         module, _, _, _ = _build_module(
@@ -1405,136 +1437,92 @@ class TestValidationStep:
             tmp_path=tmp_path,
         )
         samples, targets = _make_batch(batch_size=1, h=8, w=8)
-        targets[0]["orig_size"] = torch.tensor([16, 24])
-        targets[0]["size"] = torch.tensor([8, 8])
-        sahi_result = SimpleNamespace(
-            object_prediction_list=[
-                ObjectPrediction(bbox=[1.0, 2.0, 5.0, 6.0], category_id=1, category_name="one", score=0.9)
-            ]
-        )
+        ema_model = MagicMock(spec=nn.Module)
+        tiled_results = [{"boxes": torch.empty((0, 4)), "scores": torch.empty(0), "labels": torch.empty(0, dtype=torch.long)}]
 
-        with patch("rfdetr.training.module_model.get_sliced_prediction", return_value=sahi_result) as mock_sahi:
+        with patch("rfdetr.training.module_model.predict_tiled", return_value=tiled_results) as mock_tiled:
+            result = module.predict_validation_batch_with_model(ema_model, (samples, targets))
+
+        assert result["results"][0]["scores"].numel() == 0
+        assert mock_tiled.call_args.kwargs["model"] is ema_model
+
+    def test_asahi_validation_uses_native_adaptive_prediction(self, tmp_path):
+        """validation_mode='asahi' should route through native ASAHI prediction."""
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=False,
+            validation_mode="asahi",
+            asahi={
+                "tile_batch_size": 3,
+                "merge_metric": "cdn",
+                "nms_iou_threshold": 0.36,
+                "source_aware_duplicate_suppression": True,
+                "source_mode": "adaptive",
+                "window_resize_policy": "square_letterbox",
+                "score_threshold": 0.04,
+            },
+        )
+        module, fake_model, _, fake_pp = _build_module(
+            model_config=_base_model_config(num_classes=2, resolution=8),
+            train_config=tc,
+            tmp_path=tmp_path,
+        )
+        samples, targets = _make_batch(batch_size=1, h=16, w=16)
+        adaptive_results = [
+            {"boxes": torch.empty((0, 4)), "scores": torch.empty(0), "labels": torch.empty(0, dtype=torch.long)}
+        ]
+
+        with patch("rfdetr.training.module_model.predict_asahi", return_value=adaptive_results) as mock_asahi:
             result = module.validation_step((samples, targets), batch_idx=0)
 
-        image_arg = mock_sahi.call_args.args[0]
-        assert image_arg.shape[:2] == (8, 8)
-        assert result["results"][0]["boxes"].tolist() == [[3.0, 4.0, 15.0, 12.0]]
+        assert result["results"][0]["scores"].numel() == 0
+        assert mock_asahi.call_args.kwargs["model"] is fake_model
+        assert mock_asahi.call_args.kwargs["postprocess"] is fake_pp
+        assert mock_asahi.call_args.kwargs["merge_metric"] == "cdn"
+        assert mock_asahi.call_args.kwargs["nms_threshold"] == 0.36
+        assert mock_asahi.call_args.kwargs["source_aware_duplicate_suppression"] is True
+        assert mock_asahi.call_args.kwargs["score_threshold"] == 0.04
+        assert mock_asahi.call_args.kwargs["tile_batch_size"] == 3
+        assert mock_asahi.call_args.kwargs["source_mode"] == "adaptive"
+        assert mock_asahi.call_args.kwargs["window_resize_policy"] == "square_letterbox"
 
-    def test_sahi_validation_uses_shifted_slice_coordinates(self, tmp_path):
-        """Slice-local SAHI boxes must be shifted back into full-image coordinates before scoring."""
-        from sahi.prediction import ObjectPrediction
-
-        tc = _base_train_config(tmp_path, validation_mode="sahi", class_names=["zero"])
-        module, _, _, _ = _build_module(
-            model_config=_base_model_config(num_classes=1, resolution=8),
+    def test_gsahi_validation_uses_native_guided_prediction(self, tmp_path):
+        """validation_mode='gsahi' should route through native guided SAHI prediction."""
+        tc = _base_train_config(
+            tmp_path,
+            compute_val_loss=False,
+            validation_mode="gsahi",
+            gsahi={
+                "tile_batch_size": 2,
+                "roi_score_threshold": 0.2,
+                "nms_iou_threshold": 0.37,
+                "merge_sources": "full_coarse_fine",
+                "source_aware_duplicate_suppression": True,
+                "score_threshold": 0.03,
+            },
+        )
+        module, fake_model, _, fake_pp = _build_module(
+            model_config=_base_model_config(num_classes=2, resolution=8),
             train_config=tc,
             tmp_path=tmp_path,
         )
-        prediction = ObjectPrediction(
-            bbox=[1.0, 2.0, 3.0, 4.0],
-            category_id=0,
-            category_name="zero",
-            score=0.9,
-            shift_amount=[5, 7],
-            full_shape=[20, 30],
-        )
-
-        result = module._sahi_prediction_to_result([prediction], device=torch.device("cpu"))
-
-        assert result["boxes"].tolist() == [[6.0, 9.0, 8.0, 11.0]]
-
-    def test_sahi_prediction_to_result_preserves_masks(self, tmp_path):
-        """SAHI segmentation predictions must return mask tensors for segmentation mAP."""
-        from sahi.prediction import ObjectPrediction
-        from sahi.utils.cv import get_coco_segmentation_from_bool_mask
-
-        mask = np.zeros((8, 8), dtype=bool)
-        mask[2:6, 1:5] = True
-        prediction = ObjectPrediction(
-            category_id=0,
-            category_name="zero",
-            segmentation=get_coco_segmentation_from_bool_mask(mask),
-            score=0.9,
-            shift_amount=[0, 0],
-            full_shape=[8, 8],
-        )
-        tc = _base_train_config(tmp_path, validation_mode="sahi", class_names=["zero"])
-        module, _, _, _ = _build_module(
-            model_config=_base_model_config(num_classes=1, segmentation_head=True, resolution=8),
-            train_config=tc,
-            tmp_path=tmp_path,
-        )
-
-        result = module._sahi_prediction_to_result([prediction], device=torch.device("cpu"))
-
-        assert "masks" in result
-        assert result["masks"].shape == (1, 8, 8)
-        assert result["masks"].dtype is torch.bool
-        assert result["masks"][0, 2:6, 1:5].any()
-
-    def test_sahi_adapter_clamps_boxes_before_object_prediction(self):
-        """RF-DETR boxes outside slice bounds should be clamped before SAHI validation."""
-        from rfdetr.training.module_model import SAHIRFDETRDetectionModel
-
-        model = nn.Linear(1, 1)
-        adapter = SAHIRFDETRDetectionModel(
-            model=model,
-            postprocess=MagicMock(),
-            block_size=4,
-            category_names=["object"],
-            confidence_threshold=0.1,
-            max_detections=10,
-        )
-        adapter._original_shapes = [(10, 12, 3)]
-        adapter._original_predictions = [
-            {
-                "boxes": torch.tensor([[-3.0, -2.0, 20.0, 11.0]]),
-                "scores": torch.tensor([0.9]),
-                "labels": torch.tensor([0]),
-            }
+        samples, targets = _make_batch(batch_size=1, h=16, w=16)
+        gsahi_results = [
+            {"boxes": torch.empty((0, 4)), "scores": torch.empty(0), "labels": torch.empty(0, dtype=torch.long)}
         ]
 
-        adapter._create_object_prediction_list_from_original_predictions(
-            shift_amount_list=[[0, 0]],
-            full_shape_list=[[10, 12]],
-        )
+        with patch("rfdetr.training.module_model.predict_gsahi", return_value=gsahi_results) as mock_gsahi:
+            result = module.validation_step((samples, targets), batch_idx=0)
 
-        assert len(adapter.object_prediction_list) == 1
-        assert adapter.object_prediction_list[0].bbox.to_xyxy() == [0.0, 0.0, 12.0, 10.0]
-
-    def test_sahi_adapter_preserves_rf_detr_masks(self):
-        """RF-DETR slice masks should be converted to SAHI object segmentations."""
-        from rfdetr.training.module_model import SAHIRFDETRDetectionModel
-
-        model = nn.Linear(1, 1)
-        adapter = SAHIRFDETRDetectionModel(
-            model=model,
-            postprocess=MagicMock(),
-            block_size=4,
-            category_names=["object"],
-            confidence_threshold=0.1,
-            max_detections=10,
-        )
-        mask = torch.zeros(1, 1, 12, 12, dtype=torch.bool)
-        mask[0, 0, 2:8, 3:9] = True
-        adapter._original_shapes = [(12, 12, 3)]
-        adapter._original_predictions = [
-            {
-                "boxes": torch.tensor([[3.0, 2.0, 9.0, 8.0]]),
-                "scores": torch.tensor([0.9]),
-                "labels": torch.tensor([0]),
-                "masks": mask,
-            }
-        ]
-
-        adapter._create_object_prediction_list_from_original_predictions(
-            shift_amount_list=[[0, 0]],
-            full_shape_list=[[12, 12]],
-        )
-
-        assert len(adapter.object_prediction_list) == 1
-        assert adapter.object_prediction_list[0].mask is not None
-        assert adapter.object_prediction_list[0].mask.bool_mask.any()
+        assert result["results"][0]["scores"].numel() == 0
+        assert mock_gsahi.call_args.kwargs["model"] is fake_model
+        assert mock_gsahi.call_args.kwargs["postprocess"] is fake_pp
+        assert mock_gsahi.call_args.kwargs["roi_score_threshold"] == 0.2
+        assert mock_gsahi.call_args.kwargs["nms_threshold"] == 0.37
+        assert mock_gsahi.call_args.kwargs["merge_sources"] == "full_coarse_fine"
+        assert mock_gsahi.call_args.kwargs["source_aware_duplicate_suppression"] is True
+        assert mock_gsahi.call_args.kwargs["score_threshold"] == 0.03
+        assert mock_gsahi.call_args.kwargs["tile_batch_size"] == 2
 
 
 class TestTestStep:
@@ -1655,6 +1643,78 @@ class TestConfigureOptimizers:
         mock_get_param_dict.return_value = param_dicts
 
         assert isinstance(module.configure_optimizers()["optimizer"], torch.optim.AdamW)
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_optimizer_can_be_sgd(self, mock_get_param_dict, tmp_path):
+        """TrainConfig.optimizer='sgd' should build SGD with configured momentum."""
+        module, param_dicts = self._setup_module(
+            tmp_path,
+            optimizer="sgd",
+            optimizer_config={"momentum": 0.8},
+        )
+        mock_get_param_dict.return_value = param_dicts
+
+        optimizer_config = module.configure_optimizers()
+        optimizer = optimizer_config["optimizer"]
+
+        assert isinstance(optimizer, torch.optim.SGD)
+        assert optimizer.defaults["momentum"] == pytest.approx(0.8)
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_muadamw_routes_2d_params_to_torch_muon(self, mock_get_param_dict, tmp_path):
+        """MuAdamW routes 2-D params to torch.optim.Muon and all other params to AdamW."""
+        module, _ = self._setup_module(
+            tmp_path,
+            optimizer="muadamw",
+            optimizer_config={"momentum": 0.7, "muon_lr_scale": 0.3, "fallback_lr_scale": 1.2},
+        )
+        matrix = nn.Parameter(torch.randn(4, 4))
+        vector = nn.Parameter(torch.randn(4))
+        mock_get_param_dict.return_value = [
+            {"params": matrix, "lr": module.train_config.lr},
+            {"params": vector, "lr": module.train_config.lr},
+        ]
+
+        optimizer_config = module.configure_optimizers()
+        optimizer = optimizer_config["optimizer"]
+        scheduler = optimizer_config["lr_scheduler"]["scheduler"]
+
+        assert isinstance(optimizer, DualOptimizer)
+        assert isinstance(optimizer.primary, torch.optim.Muon)
+        assert isinstance(optimizer.secondary, torch.optim.AdamW)
+        assert optimizer.primary.param_groups[0]["params"] == [matrix]
+        assert optimizer.secondary.param_groups[0]["params"] == [matrix]
+        assert optimizer.secondary.param_groups[1]["params"] == [vector]
+        assert scheduler.base_lrs[0] == pytest.approx(module.train_config.lr * 0.3)
+        assert scheduler.base_lrs[1] == pytest.approx(module.train_config.lr * 1.2)
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_musgd_routes_2d_params_to_torch_muon(self, mock_get_param_dict, tmp_path):
+        """MuSGD routes 2-D params to torch.optim.Muon and all other params to SGD."""
+        module, _ = self._setup_module(
+            tmp_path,
+            optimizer="musgd",
+            optimizer_config={"momentum": 0.7, "muon_lr_scale": 0.3, "fallback_lr_scale": 1.2},
+        )
+        matrix = nn.Parameter(torch.randn(4, 4))
+        vector = nn.Parameter(torch.randn(4))
+        mock_get_param_dict.return_value = [
+            {"params": matrix, "lr": module.train_config.lr},
+            {"params": vector, "lr": module.train_config.lr},
+        ]
+
+        optimizer_config = module.configure_optimizers()
+        optimizer = optimizer_config["optimizer"]
+        scheduler = optimizer_config["lr_scheduler"]["scheduler"]
+
+        assert isinstance(optimizer, DualOptimizer)
+        assert isinstance(optimizer.primary, torch.optim.Muon)
+        assert isinstance(optimizer.secondary, torch.optim.SGD)
+        assert optimizer.primary.param_groups[0]["params"] == [matrix]
+        assert optimizer.secondary.param_groups[0]["params"] == [matrix]
+        assert optimizer.secondary.param_groups[1]["params"] == [vector]
+        assert scheduler.base_lrs[0] == pytest.approx(module.train_config.lr * 0.3)
+        assert scheduler.base_lrs[1] == pytest.approx(module.train_config.lr * 1.2)
 
     @patch("rfdetr.training.module_model.get_param_dict")
     def test_scheduler_interval_is_step(self, mock_get_param_dict, tmp_path):

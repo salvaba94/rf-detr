@@ -160,3 +160,18 @@ class TestBuildCriterionFromConfig:
         custom_defaults = replace(MODEL_DEFAULTS, focal_alpha=0.5)
         criterion, _ = build_criterion_from_config(mc, tc, defaults=custom_defaults)
         assert criterion.focal_alpha == pytest.approx(0.5), f"Expected focal_alpha=0.5, got {criterion.focal_alpha}"
+
+    def test_stal_config_reaches_hungarian_matcher(self) -> None:
+        """Structured STAL settings reach the matcher with the model resolution."""
+        mc = RFDETRBaseConfig(num_classes=80)
+        tc = TrainConfig(
+            dataset_dir="/tmp",
+            stal={"enabled": True, "small_box_threshold": 6.0, "expanded_box_size": 12.0},
+        )
+
+        criterion, _ = build_criterion_from_config(mc, tc)
+
+        assert criterion.matcher.stal_enabled is True
+        assert criterion.matcher.stal_small_box_threshold == pytest.approx(6.0)
+        assert criterion.matcher.stal_expanded_box_size == pytest.approx(12.0)
+        assert criterion.matcher.stal_reference_resolution == mc.resolution

@@ -36,19 +36,19 @@ class TestNamespaceForwarding:
         assert ns.aug_config is None
 
     def test_use_ema_forwarded_true(self: "TestNamespaceForwarding") -> None:
-        ns = self._make_ns(use_ema=True)
+        ns = self._make_ns(ema={"enabled": True})
         assert ns.use_ema is True
 
     def test_use_ema_forwarded_false(self: "TestNamespaceForwarding") -> None:
-        ns = self._make_ns(use_ema=False)
+        ns = self._make_ns(ema={"enabled": False})
         assert ns.use_ema is False
 
     def test_early_stopping_use_ema_forwarded_true(self: "TestNamespaceForwarding") -> None:
-        ns = self._make_ns(early_stopping_use_ema=True)
+        ns = self._make_ns(early_stopping={"use_ema": True})
         assert ns.early_stopping_use_ema is True
 
     def test_early_stopping_use_ema_forwarded_false(self: "TestNamespaceForwarding") -> None:
-        ns = self._make_ns(early_stopping_use_ema=False)
+        ns = self._make_ns(early_stopping={"use_ema": False})
         assert ns.early_stopping_use_ema is False
 
 

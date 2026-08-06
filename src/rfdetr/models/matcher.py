@@ -63,6 +63,10 @@ class HungarianMatcher(nn.Module):
         keypoint_findable_loss_coef: float = 0.0,
         keypoint_visible_loss_coef: float = 0.0,
         keypoint_nll_loss_coef: float = 0.0,
+        stal_enabled: bool = False,
+        stal_small_box_threshold: float = 8.0,
+        stal_expanded_box_size: float = 16.0,
+        stal_reference_resolution: int = 640,
     ):
         """Creates the matcher.
 
@@ -76,6 +80,10 @@ class HungarianMatcher(nn.Module):
             mask_point_sample_ratio: Downsampling ratio for mask point sampling.
             cost_mask_ce: Relative weight of the binary cross-entropy mask cost.
             cost_mask_dice: Relative weight of the Dice mask cost.
+            stal_enabled: Whether to relax tiny target geometry in training-time matching costs.
+            stal_small_box_threshold: Dimension threshold in pixels at ``stal_reference_resolution``.
+            stal_expanded_box_size: Surrogate dimension in pixels used below the threshold.
+            stal_reference_resolution: Resolution used to normalize STAL pixel dimensions.
         """
         super().__init__()
         self.cost_class = cost_class
@@ -91,7 +99,47 @@ class HungarianMatcher(nn.Module):
         self.keypoint_findable_loss_coef = keypoint_findable_loss_coef
         self.keypoint_visible_loss_coef = keypoint_visible_loss_coef
         self.keypoint_nll_loss_coef = keypoint_nll_loss_coef
+        self.stal_enabled = bool(stal_enabled)
+        self.stal_small_box_threshold = float(stal_small_box_threshold)
+        self.stal_expanded_box_size = float(stal_expanded_box_size)
+        self.stal_reference_resolution = int(stal_reference_resolution)
+        if self.stal_reference_resolution <= 0:
+            raise ValueError("stal_reference_resolution must be positive")
+        if self.stal_small_box_threshold < 0:
+            raise ValueError("stal_small_box_threshold must be non-negative")
+        if self.stal_expanded_box_size < self.stal_small_box_threshold:
+            raise ValueError("stal_expanded_box_size must be >= stal_small_box_threshold")
         self._warned_non_finite_costs = False
+
+    @staticmethod
+    def _stal_matching_boxes(
+        target_boxes: torch.Tensor,
+        small_box_threshold: float,
+        expanded_box_size: float,
+        reference_resolution: int,
+    ) -> torch.Tensor:
+        """Relax tiny dimensions for matching without changing regression targets.
+
+        Args:
+            target_boxes: Normalized target boxes in ``cxcywh`` format.
+            small_box_threshold: Pixel dimension below which matching geometry is relaxed.
+            expanded_box_size: Pixel dimension substituted for each tiny dimension.
+            reference_resolution: Resolution used to normalize pixel dimensions.
+
+        Returns:
+            Matching-only boxes with tiny width and height dimensions expanded independently.
+        """
+        if target_boxes.numel() == 0 or small_box_threshold <= 0:
+            return target_boxes
+        normalized_threshold = float(small_box_threshold) / float(reference_resolution)
+        normalized_expanded_size = float(expanded_box_size) / float(reference_resolution)
+        matching_boxes = target_boxes.clone()
+        matching_boxes[:, 2:] = torch.where(
+            matching_boxes[:, 2:] < normalized_threshold,
+            matching_boxes.new_tensor(normalized_expanded_size),
+            matching_boxes[:, 2:],
+        )
+        return matching_boxes
 
     @staticmethod
     def _sanitize_cost_matrix(cost_matrix: torch.Tensor) -> torch.Tensor:
@@ -170,6 +218,14 @@ class HungarianMatcher(nn.Module):
         # Also concat the target labels and boxes
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        matching_tgt_bbox = tgt_bbox
+        if self.training and self.stal_enabled:
+            matching_tgt_bbox = self._stal_matching_boxes(
+                target_boxes=tgt_bbox,
+                small_box_threshold=self.stal_small_box_threshold,
+                expanded_box_size=self.stal_expanded_box_size,
+                reference_resolution=self.stal_reference_resolution,
+            )
         tgt_keypoints = None
 
         masks_present = "masks" in targets[0]
@@ -178,7 +234,7 @@ class HungarianMatcher(nn.Module):
             tgt_keypoints = torch.cat([v["keypoints"] for v in targets], dim=0)
 
         # Compute the giou cost between boxes
-        giou = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+        giou = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(matching_tgt_bbox))
         cost_giou = -giou
 
         # Compute the classification cost.
@@ -193,7 +249,7 @@ class HungarianMatcher(nn.Module):
         cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
 
         # Compute the L1 cost between boxes
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        cost_bbox = torch.cdist(out_bbox, matching_tgt_bbox, p=1)
 
         if masks_present:
             tgt_masks = torch.cat([v["masks"] for v in targets])
@@ -323,6 +379,10 @@ def build_matcher(args) -> HungarianMatcher:
         "keypoint_findable_loss_coef": getattr(args, "keypoint_findable_loss_coef", 0.0),
         "keypoint_visible_loss_coef": getattr(args, "keypoint_visible_loss_coef", 0.0),
         "keypoint_nll_loss_coef": getattr(args, "keypoint_nll_loss_coef", 0.0),
+        "stal_enabled": getattr(args, "stal_enabled", False),
+        "stal_small_box_threshold": getattr(args, "stal_small_box_threshold", 8.0),
+        "stal_expanded_box_size": getattr(args, "stal_expanded_box_size", 16.0),
+        "stal_reference_resolution": getattr(args, "stal_reference_resolution", 640),
     }
     if args.segmentation_head:
         return HungarianMatcher(

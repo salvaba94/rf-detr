@@ -178,6 +178,123 @@ class TestModelConfigValidation:
         assert config.pre_resize_aug_config == pre_resize
         assert config.eval_pre_resize_aug_config == pre_resize
 
+    def test_stal_config_is_accepted(self) -> None:
+        """TrainConfig accepts Hungarian STAL geometry relaxation."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            stal={"enabled": True, "small_box_threshold": 6.0, "expanded_box_size": 12.0},
+        )
+
+        assert config.stal.enabled is True
+        assert config.stal.small_box_threshold == pytest.approx(6.0)
+        assert config.stal.expanded_box_size == pytest.approx(12.0)
+
+    def test_optimizer_options_are_accepted(self) -> None:
+        """TrainConfig accepts the supported optimizer names and momentum knobs."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            optimizer="muadamw",
+            optimizer_config={
+                "momentum": 0.8,
+                "nesterov": False,
+                "muon_lr_scale": 0.3,
+                "fallback_lr_scale": 1.2,
+                "ns_steps": 4,
+                "eps": 1e-6,
+                "adjust_lr_fn": "match_rms_adamw",
+            },
+        )
+
+        assert config.optimizer == "muadamw"
+        assert config.optimizer_config.momentum == 0.8
+        assert config.optimizer_config.nesterov is False
+        assert config.optimizer_config.muon_lr_scale == pytest.approx(0.3)
+        assert config.optimizer_config.fallback_lr_scale == pytest.approx(1.2)
+        assert config.optimizer_config.ns_steps == 4
+        assert config.optimizer_config.eps == pytest.approx(1e-6)
+        assert config.optimizer_config.adjust_lr_fn == "match_rms_adamw"
+
+    def test_optimizer_config_group_is_accepted(self) -> None:
+        """TrainConfig accepts optimizer details in a separate config group."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            optimizer="musgd",
+            optimizer_config={
+                "lr": 0.0002,
+                "lr_encoder": 0.0001,
+                "weight_decay": 0.0005,
+                "momentum": 0.85,
+                "nesterov": False,
+                "muon_lr_scale": 0.2,
+                "fallback_lr_scale": 1.0,
+                "scheduler": {
+                    "name": "cosine",
+                    "min_factor": 0.05,
+                    "warmup_epochs": 1.0,
+                    "drop_epoch": 12,
+                },
+            },
+        )
+
+        assert config.optimizer == "musgd"
+        assert config.lr == 0.0002
+        assert config.lr_encoder == 0.0001
+        assert config.weight_decay == 0.0005
+        assert config.lr_scheduler == "cosine"
+        assert config.lr_min_factor == 0.05
+        assert config.warmup_epochs == 1.0
+        assert config.lr_drop == 12
+        assert config.optimizer_config.lr == 0.0002
+        assert config.optimizer_config.lr_encoder == 0.0001
+        assert config.optimizer_config.weight_decay == 0.0005
+        assert config.optimizer_config.momentum == 0.85
+        assert config.optimizer_config.nesterov is False
+        assert config.optimizer_config.muon_lr_scale == pytest.approx(0.2)
+        assert config.optimizer_config.fallback_lr_scale == pytest.approx(1.0)
+        assert config.optimizer_config.scheduler.name == "cosine"
+        assert config.optimizer_config.scheduler.min_factor == 0.05
+        assert config.optimizer_config.scheduler.warmup_epochs == 1.0
+        assert config.optimizer_config.scheduler.drop_epoch == 12
+
+    def test_optimizer_rejects_unknown_name(self) -> None:
+        """TrainConfig rejects unsupported optimizer names."""
+        with pytest.raises(ValidationError):
+            TrainConfig(dataset_dir="/tmp", optimizer="bad")
+
+    def test_early_stopping_config_group_is_accepted(self) -> None:
+        """TrainConfig accepts early-stopping details in a structured config group."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            early_stopping={
+                "enabled": True,
+                "patience": 4,
+                "min_delta": 0.01,
+                "use_ema": True,
+            },
+        )
+
+        assert config.early_stopping.enabled is True
+        assert config.early_stopping.patience == 4
+        assert config.early_stopping.min_delta == 0.01
+        assert config.early_stopping.use_ema is True
+
+    def test_legacy_early_stopping_config_is_normalized(self) -> None:
+        """Legacy early-stopping fields are normalized into the structured config."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            early_stopping=True,
+            early_stopping_config={
+                "patience": 4,
+                "min_delta": 0.01,
+                "use_ema": True,
+            },
+        )
+
+        assert config.early_stopping.enabled is True
+        assert config.early_stopping.patience == 4
+        assert config.early_stopping.min_delta == 0.01
+        assert config.early_stopping.use_ema is True
+
     def test_sahi_validation_config_is_accepted(self) -> None:
         """TrainConfig accepts SAHI validation options."""
         config = TrainConfig(
@@ -189,17 +306,176 @@ class TestModelConfigValidation:
                 "overlap_height_ratio": 0.25,
                 "overlap_width_ratio": 0.3,
                 "nms_iou_threshold": 0.45,
+                "merge_metric": "ios",
+                "source_aware_duplicate_suppression": True,
+                "include_full_image": True,
+                "tile_batch_size": 8,
                 "confidence_threshold": 0.01,
+                "score_threshold": 0.02,
             },
             validation_batch_size=2,
         )
 
         assert config.validation_mode == "sahi"
-        assert config.sahi_slice_height == 576
-        assert config.sahi_slice_width == 640
-        assert config.sahi_nms_iou_threshold == 0.45
+        assert config.sahi.slice_height == 576
+        assert config.sahi.slice_width == 640
+        assert config.sahi.nms_iou_threshold == 0.45
+        assert config.sahi.merge_metric == "ios"
+        assert config.sahi.source_aware_duplicate_suppression is True
+        assert config.sahi.include_full_image is True
+        assert config.sahi.tile_batch_size == 8
+        assert config.sahi.score_threshold == 0.02
         assert config.validation_score_threshold == 0.01
         assert config.validation_batch_size == 2
+
+    def test_multi_scale_offsets_are_accepted(self) -> None:
+        """TrainConfig accepts explicit multi-scale offset bounds."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            multi_scale={
+                "enabled": True,
+                "min_offset": -5,
+                "max_offset": 3,
+            },
+        )
+
+        assert config.multi_scale.enabled is True
+        assert config.multi_scale.min_offset == -5
+        assert config.multi_scale.max_offset == 3
+
+    def test_legacy_multi_scale_offsets_are_normalized(self) -> None:
+        """Legacy multi-scale fields are normalized into the structured config."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            multi_scale=True,
+            multi_scale_min_offset=-5,
+            multi_scale_max_offset=3,
+        )
+
+        assert config.multi_scale.enabled is True
+        assert config.multi_scale.min_offset == -5
+        assert config.multi_scale.max_offset == 3
+
+    def test_multi_scale_offsets_reject_reversed_range(self) -> None:
+        """TrainConfig rejects offset bounds that cannot form a scale range."""
+        with pytest.raises(ValidationError):
+            TrainConfig(dataset_dir="/tmp", multi_scale={"min_offset": 3, "max_offset": -5})
+
+    def test_asahi_validation_config_is_accepted(self) -> None:
+        """TrainConfig accepts ASAHI validation options."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            validation_mode="asahi",
+            asahi={
+                "short_side_threshold": 1024,
+                "low_patch_count": 6,
+                "high_patch_count": 12,
+                "overlap_ratio": 0.2,
+                "include_full_image": False,
+                "source_mode": "adaptive",
+                "window_resize_longest_side": 768,
+                "window_resize_policy": "square_letterbox",
+                "nms_iou_threshold": 0.41,
+                "merge_metric": "cdn",
+                "source_aware_duplicate_suppression": True,
+                "tile_batch_size": 6,
+                "score_threshold": 0.03,
+            },
+        )
+
+        assert config.validation_mode == "asahi"
+        assert config.asahi.short_side_threshold == 1024
+        assert config.asahi.low_patch_count == 6
+        assert config.asahi.high_patch_count == 12
+        assert config.asahi.overlap_ratio == 0.2
+        assert config.asahi.include_full_image is False
+        assert config.asahi.source_mode == "adaptive"
+        assert config.asahi.window_resize_longest_side == 768
+        assert config.asahi.window_resize_policy == "square_letterbox"
+        assert config.asahi.nms_iou_threshold == 0.41
+        assert config.asahi.merge_metric == "cdn"
+        assert config.asahi.source_aware_duplicate_suppression is True
+        assert config.asahi.tile_batch_size == 6
+        assert config.asahi.score_threshold == 0.03
+
+    def test_asahi_high_patch_count_can_be_six_for_debug_tuning(self) -> None:
+        """TrainConfig accepts six high-resolution ASAHI patches for debug sweeps."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            validation_mode="asahi",
+            asahi={"high_patch_count": 6},
+        )
+
+        assert config.asahi.high_patch_count == 6
+
+    def test_gsahi_validation_config_is_accepted(self) -> None:
+        """TrainConfig accepts GSAHI validation options."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            validation_mode="gsahi",
+            gsahi={
+                "coarse_slice_size": 512,
+                "fine_slice_size": 224,
+                "coarse_overlap": 0.1,
+                "fine_overlap": 0.3,
+                "include_full_image": False,
+                "roi_score_threshold": 0.2,
+                "roi_expansion_ratio": 0.5,
+                "roi_max_regions": 12,
+                "nms_iou_threshold": 0.42,
+                "merge_metric": "iou",
+                "merge_sources": "full_coarse_fine",
+                "source_aware_duplicate_suppression": True,
+                "tile_batch_size": 5,
+                "score_threshold": 0.04,
+            },
+        )
+
+        assert config.validation_mode == "gsahi"
+        assert config.gsahi.coarse_slice_size == 512
+        assert config.gsahi.fine_slice_size == 224
+        assert config.gsahi.coarse_overlap == 0.1
+        assert config.gsahi.fine_overlap == 0.3
+        assert config.gsahi.include_full_image is False
+        assert config.gsahi.roi_score_threshold == 0.2
+        assert config.gsahi.roi_expansion_ratio == 0.5
+        assert config.gsahi.roi_max_regions == 12
+        assert config.gsahi.nms_iou_threshold == 0.42
+        assert config.gsahi.merge_metric == "iou"
+        assert config.gsahi.merge_sources == "full_coarse_fine"
+        assert config.gsahi.source_aware_duplicate_suppression is True
+        assert config.gsahi.tile_batch_size == 5
+        assert config.gsahi.score_threshold == 0.04
+
+    def test_legacy_gsahi_validation_config_maps_to_gsahi(self) -> None:
+        """Legacy GSAHI config names remain accepted as GSAHI aliases."""
+        config = TrainConfig(
+            dataset_dir="/tmp",
+            validation_mode="gois",
+            gois={"fine_overlap": 0.3},
+        )
+
+        assert config.validation_mode == "gsahi"
+        assert config.gsahi.fine_overlap == 0.3
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({"validation_mode": "asahi", "asahi": {"low_patch_count": 8}}, id="bad_asahi_low_count"),
+            pytest.param({"validation_mode": "asahi", "asahi": {"merge_metric": "bad"}}, id="bad_asahi_metric"),
+            pytest.param({"validation_mode": "asahi", "asahi": {"source_mode": "bad"}}, id="bad_asahi_source"),
+            pytest.param(
+                {"validation_mode": "asahi", "asahi": {"window_resize_policy": "bad"}},
+                id="bad_asahi_resize_policy",
+            ),
+            pytest.param({"validation_mode": "gsahi", "gsahi": {"fine_overlap": 1.0}}, id="bad_gsahi_overlap"),
+            pytest.param({"validation_mode": "gsahi", "gsahi": {"roi_max_regions": 0}}, id="bad_gsahi_regions"),
+        ],
+    )
+    def test_adaptive_validation_config_rejects_invalid_values(self, kwargs: dict[str, object]) -> None:
+        """Adaptive validation modes validate their nested config values."""
+        with pytest.raises(ValidationError):
+            TrainConfig(dataset_dir="/tmp", **kwargs)
 
     def test_nested_mlflow_config_is_accepted(self) -> None:
         """TrainConfig accepts grouped MLflow options."""
@@ -360,7 +636,7 @@ class TestTrainConfigT42PromotedFields:
 
     def test_ema_update_interval_default_is_one(self, tmp_path):
         """ema_update_interval defaults to 1 (update every step)."""
-        assert self._tc(tmp_path).ema_update_interval == 1
+        assert self._tc(tmp_path).ema.update_interval == 1
 
     def test_compute_val_loss_default_is_true(self, tmp_path):
         """compute_val_loss defaults to True."""
@@ -385,7 +661,6 @@ class TestTrainConfigT42PromotedFields:
             pytest.param("run_test", True, id="run_test"),
             pytest.param("eval_interval", 3, id="eval_interval"),
             pytest.param("skip_best_epochs", 3, id="skip_best_epochs"),
-            pytest.param("ema_update_interval", 4, id="ema_update_interval"),
             pytest.param("compute_val_loss", False, id="compute_val_loss"),
             pytest.param("compute_test_loss", False, id="compute_test_loss"),
             pytest.param("train_log_sync_dist", True, id="train_log_sync_dist"),
@@ -411,7 +686,6 @@ class TestTrainConfigT42PromotedFields:
         [
             pytest.param("eval_interval", 0, id="eval_interval_zero"),
             pytest.param("skip_best_epochs", -1, id="skip_best_epochs_negative"),
-            pytest.param("ema_update_interval", 0, id="ema_update_interval_zero"),
             pytest.param("prefetch_factor", 0, id="prefetch_factor_zero"),
         ],
     )
@@ -443,7 +717,43 @@ class TestTrainConfigT42PromotedFields:
     def test_auto_batch_ema_headroom_must_be_in_open_one(self, tmp_path, ema_headroom):
         """auto_batch_ema_headroom must be in (0, 1]."""
         with pytest.raises((ValueError, ValidationError)):
-            self._tc(tmp_path, auto_batch_ema_headroom=ema_headroom)
+            self._tc(tmp_path, ema={"auto_batch_headroom": ema_headroom})
+
+    def test_ema_config_group_is_accepted(self, tmp_path) -> None:
+        """TrainConfig accepts EMA options in a structured config group."""
+        tc = self._tc(
+            tmp_path,
+            ema={
+                "enabled": True,
+                "decay": 0.99,
+                "tau": 50,
+                "update_interval": 4,
+                "auto_batch_headroom": 0.8,
+            },
+        )
+
+        assert tc.ema.enabled is True
+        assert tc.ema.decay == pytest.approx(0.99)
+        assert tc.ema.tau == 50
+        assert tc.ema.update_interval == 4
+        assert tc.ema.auto_batch_headroom == pytest.approx(0.8)
+
+    def test_legacy_ema_fields_are_normalized(self, tmp_path) -> None:
+        """Legacy EMA fields are normalized into the structured config."""
+        tc = self._tc(
+            tmp_path,
+            use_ema=False,
+            ema_decay=0.98,
+            ema_tau=25,
+            ema_update_interval=3,
+            auto_batch_ema_headroom=0.6,
+        )
+
+        assert tc.ema.enabled is False
+        assert tc.ema.decay == pytest.approx(0.98)
+        assert tc.ema.tau == 25
+        assert tc.ema.update_interval == 3
+        assert tc.ema.auto_batch_headroom == pytest.approx(0.6)
 
 
 class TestBuildTrainerUsesRealFields:

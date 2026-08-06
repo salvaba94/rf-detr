@@ -300,11 +300,11 @@ def build_trainer(
                 "strategy='ddp' → DDPStrategy(find_unused_parameters=True).",
             )
     sharded = any(s in str(strategy).lower() for s in ("fsdp", "deepspeed"))
-    enable_ema = bool(tc.use_ema) and not sharded
-    if tc.use_ema and sharded:
+    enable_ema = bool(tc.ema.enabled) and not sharded
+    if tc.ema.enabled and sharded:
         warnings.warn(
             f"EMA disabled: RFDETREMACallback is not compatible with sharded strategies "
-            f"(strategy={strategy!r}). Set use_ema=False to suppress this warning.",
+            f"(strategy={strategy!r}). Set ema.enabled=False to suppress this warning.",
             UserWarning,
             stacklevel=2,
         )
@@ -314,7 +314,14 @@ def build_trainer(
 
     if tc.save_dataset_grids:
         callbacks.append(DatasetGridCallback())
-        callbacks.append(PredictionGridCallback(output_dir=tc.output_dir))
+    if tc.save_dataset_grids or tc.save_prediction_grids:
+        callbacks.append(
+            PredictionGridCallback(
+                output_dir=tc.output_dir,
+                score_threshold=tc.validation_score_threshold,
+                max_predictions=tc.validation_max_predictions,
+            )
+        )
 
     if tc.progress_bar == "rich":
         callbacks.append(
@@ -329,9 +336,9 @@ def build_trainer(
     if enable_ema:
         callbacks.append(
             RFDETREMACallback(
-                decay=tc.ema_decay,
-                tau=tc.ema_tau,
-                update_interval_steps=tc.ema_update_interval,
+                decay=tc.ema.decay,
+                tau=tc.ema.tau,
+                update_interval_steps=tc.ema.update_interval,
             )
         )
 
@@ -409,12 +416,12 @@ def build_trainer(
     )
 
     # Optional early stopping.
-    if tc.early_stopping:
+    if tc.early_stopping.enabled:
         callbacks.append(
             RFDETREarlyStopping(
-                patience=tc.early_stopping_patience,
-                min_delta=tc.early_stopping_min_delta,
-                use_ema=tc.early_stopping_use_ema,
+                patience=tc.early_stopping.patience,
+                min_delta=tc.early_stopping.min_delta,
+                use_ema=tc.early_stopping.use_ema,
                 monitor_regular=monitor_regular,
                 monitor_ema=early_stopping_monitor_ema,
                 skip_best_epochs=tc.skip_best_epochs,

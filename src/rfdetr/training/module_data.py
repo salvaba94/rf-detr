@@ -163,13 +163,16 @@ class RFDETRDataModule(LightningDataModule):
                 f"{block_size} from patch_size={model_config.patch_size} "
                 f"and num_windows={model_config.num_windows}."
             )
+        multi_scale = train_config.multi_scale
         train_resize_choices = None
-        if train_config.multi_scale and not train_config.do_random_resize_via_padding:
+        if multi_scale.enabled and not multi_scale.random_resize_via_padding:
             train_resize_choices = compute_multi_scale_scales(
                 model_config.resolution,
-                train_config.expanded_scales,
+                multi_scale.expanded_scales,
                 model_config.patch_size,
                 model_config.num_windows,
+                multi_scale.min_offset,
+                multi_scale.max_offset,
             )
         self._train_collate_fn = make_collate_fn(
             block_size=block_size,
@@ -376,7 +379,8 @@ class RFDETRDataModule(LightningDataModule):
         """
         batch_size = self.train_config.validation_batch_size
         if batch_size is None:
-            batch_size = 1 if self.train_config.validation_mode == "sahi" else self.train_config.batch_size
+            tiled_modes = {"sahi", "asahi", "gsahi"}
+            batch_size = 1 if self.train_config.validation_mode in tiled_modes else self.train_config.batch_size
         return DataLoader(
             self._dataset_val,
             batch_size=batch_size,

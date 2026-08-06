@@ -383,18 +383,16 @@ class COCOEvalCallback(Callback):
         ema_cb = self._get_ema_callback(trainer)
         ema_inner = _get_ema_inner_module(ema_cb)
         if ema_cb is not None and ema_inner is not None and self.map_metric_ema is not None:
-            samples, _ = batch
-            orig_sizes = torch.stack([t["orig_size"] for t in outputs["targets"]]).to(pl_module.device)
             ema_underlying = ema_inner.model
             with torch.no_grad():
                 ema_underlying.eval()  # AveragedModel deepcopy is not managed by PTL
-                ema_outputs = ema_underlying(samples)
-                ema_results = pl_module.postprocess(ema_outputs, orig_sizes)
+                ema_outputs = pl_module.predict_validation_batch_with_model(ema_underlying, batch)
+                ema_results = ema_outputs["results"]
             ema_preds = self._convert_preds(ema_results)
             self.map_metric_ema.update(ema_preds, targets)
             self._update_keypoint_oks_metric(
                 trainer,
-                {"results": ema_results, "targets": outputs["targets"]},
+                {"results": ema_results, "targets": ema_outputs["targets"]},
                 split="val_ema",
             )
             self._ema_has_updates = True

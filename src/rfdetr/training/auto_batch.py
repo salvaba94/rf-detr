@@ -325,10 +325,11 @@ def resolve_auto_batch_config(
         raise RuntimeError("batch_size='auto' requires a CUDA device for probing in v1.")
 
     # Use max multi-scale resolution when multi_scale is True so probe reflects worst-case.
-    multi_scale = getattr(train_config, "multi_scale", False)
-    do_random_resize = getattr(train_config, "do_random_resize_via_padding", False)
-    if multi_scale and not do_random_resize:
-        expanded_scales = getattr(train_config, "expanded_scales", True)
+    multi_scale = getattr(train_config, "multi_scale", None)
+    multi_scale_enabled = bool(getattr(multi_scale, "enabled", multi_scale if isinstance(multi_scale, bool) else False))
+    do_random_resize = bool(getattr(multi_scale, "random_resize_via_padding", False))
+    if multi_scale_enabled and not do_random_resize:
+        expanded_scales = getattr(multi_scale, "expanded_scales", True)
         patch_size = getattr(model_config, "patch_size", 14)
         num_windows = getattr(model_config, "num_windows", 4)
         scales = compute_multi_scale_scales(
@@ -336,6 +337,8 @@ def resolve_auto_batch_config(
             expanded_scales,
             patch_size,
             num_windows,
+            getattr(multi_scale, "min_offset", None),
+            getattr(multi_scale, "max_offset", None),
         )
         probe_resolution = max(scales) if scales else model_config.resolution
     else:
@@ -372,9 +375,10 @@ def resolve_auto_batch_config(
         autocast_dtype=probe_autocast_dtype,
     )
 
-    use_ema = getattr(train_config, "use_ema", False)
+    ema_config = getattr(train_config, "ema", None)
+    use_ema = bool(getattr(ema_config, "enabled", getattr(train_config, "use_ema", False)))
     if use_ema:
-        headroom = getattr(train_config, "auto_batch_ema_headroom", 0.7)
+        headroom = getattr(ema_config, "auto_batch_headroom", getattr(train_config, "auto_batch_ema_headroom", 0.7))
         safe_micro_batch = max(1, math.floor(safe_micro_batch * headroom))
         logger.info("[auto-batch] Applied EMA headroom (%.2f): safe_micro_batch=%s", headroom, safe_micro_batch)
 

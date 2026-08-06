@@ -399,3 +399,108 @@ class TestHungarianMatcherFocalAlpha:
         assert not matcher._warned_non_finite_costs, "boundary focal_alpha produced non-finite costs"
         result = matched_queries[matched_targets.argsort()].tolist()
         assert result == expected
+
+
+class TestHungarianMatcherTinyTargets:
+    """Tiny targets retain normal one-to-one set assignment."""
+
+    def test_stal_relaxes_training_match_geometry(self) -> None:
+        """STAL uses expanded tiny geometry for training assignment only."""
+        matcher = HungarianMatcher(
+            cost_class=0.0,
+            cost_bbox=1.0,
+            cost_giou=0.0,
+            stal_enabled=True,
+            stal_small_box_threshold=8.0,
+            stal_expanded_box_size=16.0,
+            stal_reference_resolution=640,
+        )
+        matcher.train()
+        outputs = {
+            "pred_logits": torch.zeros(1, 2, 1, dtype=torch.float32),
+            "pred_boxes": torch.tensor(
+                [[[0.50, 0.50, 0.010, 0.010], [0.50, 0.50, 0.025, 0.025]]], dtype=torch.float32
+            ),
+        }
+        targets = [
+            {
+                "labels": torch.tensor([0], dtype=torch.int64),
+                "boxes": torch.tensor([[0.50, 0.50, 0.010, 0.010]], dtype=torch.float32),
+            }
+        ]
+
+        matched_queries, matched_targets = matcher(outputs, targets)[0]
+
+        assert matched_queries.tolist() == [1]
+        assert matched_targets.tolist() == [0]
+
+    def test_stal_is_disabled_during_evaluation(self) -> None:
+        """Evaluation assignment uses unmodified ground-truth geometry."""
+        matcher = HungarianMatcher(
+            cost_class=0.0,
+            cost_bbox=1.0,
+            cost_giou=0.0,
+            stal_enabled=True,
+            stal_small_box_threshold=8.0,
+            stal_expanded_box_size=16.0,
+            stal_reference_resolution=640,
+        )
+        matcher.eval()
+        outputs = {
+            "pred_logits": torch.zeros(1, 2, 1, dtype=torch.float32),
+            "pred_boxes": torch.tensor(
+                [[[0.50, 0.50, 0.010, 0.010], [0.50, 0.50, 0.025, 0.025]]], dtype=torch.float32
+            ),
+        }
+        targets = [
+            {
+                "labels": torch.tensor([0], dtype=torch.int64),
+                "boxes": torch.tensor([[0.50, 0.50, 0.010, 0.010]], dtype=torch.float32),
+            }
+        ]
+
+        matched_queries, _ = matcher(outputs, targets)[0]
+
+        assert matched_queries.tolist() == [0]
+
+    def test_stal_expands_small_dimensions_independently(self) -> None:
+        """Width and height relaxation are independent and do not mutate targets."""
+        boxes = torch.tensor(
+            [[0.5, 0.5, 0.005, 0.100], [0.5, 0.5, 0.100, 0.005], [0.5, 0.5, 0.100, 0.100]]
+        )
+
+        matching_boxes = HungarianMatcher._stal_matching_boxes(boxes, 8.0, 16.0, 640)
+
+        assert torch.allclose(matching_boxes[0], torch.tensor([0.5, 0.5, 0.025, 0.100]))
+        assert torch.allclose(matching_boxes[1], torch.tensor([0.5, 0.5, 0.100, 0.025]))
+        assert torch.equal(matching_boxes[2], boxes[2])
+        assert torch.equal(boxes[:, 2:], torch.tensor([[0.005, 0.100], [0.100, 0.005], [0.100, 0.100]]))
+
+    def test_tiny_target_gets_one_match_per_query_group(self) -> None:
+        """Hungarian matching already guarantees coverage without TAL-style STAL."""
+        matcher = HungarianMatcher(cost_class=0.0, cost_bbox=1.0, cost_giou=0.0)
+        outputs = {
+            "pred_logits": torch.zeros(1, 4, 1, dtype=torch.float32),
+            "pred_boxes": torch.tensor(
+                [
+                    [
+                        [0.50, 0.50, 0.005, 0.005],
+                        [0.10, 0.10, 0.100, 0.100],
+                        [0.50, 0.50, 0.005, 0.005],
+                        [0.90, 0.90, 0.100, 0.100],
+                    ]
+                ],
+                dtype=torch.float32,
+            ),
+        }
+        targets = [
+            {
+                "labels": torch.tensor([0], dtype=torch.int64),
+                "boxes": torch.tensor([[0.50, 0.50, 0.005, 0.005]], dtype=torch.float32),
+            }
+        ]
+
+        matched_queries, matched_targets = matcher(outputs, targets, group_detr=2)[0]
+
+        assert matched_queries.tolist() == [0, 2]
+        assert matched_targets.tolist() == [0, 0]

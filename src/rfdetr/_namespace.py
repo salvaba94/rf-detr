@@ -94,7 +94,6 @@ _TC_NON_NAMESPACE_FIELDS = {
     # Auto-batch probe.
     "auto_batch_target_effective",
     "auto_batch_max_targets_per_image",
-    "auto_batch_ema_headroom",
     # PTL-only Trainer / DataModule / LR-scheduler knobs.
     "progress_bar",
     "compute_train_metrics",
@@ -105,6 +104,11 @@ _TC_NON_NAMESPACE_FIELDS = {
     "validation_batch_size",
     "lr_scheduler",
     "lr_min_factor",
+    "multi_scale",
+    "ema",
+    "early_stopping",
+    "optimizer_config",
+    "stal",
     # Dataset class labels.
     "class_names",
 }
@@ -165,6 +169,38 @@ def _namespace_from_configs(
             "mask_ce_loss_coef": getattr(tc, "mask_ce_loss_coef", 5.0),
             "mask_dice_loss_coef": getattr(tc, "mask_dice_loss_coef", 5.0),
             "mask_point_sample_ratio": getattr(tc, "mask_point_sample_ratio", 16),
+            # Early-stopping extras from structured TrainConfig blocks.
+            "early_stopping_enabled": tc.early_stopping.enabled,
+            "early_stopping_patience": tc.early_stopping.patience,
+            "early_stopping_min_delta": tc.early_stopping.min_delta,
+            "early_stopping_use_ema": tc.early_stopping.use_ema,
+            # Multi-scale extras from structured TrainConfig blocks.
+            "multi_scale": tc.multi_scale.enabled,
+            "expanded_scales": tc.multi_scale.expanded_scales,
+            "multi_scale_min_offset": tc.multi_scale.min_offset,
+            "multi_scale_max_offset": tc.multi_scale.max_offset,
+            "do_random_resize_via_padding": tc.multi_scale.random_resize_via_padding,
+            # EMA extras from structured TrainConfig blocks.
+            "use_ema": tc.ema.enabled,
+            "ema_decay": tc.ema.decay,
+            "ema_tau": tc.ema.tau,
+            "ema_update_interval": tc.ema.update_interval,
+            "auto_batch_ema_headroom": tc.ema.auto_batch_headroom,
+            # Optimizer extras from structured TrainConfig blocks.
+            "lr": tc.optimizer_config.lr,
+            "lr_encoder": tc.optimizer_config.lr_encoder,
+            "weight_decay": tc.optimizer_config.weight_decay,
+            "optimizer_momentum": tc.optimizer_config.momentum,
+            "optimizer_nesterov": tc.optimizer_config.nesterov,
+            "lr_scheduler": tc.optimizer_config.scheduler.name,
+            "lr_min_factor": tc.optimizer_config.scheduler.min_factor,
+            "warmup_epochs": tc.optimizer_config.scheduler.warmup_epochs,
+            "lr_drop": tc.optimizer_config.scheduler.drop_epoch,
+            # Training-only target geometry used by the Hungarian matcher.
+            "stal_enabled": tc.stal.enabled,
+            "stal_small_box_threshold": tc.stal.small_box_threshold,
+            "stal_expanded_box_size": tc.stal.expanded_box_size,
+            "stal_reference_resolution": mc.resolution,
             # Transformations: fields requiring a default sentinel or transitional priority.
             "cls_loss_coef": cls_loss_coef,
             "resume": tc.resume or "",

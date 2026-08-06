@@ -891,6 +891,8 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
     include_masks = getattr(args, "segmentation_head", False)
     multi_scale = getattr(args, "multi_scale", False)
     expanded_scales = getattr(args, "expanded_scales", None)
+    multi_scale_min_offset = getattr(args, "multi_scale_min_offset", None)
+    multi_scale_max_offset = getattr(args, "multi_scale_max_offset", None)
     do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
     patch_size = getattr(args, "patch_size", None)
     num_windows = getattr(args, "num_windows", None)
@@ -929,6 +931,8 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 resolution,
                 multi_scale=multi_scale,
                 expanded_scales=expanded_scales,
+                multi_scale_min_offset=multi_scale_min_offset,
+                multi_scale_max_offset=multi_scale_max_offset,
                 skip_random_resize=not do_random_resize_via_padding,
                 patch_size=patch_size,
                 num_windows=num_windows,
@@ -954,6 +958,8 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
                 resolution,
                 multi_scale=multi_scale,
                 expanded_scales=expanded_scales,
+                multi_scale_min_offset=multi_scale_min_offset,
+                multi_scale_max_offset=multi_scale_max_offset,
                 skip_random_resize=not do_random_resize_via_padding,
                 patch_size=patch_size,
                 num_windows=num_windows,

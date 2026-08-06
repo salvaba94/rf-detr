@@ -98,6 +98,154 @@ class BaseConfig(BaseModel):
         raise ValueError(f"Unknown attribute: '{name}'.")
 
 
+class StalConfig(BaseConfig):
+    """Small-target geometry relaxation for Hungarian matching."""
+
+    enabled: bool = False
+    small_box_threshold: float = Field(default=8.0, ge=0.0)
+    expanded_box_size: float = Field(default=16.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_expanded_box_size(self) -> "StalConfig":
+        """Require relaxed dimensions to be no smaller than the trigger threshold."""
+        if self.expanded_box_size < self.small_box_threshold:
+            raise ValueError("stal.expanded_box_size must be greater than or equal to stal.small_box_threshold")
+        return self
+
+
+class EarlyStoppingConfig(BaseConfig):
+    """Early-stopping callback options."""
+
+    enabled: bool = False
+    patience: int = Field(default=10, ge=1)
+    min_delta: float = Field(default=0.001, ge=0.0)
+    use_ema: bool = False
+
+
+class MultiScaleConfig(BaseConfig):
+    """Multi-scale training resize options."""
+
+    enabled: bool = True
+    expanded_scales: bool = True
+    min_offset: Optional[int] = None
+    max_offset: Optional[int] = None
+    random_resize_via_padding: bool = False
+
+    @model_validator(mode="after")
+    def _validate_offset_range(self) -> "MultiScaleConfig":
+        """Validate explicit multi-scale offset bounds."""
+        if self.min_offset is not None and self.max_offset is not None and self.min_offset > self.max_offset:
+            raise ValueError(
+                "multi_scale.min_offset must be less than or equal to multi_scale.max_offset, "
+                f"got {self.min_offset} > {self.max_offset}."
+            )
+        return self
+
+
+class EmaConfig(BaseConfig):
+    """Exponential moving average training options."""
+
+    enabled: bool = True
+    decay: float = 0.993
+    tau: int = Field(default=100, ge=1)
+    update_interval: int = Field(default=1, ge=1)
+    auto_batch_headroom: float = Field(default=0.7, gt=0.0, le=1.0)
+
+
+class OptimizerSchedulerConfig(BaseConfig):
+    """Learning-rate scheduler options grouped under optimizer configuration."""
+
+    name: Literal["step", "cosine"] = "step"
+    min_factor: float = 0.0
+    warmup_epochs: float = 0.0
+    drop_epoch: int = 100
+
+
+class OptimizerConfig(BaseConfig):
+    """Optimizer hyperparameters grouped away from TrainConfig's legacy flat fields."""
+
+    lr: float = 1e-4
+    lr_encoder: float = 1.5e-4
+    weight_decay: float = 1e-4
+    momentum: float = Field(default=0.95, ge=0.0, lt=1.0)
+    nesterov: bool = True
+    muon_lr_scale: float = Field(default=0.2, ge=0.0)
+    fallback_lr_scale: float = Field(default=1.0, ge=0.0)
+    ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315)
+    eps: float = Field(default=1e-7, gt=0.0)
+    ns_steps: int = Field(default=5, ge=1)
+    adjust_lr_fn: Optional[Literal["original", "match_rms_adamw"]] = None
+    scheduler: OptimizerSchedulerConfig = Field(default_factory=OptimizerSchedulerConfig)
+
+
+class SahiValidationConfig(BaseConfig):
+    """Fixed-grid SAHI validation options."""
+
+    slice_height: Optional[int] = Field(default=None, ge=1)
+    slice_width: Optional[int] = Field(default=None, ge=1)
+    overlap_height_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)
+    overlap_width_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)
+    nms_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    merge_metric: Literal["iou", "ios", "diou", "cdn"] = "iou"
+    source_aware_duplicate_suppression: bool = False
+    include_full_image: bool = False
+    tile_batch_size: Optional[int] = Field(default=None, ge=1)
+    batch_across_images: bool = False
+    tile_input_dtype: Literal["auto", "fp32", "bf16", "fp16"] = "auto"
+    tile_memory_format: Literal["contiguous", "channels_last"] = "contiguous"
+    score_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
+
+
+class AsahiValidationConfig(BaseConfig):
+    """Adaptive SAHI validation options."""
+
+    short_side_threshold: int = Field(default=1280, ge=1)
+    low_patch_count: Literal[6] = 6
+    high_patch_count: Literal[6, 12] = 12
+    overlap_ratio: float = Field(default=0.15, ge=0.0, lt=1.0)
+    include_full_image: bool = True
+    source_mode: Literal["adaptive", "full", "full_adaptive"] = "full_adaptive"
+    window_resize_longest_side: Optional[int] = Field(default=None, ge=1)
+    window_resize_policy: Literal[
+        "aspect_longest_side",
+        "aspect_valid_target",
+        "square_stretch",
+        "square_letterbox",
+        "letterbox_valid_target",
+        "letterbox_canvas_target",
+        "square_context",
+    ] = "square_context"
+    nms_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    merge_metric: Literal["iou", "ios", "diou", "cdn"] = "cdn"
+    source_aware_duplicate_suppression: bool = False
+    tile_batch_size: Optional[int] = Field(default=None, ge=1)
+    batch_across_images: bool = False
+    tile_input_dtype: Literal["auto", "fp32", "bf16", "fp16"] = "auto"
+    tile_memory_format: Literal["contiguous", "channels_last"] = "contiguous"
+    score_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
+
+
+class GsahiValidationConfig(BaseConfig):
+    """Guided SAHI coarse-to-fine validation options."""
+
+    coarse_slice_size: int = Field(default=640, ge=1)
+    fine_slice_size: int = Field(default=256, ge=1)
+    coarse_overlap: float = Field(default=0.2, ge=0.0, lt=1.0)
+    fine_overlap: float = Field(default=0.2, ge=0.0, lt=1.0)
+    include_full_image: bool = True
+    roi_score_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    roi_expansion_ratio: float = Field(default=0.25, ge=0.0)
+    roi_max_regions: int = Field(default=32, ge=1)
+    nms_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    merge_metric: Literal["iou", "ios", "diou", "cdn"] = "iou"
+    merge_sources: Literal["full_fine", "full_coarse_fine", "fine"] = "full_fine"
+    source_aware_duplicate_suppression: bool = False
+    tile_batch_size: Optional[int] = Field(default=None, ge=1)
+    tile_input_dtype: Literal["auto", "fp32", "bf16", "fp16"] = "auto"
+    tile_memory_format: Literal["contiguous", "channels_last"] = "contiguous"
+    score_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
+
+
 class ModelConfig(BaseConfig):
     encoder: EncoderName
     out_feature_indexes: List[int]
@@ -654,11 +802,8 @@ class TrainConfig(BaseConfig):
     auto_batch_target_effective: int = 16  # per-device effective batch size target (before devices * num_nodes)
     # Auto-batch probe: worst-case assumptions when batch_size="auto".
     auto_batch_max_targets_per_image: int = 100
-    auto_batch_ema_headroom: float = 0.7  # scale safe batch by this when use_ema=True (EMA uses extra memory)
     epochs: int = 100
     resume: Optional[PathLikeStr] = None
-    ema_decay: float = 0.993
-    ema_tau: int = 100
     lr_drop: int = 100
     checkpoint_interval: int = Field(default=10, ge=1)
     skip_best_epochs: int = Field(default=0, ge=0)
@@ -681,13 +826,13 @@ class TrainConfig(BaseConfig):
     square_resize_div_64: bool = True
     dataset_dir: Optional[PathLikeStr]
     output_dir: PathLikeStr = "output"
-    multi_scale: bool = True
-    expanded_scales: bool = True
-    do_random_resize_via_padding: bool = False
-    use_ema: bool = True
-    ema_update_interval: int = 1
+    multi_scale: MultiScaleConfig = Field(default_factory=MultiScaleConfig)
+    ema: EmaConfig = Field(default_factory=EmaConfig)
     num_workers: int = 2
     weight_decay: float = 1e-4
+    optimizer: Literal["adamw", "sgd", "muadamw", "musgd"] = "adamw"
+    optimizer_config: OptimizerConfig = Field(default_factory=OptimizerConfig)
+    stal: StalConfig = Field(default_factory=StalConfig)
     amp_dtype: Literal["auto", "bf16", "fp16"] = Field(
         default="auto",
         description=(
@@ -698,10 +843,7 @@ class TrainConfig(BaseConfig):
             "Has no effect when model_config.amp=False or when training on CPU."
         ),
     )
-    early_stopping: bool = False
-    early_stopping_patience: int = 10
-    early_stopping_min_delta: float = 0.001
-    early_stopping_use_ema: bool = False
+    early_stopping: EarlyStoppingConfig = Field(default_factory=EarlyStoppingConfig)
     progress_bar: Optional[Literal["tqdm", "rich"]] = None  # Progress bar style: "rich", "tqdm", or None to disable.
     tensorboard: bool = True
     wandb: bool = False
@@ -720,14 +862,15 @@ class TrainConfig(BaseConfig):
     eval_interval: int = 1
     log_per_class_metrics: bool = True
     validation_batch_size: Optional[int] = Field(default=None, ge=1)
-    validation_mode: Literal["standard", "sahi"] = "standard"
-    sahi_slice_height: Optional[int] = Field(default=None, ge=1)
-    sahi_slice_width: Optional[int] = Field(default=None, ge=1)
-    sahi_overlap_height_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)
-    sahi_overlap_width_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)
-    sahi_nms_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    sahi_confidence_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
-    sahi: Optional[Dict[str, Any]] = None
+    validation_mode: Literal[
+        "standard",
+        "sahi",
+        "asahi",
+        "gsahi",
+    ] = "standard"
+    sahi: SahiValidationConfig = Field(default_factory=SahiValidationConfig)
+    asahi: AsahiValidationConfig = Field(default_factory=AsahiValidationConfig)
+    gsahi: GsahiValidationConfig = Field(default_factory=GsahiValidationConfig)
     validation_score_threshold: float = Field(default=0.001, ge=0.0, le=1.0)
     validation_max_predictions: int = Field(default=500, ge=1)
     pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
@@ -736,6 +879,7 @@ class TrainConfig(BaseConfig):
     eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False
+    save_prediction_grids: bool = False
     notes: Optional[Any] = Field(
         default=None,
         description=(
@@ -746,6 +890,205 @@ class TrainConfig(BaseConfig):
             "all other types are JSON-encoded."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_nested_ema_config(cls, data: Any) -> Any:
+        """Normalize legacy EMA fields into the structured config.
+
+        Args:
+            data: Raw config data received by Pydantic.
+
+        Returns:
+            Config data with supported EMA keys under ``ema``.
+        """
+        if not isinstance(data, dict):
+            return data
+        expanded = dict(data)
+        raw_ema = expanded.get("ema")
+        legacy_mapping = {
+            "use_ema": "enabled",
+            "ema_decay": "decay",
+            "ema_tau": "tau",
+            "ema_update_interval": "update_interval",
+            "auto_batch_ema_headroom": "auto_batch_headroom",
+        }
+
+        if isinstance(raw_ema, bool):
+            normalized: dict[str, Any] = {"enabled": raw_ema}
+        elif isinstance(raw_ema, dict):
+            normalized = dict(raw_ema)
+        else:
+            normalized = {}
+
+        for legacy_key, nested_key in legacy_mapping.items():
+            if legacy_key in expanded:
+                legacy_value = expanded.pop(legacy_key)
+                if nested_key not in normalized:
+                    normalized[nested_key] = legacy_value
+
+        if normalized:
+            expanded["ema"] = normalized
+        return expanded
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_nested_multi_scale_config(cls, data: Any) -> Any:
+        """Normalize legacy multi-scale fields into the structured config.
+
+        Args:
+            data: Raw config data received by Pydantic.
+
+        Returns:
+            Config data with supported multi-scale keys under ``multi_scale``.
+        """
+        if not isinstance(data, dict):
+            return data
+        expanded = dict(data)
+        raw_multi_scale = expanded.get("multi_scale")
+        legacy_mapping = {
+            "expanded_scales": "expanded_scales",
+            "multi_scale_min_offset": "min_offset",
+            "multi_scale_max_offset": "max_offset",
+            "do_random_resize_via_padding": "random_resize_via_padding",
+        }
+
+        if isinstance(raw_multi_scale, bool):
+            normalized: dict[str, Any] = {"enabled": raw_multi_scale}
+        elif isinstance(raw_multi_scale, dict):
+            normalized = dict(raw_multi_scale)
+        else:
+            normalized = {}
+
+        for legacy_key, nested_key in legacy_mapping.items():
+            if legacy_key in expanded:
+                legacy_value = expanded.pop(legacy_key)
+                if nested_key not in normalized:
+                    normalized[nested_key] = legacy_value
+
+        if normalized:
+            expanded["multi_scale"] = normalized
+        return expanded
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_nested_optimizer_config(cls, data: Any) -> Any:
+        """Keep backward-compatible nested optimizer selector syntax.
+
+        Args:
+            data: Raw config data received by Pydantic.
+
+        Returns:
+            Config data with ``optimizer.name`` moved to the selector field when present.
+        """
+        if not isinstance(data, dict):
+            return data
+        optimizer_config = data.get("optimizer_config")
+        optimizer = data.get("optimizer")
+        if not isinstance(optimizer, dict):
+            return data
+        expanded = dict(data)
+        if "name" in optimizer:
+            expanded["optimizer"] = optimizer["name"]
+        optimizer_without_name = {key: value for key, value in optimizer.items() if key != "name"}
+        if optimizer_without_name:
+            if isinstance(optimizer_config, dict):
+                expanded["optimizer_config"] = {**optimizer_without_name, **optimizer_config}
+            else:
+                expanded["optimizer_config"] = optimizer_without_name
+        return expanded
+
+    @model_validator(mode="after")
+    def _sync_optimizer_config_aliases(self) -> "TrainConfig":
+        """Synchronize legacy flat optimizer fields with the structured optimizer config."""
+        optimizer_fields_set = "optimizer_config" in self.model_fields_set
+        scheduler_fields_set = optimizer_fields_set and "scheduler" in self.optimizer_config.model_fields_set
+        scheduler = self.optimizer_config.scheduler
+
+        if not optimizer_fields_set:
+            self.optimizer_config.lr = self.lr
+            self.optimizer_config.lr_encoder = self.lr_encoder
+            self.optimizer_config.weight_decay = self.weight_decay
+            scheduler.name = self.lr_scheduler
+            scheduler.min_factor = self.lr_min_factor
+            scheduler.warmup_epochs = self.warmup_epochs
+            scheduler.drop_epoch = self.lr_drop
+            return self
+
+        if "lr" not in self.optimizer_config.model_fields_set and "lr" in self.model_fields_set:
+            self.optimizer_config.lr = self.lr
+        if "lr_encoder" not in self.optimizer_config.model_fields_set and "lr_encoder" in self.model_fields_set:
+            self.optimizer_config.lr_encoder = self.lr_encoder
+        if "weight_decay" not in self.optimizer_config.model_fields_set and "weight_decay" in self.model_fields_set:
+            self.optimizer_config.weight_decay = self.weight_decay
+
+        if not scheduler_fields_set:
+            if "lr_scheduler" in self.model_fields_set:
+                scheduler.name = self.lr_scheduler
+            if "lr_min_factor" in self.model_fields_set:
+                scheduler.min_factor = self.lr_min_factor
+            if "warmup_epochs" in self.model_fields_set:
+                scheduler.warmup_epochs = self.warmup_epochs
+            if "lr_drop" in self.model_fields_set:
+                scheduler.drop_epoch = self.lr_drop
+        else:
+            if "name" not in scheduler.model_fields_set and "lr_scheduler" in self.model_fields_set:
+                scheduler.name = self.lr_scheduler
+            if "min_factor" not in scheduler.model_fields_set and "lr_min_factor" in self.model_fields_set:
+                scheduler.min_factor = self.lr_min_factor
+            if "warmup_epochs" not in scheduler.model_fields_set and "warmup_epochs" in self.model_fields_set:
+                scheduler.warmup_epochs = self.warmup_epochs
+            if "drop_epoch" not in scheduler.model_fields_set and "lr_drop" in self.model_fields_set:
+                scheduler.drop_epoch = self.lr_drop
+
+        object.__setattr__(self, "lr", self.optimizer_config.lr)
+        object.__setattr__(self, "lr_encoder", self.optimizer_config.lr_encoder)
+        object.__setattr__(self, "weight_decay", self.optimizer_config.weight_decay)
+        object.__setattr__(self, "lr_scheduler", scheduler.name)
+        object.__setattr__(self, "lr_min_factor", scheduler.min_factor)
+        object.__setattr__(self, "warmup_epochs", scheduler.warmup_epochs)
+        object.__setattr__(self, "lr_drop", scheduler.drop_epoch)
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_nested_early_stopping_config(cls, data: Any) -> Any:
+        """Normalize legacy early-stopping forms into the structured config.
+
+        Args:
+            data: Raw config data received by Pydantic.
+
+        Returns:
+            Config data with supported early-stopping keys under ``early_stopping``.
+        """
+        if not isinstance(data, dict):
+            return data
+        expanded = dict(data)
+        raw_early_stopping = expanded.get("early_stopping")
+        early_stopping_config = expanded.pop("early_stopping_config", None)
+        legacy_mapping = {
+            "early_stopping_patience": "patience",
+            "early_stopping_min_delta": "min_delta",
+            "early_stopping_use_ema": "use_ema",
+        }
+
+        if isinstance(raw_early_stopping, bool):
+            normalized: dict[str, Any] = {"enabled": raw_early_stopping}
+        elif isinstance(raw_early_stopping, dict):
+            normalized = dict(raw_early_stopping)
+        else:
+            normalized = {}
+
+        if isinstance(early_stopping_config, dict):
+            normalized = {**normalized, **early_stopping_config}
+
+        for legacy_key, nested_key in legacy_mapping.items():
+            if legacy_key in expanded:
+                normalized[nested_key] = expanded.pop(legacy_key)
+
+        if normalized:
+            expanded["early_stopping"] = normalized
+        return expanded
 
     @model_validator(mode="before")
     @classmethod
@@ -779,34 +1122,41 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="before")
     @classmethod
-    def _expand_nested_sahi_config(cls, data: Any) -> Any:
-        """Expand a nested ``sahi`` YAML block into flat TrainConfig fields.
+    def _normalize_validation_method_configs(cls, data: Any) -> Any:
+        """Normalize validation method aliases while keeping method options grouped.
 
         Args:
             data: Raw config data received by Pydantic.
 
         Returns:
-            Config data with supported ``sahi`` keys mapped to their internal fields.
+            Config data with validation method settings stored under ``sahi``, ``asahi``, and ``gsahi``.
         """
         if not isinstance(data, dict):
             return data
         expanded = dict(data)
-        if "sahi_confidence_threshold" in expanded and "validation_score_threshold" not in expanded:
-            expanded["validation_score_threshold"] = expanded["sahi_confidence_threshold"]
-        sahi = data.get("sahi")
-        if not isinstance(sahi, dict):
-            return expanded
-        mapping = {
-            "slice_height": "sahi_slice_height",
-            "slice_width": "sahi_slice_width",
-            "overlap_height_ratio": "sahi_overlap_height_ratio",
-            "overlap_width_ratio": "sahi_overlap_width_ratio",
-            "nms_iou_threshold": "sahi_nms_iou_threshold",
-            "confidence_threshold": "validation_score_threshold",
-        }
-        for nested_key, field_name in mapping.items():
-            if nested_key in sahi and field_name not in expanded:
-                expanded[field_name] = sahi[nested_key]
+        if expanded.get("validation_mode") in {"guided_sahi", "dual_sahi", "coarse_to_fine", "gois"}:
+            expanded["validation_mode"] = "gsahi"
+
+        if isinstance(expanded.get("sahi"), dict):
+            sahi = dict(expanded["sahi"])
+            confidence_threshold = sahi.pop("confidence_threshold", None)
+            if confidence_threshold is not None:
+                if "validation_score_threshold" not in expanded:
+                    expanded["validation_score_threshold"] = confidence_threshold
+                sahi.setdefault("score_threshold", confidence_threshold)
+            expanded["sahi"] = sahi
+
+        alias_block = next(
+            (
+                expanded.pop(alias)
+                for alias in ("guided_sahi", "dual_sahi", "coarse_to_fine", "gois")
+                if isinstance(expanded.get(alias), dict)
+            ),
+            None,
+        )
+        if alias_block is not None and "gsahi" not in expanded:
+            expanded["gsahi"] = alias_block
+
         return expanded
 
     @model_validator(mode="after")
@@ -913,14 +1263,6 @@ class TrainConfig(BaseConfig):
             )
         return v
 
-    @field_validator("auto_batch_ema_headroom", mode="after")
-    @classmethod
-    def validate_ema_headroom(cls, v: float) -> float:
-        """Validate auto_batch_ema_headroom is in (0, 1]."""
-        if not (0 < v <= 1.0):
-            raise ValueError("auto_batch_ema_headroom must be in (0, 1].")
-        return v
-
     @field_validator("smooth_alpha", mode="after")
     @classmethod
     def validate_smooth_alpha(cls, v: float) -> float:
@@ -929,7 +1271,7 @@ class TrainConfig(BaseConfig):
             raise ValueError("smooth_alpha must be in [0.0, 1.0).")
         return v
 
-    @field_validator("ema_update_interval", "eval_interval", mode="after")
+    @field_validator("eval_interval", mode="after")
     @classmethod
     def validate_positive_intervals(cls, v: int) -> int:
         """Validate interval fields are >= 1."""

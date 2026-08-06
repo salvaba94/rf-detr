@@ -58,7 +58,6 @@ train = [
     "pycocotools",
     "scipy",
     "albumentations>=1.4.24,<3.0.0",
-    "sahi>=0.12.1,<0.13.0",
     "roboflow",
     "rf100vl",
 ]

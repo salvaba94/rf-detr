@@ -41,7 +41,7 @@ class TestNamespaceFromConfigs:
             train_log_on_step=True,
             compute_val_loss=False,
             compute_test_loss=False,
-            ema_update_interval=2,
+            ema={"update_interval": 2},
             prefetch_factor=4,
         )
         args = _namespace_from_configs(base_model_config(), tc)
@@ -70,6 +70,52 @@ class TestNamespaceFromConfigs:
         assert args.sync_bn is True
         assert args.fp16_eval is True
 
+    def test_forwards_structured_optimizer_config(self, base_model_config, base_train_config):
+        """Nested optimizer config is flattened only inside the legacy namespace bridge."""
+        tc = base_train_config(
+            optimizer="muadamw",
+            optimizer_config={
+                "lr": 2e-4,
+                "lr_encoder": 1e-4,
+                "weight_decay": 5e-4,
+                "momentum": 0.8,
+                "nesterov": False,
+                "scheduler": {
+                    "name": "cosine",
+                    "min_factor": 0.2,
+                    "warmup_epochs": 1.0,
+                    "drop_epoch": 7,
+                },
+            },
+        )
+
+        args = _namespace_from_configs(base_model_config(), tc)
+
+        assert args.optimizer == "muadamw"
+        assert args.lr == pytest.approx(2e-4)
+        assert args.lr_encoder == pytest.approx(1e-4)
+        assert args.weight_decay == pytest.approx(5e-4)
+        assert args.optimizer_momentum == pytest.approx(0.8)
+        assert args.optimizer_nesterov is False
+        assert args.lr_scheduler == "cosine"
+        assert args.lr_min_factor == pytest.approx(0.2)
+        assert args.warmup_epochs == pytest.approx(1.0)
+        assert args.lr_drop == 7
+
+    def test_forwards_stal_with_model_resolution(self, base_model_config, base_train_config) -> None:
+        """STAL pixel dimensions are normalized against the model input resolution."""
+        mc = base_model_config(resolution=704)
+        tc = base_train_config(
+            stal={"enabled": True, "small_box_threshold": 6.0, "expanded_box_size": 12.0}
+        )
+
+        args = _namespace_from_configs(mc, tc)
+
+        assert args.stal_enabled is True
+        assert args.stal_small_box_threshold == pytest.approx(6.0)
+        assert args.stal_expanded_box_size == pytest.approx(12.0)
+        assert args.stal_reference_resolution == 704
+
     def test_seed_falls_back_to_legacy_default_when_unset(self, base_model_config, base_train_config):
         """Seed defaults to 42 in the namespace when TrainConfig.seed is None."""
         tc = base_train_config(seed=None)
@@ -78,7 +124,7 @@ class TestNamespaceFromConfigs:
 
     def test_forwards_dataset_fields(self, base_model_config, base_train_config):
         """Dataset-routing fields are forwarded to the Namespace."""
-        tc = base_train_config(multi_scale=True, expanded_scales=True, dataset_file="coco")
+        tc = base_train_config(multi_scale={"enabled": True, "expanded_scales": True}, dataset_file="coco")
         args = _namespace_from_configs(base_model_config(), tc)
 
         assert args.multi_scale is True

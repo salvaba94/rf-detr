@@ -60,3 +60,4 @@ def test_save_grid_writes_files(tmp_path: Path) -> None:
             img = np.array(pil_img)
         assert img.ndim == 3
         assert img.shape[2] == 3
+        assert img.shape[1] > img.shape[0]

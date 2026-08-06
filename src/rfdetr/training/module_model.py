@@ -9,23 +9,22 @@ from __future__ import annotations
 
 import math
 import warnings
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import torch
 from pytorch_lightning import LightningModule, seed_everything
-from sahi.models.base import DetectionModel
-from sahi.predict import get_sliced_prediction
-from sahi.prediction import ObjectPrediction
-from sahi.utils.cv import get_coco_segmentation_from_bool_mask
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import RFDETRModelConfig, RFDETRTrainConfig
+from rfdetr.evaluation.tiled_asahi import predict_asahi
+from rfdetr.evaluation.tiled_gsahi import predict_gsahi
+from rfdetr.evaluation.tiled_sahi import predict_tiled
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
+from rfdetr.training.optimizers import build_optimizer
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
-from rfdetr.utilities.tensors import nested_tensor_from_tensor_list
 
 logger = get_logger()
 
@@ -40,191 +39,6 @@ _TRAIN_PROGRESS_LOSS_ALIASES: dict[str, str] = {
     "loss_keypoints_visible": "kp_vis",
     "loss_keypoints_nll": "kp_nll",
 }
-
-_IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32)
-_IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32)
-
-
-class SAHIRFDETRDetectionModel(DetectionModel):
-    """SAHI adapter that runs sliced inference through an in-memory RF-DETR module."""
-
-    def __init__(
-        self,
-        *,
-        model: torch.nn.Module,
-        postprocess: Any,
-        block_size: int,
-        category_names: list[str],
-        confidence_threshold: float,
-        max_detections: int,
-    ) -> None:
-        self.postprocess = postprocess
-        self.block_size = block_size
-        self.category_names = category_names
-        self.max_detections = max_detections
-        super().__init__(
-            model=model,
-            confidence_threshold=confidence_threshold,
-            category_mapping={str(index): name for index, name in enumerate(category_names)},
-            load_at_init=True,
-        )
-
-    def load_model(self) -> None:
-        """Reject path-based loading because the Lightning module already owns the model."""
-        raise ValueError("SAHIRFDETRDetectionModel requires an in-memory RF-DETR model.")
-
-    def set_model(self, model: torch.nn.Module, **kwargs: Any) -> None:
-        """Attach an existing RF-DETR model to the SAHI adapter.
-
-        Args:
-            model: In-memory RF-DETR model.
-            **kwargs: Unused SAHI extension hook.
-        """
-        self.model = model
-
-    def perform_inference(self, image: np.ndarray) -> None:
-        """Run RF-DETR inference on a single SAHI slice.
-
-        Args:
-            image: Slice image in HWC uint8 format.
-        """
-        self.perform_batch_inference([image])
-
-    def perform_batch_inference(self, images: list[np.ndarray]) -> None:
-        """Run RF-DETR inference on a batch of SAHI slices.
-
-        Args:
-            images: Slice images in HWC uint8 format.
-        """
-        if not images:
-            self._original_predictions = []
-            self._original_shapes = []
-            return
-        self._original_shapes = [image.shape for image in images]
-        device = next(self.model.parameters()).device
-        tensors = [self._image_to_tensor(image, device=device) for image in images]
-        samples = nested_tensor_from_tensor_list(tensors, block_size=self.block_size)
-        sizes = torch.as_tensor(
-            [[image.shape[0], image.shape[1]] for image in images],
-            dtype=torch.float32,
-            device=device,
-        )
-        with torch.no_grad():
-            outputs = self.model(samples)
-            self._original_predictions = self.postprocess(outputs, sizes)
-
-    def _create_object_prediction_list_from_original_predictions(
-        self,
-        shift_amount_list: list[list[int | float]] | None = None,
-        full_shape_list: list[list[int | float]] | None = None,
-    ) -> None:
-        """Convert RF-DETR predictions to SAHI object predictions.
-
-        Args:
-            shift_amount_list: Per-slice offsets supplied by SAHI.
-            full_shape_list: Full image shapes supplied by SAHI.
-        """
-        shift_amount_list = shift_amount_list or [[0, 0]]
-        predictions = self._original_predictions or []
-        object_predictions_per_image: list[list[ObjectPrediction]] = []
-        for index, prediction in enumerate(predictions):
-            shift_amount = shift_amount_list[index] if index < len(shift_amount_list) else [0, 0]
-            full_shape = full_shape_list[index] if full_shape_list and index < len(full_shape_list) else None
-            boxes = prediction.get("boxes", torch.empty((0, 4))).detach().float().cpu()
-            scores = prediction.get("scores", torch.empty(0)).detach().float().cpu()
-            labels = prediction.get("labels", torch.empty(0, dtype=torch.long)).detach().long().cpu()
-            masks = prediction.get("masks")
-            if torch.is_tensor(masks):
-                masks = masks.detach().cpu().bool()
-                if masks.ndim == 4 and masks.shape[1] == 1:
-                    masks = masks.squeeze(1)
-                if masks.ndim != 3 or masks.shape[0] != boxes.shape[0]:
-                    masks = None
-            else:
-                masks = None
-            if boxes.numel():
-                shape = self._original_shapes[index] if index < len(self._original_shapes or []) else None
-                if shape is not None:
-                    height, width = int(shape[0]), int(shape[1])
-                    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0.0, float(width))
-                    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0.0, float(height))
-                else:
-                    boxes = boxes.clamp_min(0.0)
-                finite = torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores)
-                boxes = boxes[finite]
-                scores = scores[finite]
-                labels = labels[finite]
-                if masks is not None:
-                    masks = masks[finite]
-            if scores.numel():
-                keep = scores >= float(self.confidence_threshold)
-                boxes = boxes[keep]
-                scores = scores[keep]
-                labels = labels[keep]
-                if masks is not None:
-                    masks = masks[keep]
-            if scores.numel() > self.max_detections:
-                keep = torch.topk(scores, self.max_detections).indices
-                boxes = boxes[keep]
-                scores = scores[keep]
-                labels = labels[keep]
-                if masks is not None:
-                    masks = masks[keep]
-            object_predictions: list[ObjectPrediction] = []
-            for prediction_index, (box, score, label) in enumerate(zip(boxes, scores, labels)):
-                if float(box[2] - box[0]) <= 0.0 or float(box[3] - box[1]) <= 0.0:
-                    continue
-                segmentation = None
-                prediction_full_shape = full_shape
-                if masks is not None:
-                    mask_np = masks[prediction_index].numpy()
-                    segmentation = get_coco_segmentation_from_bool_mask(mask_np)
-                    if not segmentation:
-                        continue
-                    if prediction_full_shape is None:
-                        prediction_full_shape = list(mask_np.shape)
-                object_predictions.append(
-                    ObjectPrediction(
-                        bbox=box.tolist(),
-                        category_id=int(label.item()),
-                        category_name=self._category_name(int(label.item())),
-                        segmentation=segmentation,
-                        score=float(score.item()),
-                        shift_amount=shift_amount,
-                        full_shape=prediction_full_shape,
-                    )
-                )
-            object_predictions_per_image.append(object_predictions)
-        self._object_prediction_list_per_image = object_predictions_per_image
-
-    def _category_name(self, label: int) -> str:
-        """Return a display name for a zero-based category label.
-
-        Args:
-            label: Zero-based category label.
-
-        Returns:
-            Category name used by SAHI.
-        """
-        if 0 <= label < len(self.category_names):
-            return self.category_names[label]
-        return str(label)
-
-    @staticmethod
-    def _image_to_tensor(image: np.ndarray, *, device: torch.device) -> torch.Tensor:
-        """Convert a SAHI uint8 HWC image slice into a normalized RF-DETR tensor.
-
-        Args:
-            image: Slice image in HWC uint8 format.
-            device: Destination device.
-
-        Returns:
-            Normalized CHW tensor on ``device``.
-        """
-        tensor = torch.as_tensor(image, device=device).permute(2, 0, 1).float().div(255.0)
-        mean = _IMAGENET_MEAN.to(device=device)[:, None, None]
-        std = _IMAGENET_STD.to(device=device)[:, None, None]
-        return (tensor - mean) / std
 
 
 class RFDETRModelModule(LightningModule):
@@ -283,9 +97,9 @@ class RFDETRModelModule(LightningModule):
         accelerator = str(train_config.accelerator).lower()
         uses_cuda_accelerator = accelerator in {"auto", "gpu", "cuda"}
         compile_enabled = (
-            model_config.compile and DEVICE == "cuda" and uses_cuda_accelerator and not train_config.multi_scale
+            model_config.compile and DEVICE == "cuda" and uses_cuda_accelerator and not train_config.multi_scale.enabled
         )
-        if model_config.compile and train_config.multi_scale:
+        if model_config.compile and train_config.multi_scale.enabled:
             logger.info("Disabling torch.compile because multi_scale=True introduces dynamic input shapes.")
         if compile_enabled:
             # dynamic=True: one compiled graph handles all multi-scale input sizes instead
@@ -682,193 +496,218 @@ class RFDETRModelModule(LightningModule):
         )
         self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
-    def _validation_uses_sahi(self) -> bool:
-        """Return whether validation should use SAHI sliced inference.
+    def _validation_uses_tiled_mode(self) -> bool:
+        """Return whether validation should use native tiled inference.
 
         Returns:
-            ``True`` when ``TrainConfig.validation_mode`` is ``"sahi"``.
+            ``True`` for native tiled validation modes.
         """
-        return getattr(self.train_config, "validation_mode", "standard") == "sahi"
+        return getattr(self.train_config, "validation_mode", "standard") in {
+            "sahi",
+            "asahi",
+            "gsahi",
+        }
 
-    def _make_sahi_detection_model(self) -> SAHIRFDETRDetectionModel:
-        """Build a SAHI adapter around the current RF-DETR model.
-
-        Returns:
-            SAHI detection model wrapper.
-        """
-        class_names = getattr(self.train_config, "class_names", None)
-        if not class_names:
-            class_names = [str(index) for index in range(int(self.model_config.num_classes))]
-        return SAHIRFDETRDetectionModel(
-            model=self.model,
-            postprocess=self.postprocess,
-            block_size=int(self.model_config.patch_size * self.model_config.num_windows),
-            category_names=list(class_names),
-            confidence_threshold=float(self.train_config.validation_score_threshold),
-            max_detections=int(self.train_config.validation_max_predictions),
-        )
-
-    @staticmethod
-    def _normalized_tensor_to_uint8_image(image: torch.Tensor) -> np.ndarray:
-        """Convert a normalized RF-DETR tensor into a uint8 HWC image for SAHI slicing.
+    def _tiled_merge_kwargs(self, validation_config: Any) -> Dict[str, Any]:
+        """Return common tiled merge/suppression kwargs from a method config.
 
         Args:
-            image: Normalized CHW image tensor.
+            validation_config: Method-specific validation config containing merge fields.
 
         Returns:
-            HWC uint8 array.
+            Keyword arguments shared by all tiled validation methods.
         """
-        mean = _IMAGENET_MEAN.to(device=image.device)[:, None, None]
-        std = _IMAGENET_STD.to(device=image.device)[:, None, None]
-        image = (image.detach().float() * std + mean).clamp(0.0, 1.0)
-        return image.mul(255.0).byte().permute(1, 2, 0).cpu().numpy()
+        return {
+            "nms_threshold": float(validation_config.nms_iou_threshold),
+            "merge_metric": validation_config.merge_metric,
+            "source_aware_duplicate_suppression": bool(validation_config.source_aware_duplicate_suppression),
+        }
 
-    def _sahi_prediction_to_result(
+    def _validation_step_tiled(
         self,
-        object_predictions: list[ObjectPrediction],
+        model: torch.nn.Module,
+        batch: Tuple,
         *,
-        device: torch.device,
-        image_size: torch.Tensor | None = None,
-        orig_size: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Convert SAHI object predictions to torchmetrics-compatible tensors.
+        return_diagnostics: bool = False,
+        timing_stats: Any | None = None,
+    ) -> Dict[str, Any]:
+        """Run native tiled inference for one validation batch.
 
         Args:
-            object_predictions: SAHI merged predictions for one image.
-            device: Destination device for returned tensors.
-            image_size: Transformed image size used for sliced inference.
-            orig_size: Original image size used by metric targets.
-
-        Returns:
-            Prediction dictionary with ``boxes``, ``scores``, and ``labels`` tensors.
-        """
-        if not object_predictions:
-            result = {
-                "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
-                "scores": torch.empty(0, dtype=torch.float32, device=device),
-                "labels": torch.empty(0, dtype=torch.long, device=device),
-            }
-            if getattr(self.model_config, "segmentation_head", False):
-                size = orig_size if orig_size is not None else image_size
-                if size is not None:
-                    height, width = [int(value) for value in size.detach().cpu().tolist()]
-                    result["masks"] = torch.empty((0, height, width), dtype=torch.bool, device=device)
-            return result
-        shifted_predictions = [
-            prediction.get_shifted_object_prediction()
-            if hasattr(prediction, "get_shifted_object_prediction")
-            else prediction
-            for prediction in object_predictions
-        ]
-        boxes = torch.tensor(
-            [prediction.bbox.to_xyxy() for prediction in shifted_predictions],
-            dtype=torch.float32,
-            device=device,
-        )
-        scores = torch.tensor(
-            [float(prediction.score.value) for prediction in shifted_predictions],
-            dtype=torch.float32,
-            device=device,
-        )
-        labels = torch.tensor(
-            [int(prediction.category.id) for prediction in shifted_predictions],
-            dtype=torch.long,
-            device=device,
-        )
-        masks = None
-        mask_arrays = [
-            prediction.mask.bool_mask
-            for prediction in shifted_predictions
-            if getattr(prediction, "mask", None) is not None
-        ]
-        if len(mask_arrays) == len(shifted_predictions):
-            masks = torch.as_tensor(np.stack(mask_arrays), dtype=torch.bool, device=device)
-        if scores.numel() > int(self.train_config.validation_max_predictions):
-            keep = torch.topk(scores, int(self.train_config.validation_max_predictions)).indices
-            boxes = boxes[keep]
-            scores = scores[keep]
-            labels = labels[keep]
-            if masks is not None:
-                masks = masks[keep]
-        if image_size is not None and orig_size is not None:
-            image_h, image_w = [float(value) for value in image_size.detach().cpu().tolist()]
-            orig_h, orig_w = [float(value) for value in orig_size.detach().cpu().tolist()]
-            if image_h > 0.0 and image_w > 0.0 and (image_h != orig_h or image_w != orig_w):
-                scale = boxes.new_tensor([orig_w / image_w, orig_h / image_h, orig_w / image_w, orig_h / image_h])
-                boxes = boxes * scale
-                if masks is not None:
-                    masks = (
-                        torch.nn.functional.interpolate(
-                            masks.unsqueeze(1).float(),
-                            size=(int(orig_h), int(orig_w)),
-                            mode="nearest",
-                        )
-                        .squeeze(1)
-                        .bool()
-                    )
-        result = {"boxes": boxes, "scores": scores, "labels": labels}
-        if masks is not None:
-            result["masks"] = masks
-        return result
-
-    def _validation_step_sahi(self, batch: Tuple, batch_idx: int) -> Dict[str, Any]:
-        """Run SAHI sliced inference for one validation batch.
-
-        Args:
+            model: Model instance used for prediction.
             batch: Tuple of (NestedTensor samples, list of target dicts).
-            batch_idx: Batch index within the validation epoch.
+            return_diagnostics: Whether to keep debug-only projection metadata.
+            timing_stats: Optional tiled timing accumulator for debug benchmarks.
 
         Returns:
             Dict with ``results`` and ``targets`` for ``COCOEvalCallback``.
         """
         if getattr(self.model_config, "use_grouppose_keypoints", False):
-            raise NotImplementedError("SAHI validation currently supports bbox and segmentation models only.")
+            raise NotImplementedError("Tiled validation currently supports bbox and segmentation models only.")
 
         samples, targets = batch
-        if self.train_config.compute_val_loss:
-            if not self._sahi_val_loss_warning_emitted:
-                logger.info(
-                    "Skipping val/loss for validation_mode='sahi'; sliced validation reports mAP/F1 from tiled "
-                    "predictions instead of running an additional full-frame loss pass."
-                )
-                self._sahi_val_loss_warning_emitted = True
-
-        sahi_model = self._make_sahi_detection_model()
-        image_tensors = samples.tensors
-        results: list[dict[str, torch.Tensor]] = []
-        slice_height = self.train_config.sahi_slice_height or self.model_config.resolution
-        slice_width = self.train_config.sahi_slice_width or self.model_config.resolution
-        for image_tensor, target in zip(image_tensors, targets):
-            image_size = target.get("size", target["orig_size"])
-            height, width = [int(value) for value in image_size.tolist()]
-            image = self._normalized_tensor_to_uint8_image(image_tensor[:, :height, :width])
-            prediction = get_sliced_prediction(
-                image,
-                detection_model=sahi_model,
+        validation_mode = getattr(self.train_config, "validation_mode", "standard")
+        sahi_config = self.train_config.sahi
+        slice_height = sahi_config.slice_height or self.model_config.resolution
+        slice_width = sahi_config.slice_width or self.model_config.resolution
+        block_size = int(self.model_config.patch_size * self.model_config.num_windows)
+        segmentation = bool(getattr(self.model_config, "segmentation_head", False))
+        if validation_mode == "asahi":
+            asahi_config = self.train_config.asahi
+            tile_batch_size = asahi_config.tile_batch_size or self.train_config.validation_batch_size or 1
+            score_threshold = float(asahi_config.score_threshold)
+            results = predict_asahi(
+                model=model,
+                postprocess=self.postprocess,
+                samples=samples,
+                targets=targets,
+                short_side_threshold=int(asahi_config.short_side_threshold),
+                low_patch_count=int(asahi_config.low_patch_count),
+                high_patch_count=int(asahi_config.high_patch_count),
+                overlap_ratio=float(asahi_config.overlap_ratio),
+                include_full_image=bool(asahi_config.include_full_image),
+                score_threshold=score_threshold,
+                max_predictions=int(self.train_config.validation_max_predictions),
+                tile_batch_size=int(tile_batch_size),
+                block_size=block_size,
+                segmentation=segmentation,
+                full_image_size=int(self.model_config.resolution),
+                window_resize_longest_side=asahi_config.window_resize_longest_side,
+                window_resize_policy=asahi_config.window_resize_policy,
+                source_mode=asahi_config.source_mode,
+                tile_input_dtype=getattr(asahi_config, "tile_input_dtype", "auto"),
+                tile_memory_format=getattr(asahi_config, "tile_memory_format", "contiguous"),
+                batch_across_images=bool(getattr(asahi_config, "batch_across_images", False)),
+                return_diagnostics=return_diagnostics,
+                timing_stats=timing_stats,
+                **self._tiled_merge_kwargs(asahi_config),
+            )
+        elif validation_mode == "gsahi":
+            gsahi_config = self.train_config.gsahi
+            tile_batch_size = gsahi_config.tile_batch_size or self.train_config.validation_batch_size or 1
+            score_threshold = float(gsahi_config.score_threshold)
+            roi_score_threshold = gsahi_config.roi_score_threshold
+            if roi_score_threshold is None:
+                roi_score_threshold = score_threshold
+            results = predict_gsahi(
+                model=model,
+                postprocess=self.postprocess,
+                samples=samples,
+                targets=targets,
+                coarse_slice_size=int(gsahi_config.coarse_slice_size),
+                fine_slice_size=int(gsahi_config.fine_slice_size),
+                coarse_overlap=float(gsahi_config.coarse_overlap),
+                fine_overlap=float(gsahi_config.fine_overlap),
+                include_full_image=bool(gsahi_config.include_full_image),
+                roi_score_threshold=float(roi_score_threshold),
+                roi_expansion_ratio=float(gsahi_config.roi_expansion_ratio),
+                roi_max_regions=int(gsahi_config.roi_max_regions),
+                score_threshold=score_threshold,
+                max_predictions=int(self.train_config.validation_max_predictions),
+                tile_batch_size=int(tile_batch_size),
+                block_size=block_size,
+                segmentation=segmentation,
+                full_image_size=int(self.model_config.resolution),
+                merge_sources=gsahi_config.merge_sources,
+                tile_input_dtype=getattr(gsahi_config, "tile_input_dtype", "auto"),
+                tile_memory_format=getattr(gsahi_config, "tile_memory_format", "contiguous"),
+                return_diagnostics=return_diagnostics,
+                timing_stats=timing_stats,
+                **self._tiled_merge_kwargs(gsahi_config),
+            )
+        else:
+            tile_batch_size = sahi_config.tile_batch_size or self.train_config.validation_batch_size or 1
+            score_threshold = float(sahi_config.score_threshold)
+            results = predict_tiled(
+                model=model,
+                postprocess=self.postprocess,
+                samples=samples,
+                targets=targets,
                 slice_height=int(slice_height),
                 slice_width=int(slice_width),
-                overlap_height_ratio=float(self.train_config.sahi_overlap_height_ratio),
-                overlap_width_ratio=float(self.train_config.sahi_overlap_width_ratio),
-                perform_standard_pred=False,
-                postprocess_type="NMS",
-                postprocess_match_metric="IOU",
-                postprocess_match_threshold=float(self.train_config.sahi_nms_iou_threshold),
-                verbose=0,
-                progress_bar=False,
-                auto_slice_resolution=False,
-                batch_size=int(self.train_config.validation_batch_size or 1),
-                force_postprocess_type=True,
-                confidence_threshold=float(self.train_config.validation_score_threshold),
+                overlap_height_ratio=float(sahi_config.overlap_height_ratio),
+                overlap_width_ratio=float(sahi_config.overlap_width_ratio),
+                include_full_image=bool(sahi_config.include_full_image),
+                score_threshold=score_threshold,
+                max_predictions=int(self.train_config.validation_max_predictions),
+                tile_batch_size=int(tile_batch_size),
+                block_size=block_size,
+                segmentation=segmentation,
+                full_image_size=int(self.model_config.resolution),
+                tile_input_dtype=getattr(sahi_config, "tile_input_dtype", "auto"),
+                tile_memory_format=getattr(sahi_config, "tile_memory_format", "contiguous"),
+                batch_across_images=bool(getattr(sahi_config, "batch_across_images", False)),
+                return_diagnostics=return_diagnostics,
+                timing_stats=timing_stats,
+                **self._tiled_merge_kwargs(sahi_config),
             )
-            results.append(
-                self._sahi_prediction_to_result(
-                    prediction.object_prediction_list,
-                    device=target["boxes"].device,
-                    image_size=image_size,
-                    orig_size=target["orig_size"],
-                )
-            )
+        results = self._filter_validation_results(results)
         return {"results": results, "targets": targets}
+
+    def predict_validation_batch_with_model(
+        self,
+        model: torch.nn.Module,
+        batch: Tuple,
+        *,
+        return_diagnostics: bool = False,
+        timing_stats: Any | None = None,
+    ) -> Dict[str, Any]:
+        """Predict validation results with a specific model instance.
+
+        Args:
+            model: RF-DETR model to evaluate.
+            batch: Tuple of (NestedTensor samples, list of target dicts).
+            return_diagnostics: Whether tiled validation should keep debug-only projection metadata.
+            timing_stats: Optional tiled timing accumulator for debug benchmarks.
+
+        Returns:
+            Dict with ``results`` and ``targets`` for metric callbacks.
+        """
+        with self._validation_autocast_context(batch):
+            if self._validation_uses_tiled_mode():
+                return self._validation_step_tiled(
+                    model,
+                    batch,
+                    return_diagnostics=return_diagnostics,
+                    timing_stats=timing_stats,
+                )
+            samples, targets = batch
+            outputs = model(samples)
+            orig_sizes = torch.stack([t["orig_size"] for t in targets])
+            results = self.postprocess(outputs, orig_sizes)
+            results = self._filter_validation_results(results)
+            return {"results": results, "targets": targets}
+
+    def _validation_autocast_context(self, batch: Tuple) -> Any:
+        """Return the configured validation autocast context when none is active."""
+        if not bool(getattr(self.model_config, "amp", False)):
+            return nullcontext()
+        samples = batch[0]
+        tensors = getattr(samples, "tensors", None)
+        if not torch.is_tensor(tensors):
+            return nullcontext()
+        device = tensors.device
+        if device.type not in {"cuda", "mps"}:
+            return nullcontext()
+        try:
+            if torch.is_autocast_enabled(device.type):
+                return nullcontext()
+        except TypeError:
+            if torch.is_autocast_enabled():
+                return nullcontext()
+        dtype = self._validation_autocast_dtype(device)
+        return torch.autocast(device_type=device.type, dtype=dtype)
+
+    def _validation_autocast_dtype(self, device: torch.device) -> torch.dtype:
+        """Resolve validation autocast dtype from model/train config and device."""
+        amp_dtype = getattr(self.train_config, "amp_dtype", "auto")
+        if device.type == "mps":
+            return torch.float16
+        if amp_dtype == "fp16":
+            return torch.float16
+        if amp_dtype == "bf16":
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     def validation_step(self, batch: Tuple, batch_idx: int) -> Dict[str, Any]:
         """Run forward pass and postprocess for one validation step.
@@ -883,8 +722,14 @@ class RFDETRModelModule(LightningModule):
         Returns:
             Dict with ``results`` (postprocessed predictions) and ``targets``.
         """
-        if self._validation_uses_sahi():
-            return self._validation_step_sahi(batch, batch_idx)
+        if self._validation_uses_tiled_mode():
+            if self.train_config.compute_val_loss and not self._sahi_val_loss_warning_emitted:
+                logger.info(
+                    "Skipping val/loss for tiled validation; native tiled validation reports mAP/F1 from "
+                    "tiled predictions instead of running an additional full-frame loss pass."
+                )
+                self._sahi_val_loss_warning_emitted = True
+            return self.predict_validation_batch_with_model(self.model, batch)
 
         samples, targets = batch
         outputs = self.model(samples)
@@ -928,7 +773,7 @@ class RFDETRModelModule(LightningModule):
         )
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        """Build AdamW optimizer with layer-wise LR decay and LambdaLR scheduler.
+        """Build optimizer with layer-wise LR decay and LambdaLR scheduler.
 
         Uses ``trainer.estimated_stepping_batches`` for total step count so cosine annealing covers the full training
         run regardless of dataset size or accumulation settings.
@@ -944,12 +789,22 @@ class RFDETRModelModule(LightningModule):
         # name-prefix mismatches that put the same tensor in multiple groups.
         model_for_params = getattr(self.model, "_orig_mod", self.model)
         param_dicts = get_param_dict(ns, model_for_params)
-        param_dicts = [p for p in param_dicts if p["params"].requires_grad]
-        optimizer = torch.optim.AdamW(
-            param_dicts,
-            lr=tc.lr,
-            weight_decay=tc.weight_decay,
-            fused=self._use_fused_optimizer,
+        optimizer_config = tc.optimizer_config
+        scheduler_config = optimizer_config.scheduler
+        optimizer = build_optimizer(
+            name=tc.optimizer,
+            params=param_dicts,
+            lr=optimizer_config.lr,
+            weight_decay=optimizer_config.weight_decay,
+            fused_adamw=self._use_fused_optimizer if tc.optimizer == "adamw" else False,
+            momentum=optimizer_config.momentum,
+            nesterov=optimizer_config.nesterov,
+            muon_lr_scale=optimizer_config.muon_lr_scale,
+            fallback_lr_scale=optimizer_config.fallback_lr_scale,
+            ns_coefficients=optimizer_config.ns_coefficients,
+            eps=optimizer_config.eps,
+            ns_steps=optimizer_config.ns_steps,
+            adjust_lr_fn=optimizer_config.adjust_lr_fn,
         )
 
         # ``trainer.estimated_stepping_batches`` is reported in *microbatch* units when
@@ -971,16 +826,18 @@ class RFDETRModelModule(LightningModule):
             max(1, math.ceil(microbatches / grad_accum_steps)) if self._use_manual_optimization else microbatches
         )
         steps_per_epoch = max(1, total_steps // tc.epochs)
-        warmup_steps = int(steps_per_epoch * tc.warmup_epochs)
+        warmup_steps = int(steps_per_epoch * scheduler_config.warmup_epochs)
 
         def lr_lambda(current_step: int) -> float:
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
-            if tc.lr_scheduler == "cosine":
+            if scheduler_config.name == "cosine":
                 progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-                return tc.lr_min_factor + (1 - tc.lr_min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
+                return scheduler_config.min_factor + (1 - scheduler_config.min_factor) * 0.5 * (
+                    1 + math.cos(math.pi * progress)
+                )
             # Step decay: drop by 10× after lr_drop epochs.
-            if current_step < tc.lr_drop * steps_per_epoch:
+            if current_step < scheduler_config.drop_epoch * steps_per_epoch:
                 return 1.0
             return 0.1
 

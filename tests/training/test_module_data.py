@@ -810,17 +810,19 @@ class TestValDataloader:
         loader = dm.val_dataloader()
         assert loader.num_workers == 0
 
-    def test_sahi_validation_uses_single_image_batches_by_default(self, tmp_path):
-        """SAHI validation keeps full-image DataLoader batches memory-bounded by default."""
+    @pytest.mark.parametrize("validation_mode", ["sahi", "asahi", "gsahi"])
+    def test_tiled_validation_uses_single_image_batches_by_default(self, tmp_path, validation_mode):
+        """Tiled validation keeps full-image DataLoader batches memory-bounded by default."""
         dm = self._setup_dm_with_val(tmp_path, batch_size=6)
-        dm.train_config.validation_mode = "sahi"
+        dm.train_config.validation_mode = validation_mode
         loader = dm.val_dataloader()
         assert loader.batch_size == 1
 
-    def test_validation_batch_size_applies_to_sahi_validation(self, tmp_path):
-        """The top-level validation batch size also applies to SAHI validation."""
+    @pytest.mark.parametrize("validation_mode", ["sahi", "asahi", "gsahi"])
+    def test_validation_batch_size_applies_to_tiled_validation(self, tmp_path, validation_mode):
+        """The top-level validation batch size also applies to tiled validation."""
         dm = self._setup_dm_with_val(tmp_path, batch_size=6)
-        dm.train_config.validation_mode = "sahi"
+        dm.train_config.validation_mode = validation_mode
         dm.train_config.validation_batch_size = 3
         loader = dm.val_dataloader()
         assert loader.batch_size == 3

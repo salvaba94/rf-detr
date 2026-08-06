@@ -1,69 +1,268 @@
-# RF-DETR Nano fast airborne detection config.
-# Usage: rfdetr fit --config configs/rfdetr_nano_airborne_fast.yaml
+# RF-DETR Medium airborne detection config tuned for GSAHI validation.
+# Usage: rfdetr fit --config configs/rfdetr_medium_airborne.yaml
 
+# Model and training configuration consumed by the Lightning CLI.
 model:
+  # Model architecture settings.
   model_config:
+    # Lightning class path for the model-size configuration.
     class_path: rfdetr.config.RFDETRMediumConfig
+    # Arguments passed to RFDETRMediumConfig.
     init_args:
-      num_classes: 4
+      # Number of object categories in the airborne dataset.
+      num_classes: 9
+      # Enables mixed-precision training; amp_dtype below chooses the autocast type.
       amp: true
-      resolution: 576
-      num_queries: 100
-      num_select: 100
+      # Longest-side letterbox input size used by the model.
+      resolution: 640
+      # Detection query budget. Lower values reduce compute and limit max raw detections.
+      num_queries: 50
+      # Number of top predictions kept before post-processing.
+      num_select: 50
 
-
+  # Training, augmentation, validation, and logging settings.
   train_config:
+    # Lightning class path for the training configuration.
     class_path: rfdetr.config.TrainConfig
+    # Arguments passed to TrainConfig.
     init_args:
-      dataset_dir: ../airborne-object-tracking/exports/rf_detr_coco/
-      output_dir: output/rfdetr_medium_airborne_fast
+      # COCO-format dataset root used for training and validation.
+      dataset_dir: ../airborne-object-tracking/exports/daa_weak_class_boosted_250k_coco_v2_symlink/
+      # Directory for checkpoints, logs, plots, and exported artifacts.
+      output_dir: output/rfdetr_medium_airborne_asahi
 
-      epochs: 25
+      # Core training loop settings.
+      # Maximum number of training epochs.
+      epochs: 10
+      # Per-device training batch size.
       batch_size: 32
-      validation_batch_size: 1
+      # Smaller validation batch leaves memory for tiled validation.
+      validation_batch_size: 6
+      # Effective batch size is batch_size * grad_accum_steps per device.
       grad_accum_steps: 1
+      # auto chooses bf16 on supported CUDA hardware, otherwise fp16.
+      amp_dtype: auto
+      # DataLoader worker processes.
       num_workers: 8
+      # Progress bar implementation shown during training.
       progress_bar: rich
 
+      # STAL adds extra assignment resilience for tiny boxes in the Hungarian matcher.
+      stal:
+        # Enables small-target assisted matching.
+        enabled: true
+        # Boxes with shortest side <= this many input pixels are treated as small.
+        small_box_threshold: 10
+        # Minimum number of query matches to keep for each small target.
+        min_matches: 4
+
+      # Optimizer family. MuAdamW adds Muon-style updates for selected parameters.
+      optimizer: muadamw
+      optimizer_config:
+        # Base learning rate for non-encoder parameters.
+        lr: 0.0001
+        # Separate learning rate for the DINO encoder/backbone.
+        lr_encoder: 0.00015
+        # Decoupled L2 regularization.
+        weight_decay: 0.0001
+        # Momentum used by Muon and SGD-style optimizer components.
+        momentum: 0.95
+        # Enables Nesterov momentum where the optimizer supports it.
+        nesterov: true
+        # Muon LR multiplier for MuAdamW/MuSGD matrix-parameter updates.
+        muon_lr_scale: 0.2
+        # Fallback AdamW/SGD LR multiplier; 1.0 keeps the configured LR.
+        fallback_lr_scale: 1.0
+        # Muon Newton-Schulz iterations. PyTorch Muon default is 5.
+        ns_steps: 5
+        # Muon numerical stability epsilon. PyTorch Muon default is 1e-7.
+        eps: 0.0000001
+        # Optional PyTorch Muon LR adjustment: null, original, or match_rms_adamw.
+        adjust_lr_fn: null
+        scheduler:
+          # cosine decays smoothly instead of stepping at lr_drop.
+          name: cosine
+          # Lowest LR is lr * min_factor at the end of cosine decay.
+          min_factor: 0.05
+          # Linear warmup duration before the main schedule.
+          warmup_epochs: 1.0
+
+      # Stops training when validation quality stalls.
+      early_stopping:
+        # Enables the early-stopping callback.
+        enabled: true
+        # Number of validation checks without enough improvement before stopping.
+        patience: 3
+        # Minimum metric improvement required to reset patience.
+        min_delta: 0.002
+        # false monitors the regular model; true monitors EMA metrics only.
+        use_ema: false
+
+      # Exponential moving average of weights for smoother validation/export.
+      ema:
+        # Enables EMA weight tracking.
+        enabled: true
+        # Higher decay updates EMA more slowly; 0.99 adapts faster than the default 0.993.
+        decay: 0.993
+        # Warmup constant for ramping EMA decay early in training.
+        tau: 100
+        # Update EMA every N optimizer steps.
+        update_interval: 1
+        # Auto-batch safety factor reserved for the extra EMA model copy.
+        auto_batch_headroom: 0.7
+
+      # Augmentation backend; cpu avoids GPU augmentation memory spikes.
       augmentation_backend: cpu
+      #square_resize_div_64: false
+      # Crop large airborne frames into training-sized windows before normal augmentations.
       pre_resize_aug_config:
         - TiledCroppingWithMasks:
-            height: 576
-            width: 576
-            p: 0.9
+            # Crop height in pixels.
+            height: 640
+            # Crop width in pixels.
+            width: 640
+            # Probability of applying tiled crop augmentation.
+            p: 0.85
       aug_config:
+        # Pastes labeled objects into images to increase small-object variety.
         - CopyPaste:
-            p: 0.1
+            # Probability of applying CopyPaste.
+            p: 0.3
+            # Maximum number of objects pasted into one image.
             max_paste_objects: 3
+            # Avoid pasting objects too heavily over existing objects.
             max_iou: 0.3
+        # Horizontal flips preserve airborne scene semantics.
         - HorizontalFlip:
+            # Probability of applying a horizontal flip.
             p: 0.5
 
-      square_resize_div_64: false
-      multi_scale: true
-      do_random_resize_via_padding: false
+      # Multi-scale training samples input sizes around the base resolution.
+      multi_scale:
+        # Enables multi-scale training.
+        enabled: true
+        # Candidate sizes start 5 scale steps below the base size.
+        min_offset: -5
+        # Candidate sizes end 3 scale steps above the base size.
+        max_offset: 3
+        # false uses collate-time resize choices instead of padding-based random resize.
+        random_resize_via_padding: false
 
+      # Experiment loggers.
+      # Disable TensorBoard logging for this run.
       tensorboard: false
+      # Disable Weights & Biases logging for this run.
       wandb: false
       mlflow:
+        # Enables MLflow experiment logging.
         enabled: true
+        # Store checkpoints/plots/config artifacts in MLflow.
         log_artifacts: true
+        # Log CPU/GPU/RAM metrics when MLflow supports it.
         log_system_metrics: true
-      train_log_on_step: true
-      validate_before_fit: false
-      validation_mode: sahi
-      sahi:
-        slice_height: 576
-        slice_width: 576
-        overlap_height_ratio: 0.2
-        overlap_width_ratio: 0.2
-        nms_iou_threshold: 0.5
-      validation_score_threshold: 0.001
-      validation_max_predictions: 50
-      save_dataset_grids: true
 
+      # Validation strategy. ASAHI was fastest in the tiled benchmark while matching/bettering SAHI IoU.
+      validation_mode: asahi
+      # SAHI validation settings, used when validation_mode: sahi.
+      sahi:
+        # Tile height for fixed-grid SAHI validation.
+        slice_height: 640
+        # Tile width for fixed-grid SAHI validation.
+        slice_width: 640
+        # Tile overlap reduces missed objects on tile boundaries.
+        overlap_height_ratio: 0.2
+        # Horizontal overlap between neighboring SAHI tiles.
+        overlap_width_ratio: 0.2
+        # SAHI baseline merge threshold for neighboring tile duplicates.
+        # 640px tiles cover 2448x2048 frames as roughly a 5x4 grid at this overlap.
+        nms_iou_threshold: 0.45
+        # Use Cluster-DIoU-NMS to reduce repeated boxes from neighboring tiles.
+        merge_metric: cdn
+        # Suppress same-class duplicates from different source windows by center consistency.
+        source_aware_duplicate_suppression: true
+        # Also evaluate a full-image letterbox pass alongside tiles.
+        include_full_image: true
+        # Number of tiles forwarded per validation model call.
+        tile_batch_size: 4
+        # Candidate threshold used while collecting tiled predictions.
+        score_threshold: 0.35
+      # Adaptive SAHI validation settings, used when validation_mode: asahi.
+      asahi:
+        # Images whose longer side is at or below this ASAHI limiting dimension use fewer patches.
+        short_side_threshold: 1818
+        # Patch count for images at or below the ASAHI limiting dimension.
+        low_patch_count: 6
+        # Patch count for images above the ASAHI limiting dimension.
+        high_patch_count: 12
+        # ASAHI benchmark winner for 2448x2048 airborne validation frames.
+        overlap_ratio: 0.10
+        # Prediction sources to fuse: adaptive, full, or full_adaptive.
+        source_mode: adaptive
+        # Resize ASAHI adaptive crops to the RF-DETR training canvas.
+        # 640 is the faster training-validation preset: ~12.28 FPS, 0.8020 IoU, 18/4 matched/missed.
+        window_resize_longest_side: 640
+        # Stretch adaptive crops to the RF-DETR canvas.
+        window_resize_policy: square_stretch
+        # Adaptive-only validation avoids the extra full-image forward.
+        include_full_image: false
+        # Suppress merged ASAHI predictions whose selected merge score exceeds this threshold.
+        # Lower values merge repeated boxes more aggressively.
+        nms_iou_threshold: 0.35
+        # CDN is ASAHI's paper-style Cluster-DIoU-NMS merge for crowded duplicate suppression.
+        merge_metric: cdn
+        # Suppress same-class duplicates from different source windows by center consistency.
+        source_aware_duplicate_suppression: true
+        # Number of adaptive tiles forwarded per validation model call.
+        tile_batch_size: 4
+        # Candidate threshold used while collecting adaptive tiled predictions.
+        score_threshold: 0.35
+      # GSAHI validation settings, used when validation_mode: gsahi.
+      gsahi:
+        # First-pass tile size used to find candidate regions.
+        coarse_slice_size: 640
+        # Second-pass tile size used inside expanded candidate regions.
+        fine_slice_size: 256
+        # GOIS C2 overlap ratio for first-pass coarse tiles.
+        coarse_overlap: 0.2
+        # GOIS C2 overlap ratio for second-pass fine tiles.
+        fine_overlap: 0.2
+        # Skip the full-image pass; benchmarked matches come from coarse/fine boxes, not full-image boxes.
+        include_full_image: false
+        # Minimum coarse prediction score needed to seed a fine ROI.
+        roi_score_threshold: 0.35
+        # Expands each coarse ROI before fine slicing to keep context.
+        roi_expansion_ratio: 0.25
+        # Caps fine-stage regions per image for validation speed.
+        roi_max_regions: 8
+        # GOIS C2 merge threshold for repeated fine-tile boxes.
+        nms_iou_threshold: 0.4
+        # Use Cluster-DIoU-NMS to reduce repeated boxes from neighboring fine tiles.
+        merge_metric: cdn
+        # Keep coarse and fine predictions; full-image predictions stay disabled above.
+        merge_sources: full_coarse_fine
+        # Suppress same-class duplicates from different source windows by center consistency.
+        source_aware_duplicate_suppression: true
+        # Number of GSAHI tiles forwarded per validation model call.
+        tile_batch_size: 8
+        # Candidate threshold used while collecting coarse/fine tiled predictions.
+        score_threshold: 0.35
+
+      # General score threshold used by validation visualizations and final tiled prediction filtering.
+      validation_score_threshold: 0.4
+      # Limit predictions per image to reduce noisy false positives and plotting clutter.
+      validation_max_predictions: 50
+      # Save train/validation input grids for qualitative dataset inspection.
+      save_dataset_grids: true
+      # Save validation prediction grids for qualitative inference inspection.
+      save_prediction_grids: true
+
+# PyTorch Lightning Trainer settings.
 trainer:
+  # Let Lightning choose CPU/GPU/MPS based on availability.
   accelerator: auto
+  # Let Lightning choose device count unless overridden at launch.
   devices: auto
+  # Skip Lightning sanity validation to avoid an extra tiled-validation pass.
   num_sanity_val_steps: 0
+  # Training log frequency in optimizer steps.
   log_every_n_steps: 10

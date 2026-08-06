@@ -106,7 +106,7 @@ class TestBuildTrainerCallbacks:
 
     def test_coco_eval_always_present(self, tmp_path):
         """COCOEvalCallback is always included regardless of config flags."""
-        trainer = build_trainer(_tc(tmp_path, use_ema=False, early_stopping=False), _mc())
+        trainer = build_trainer(_tc(tmp_path, use_ema=False, early_stopping={"enabled": False}), _mc())
         types = [type(cb) for cb in trainer.callbacks]
         assert COCOEvalCallback in types
 
@@ -223,21 +223,21 @@ class TestBuildTrainerCallbacks:
         with pytest.raises(ValidationError):
             _tc(tmp_path, checkpoint_interval=0)
 
-    def test_ema_callback_when_use_ema_true(self, tmp_path):
-        """RFDETREMACallback is added when use_ema=True."""
-        trainer = build_trainer(_tc(tmp_path, use_ema=True), _mc())
+    def test_ema_callback_when_enabled(self, tmp_path):
+        """RFDETREMACallback is added when ema.enabled=True."""
+        trainer = build_trainer(_tc(tmp_path, ema={"enabled": True}), _mc())
         types = [type(cb) for cb in trainer.callbacks]
         assert RFDETREMACallback in types
 
     def test_ema_callback_uses_update_interval(self, tmp_path):
-        """RFDETREMACallback receives ema_update_interval from TrainConfig."""
-        trainer = build_trainer(_tc(tmp_path, use_ema=True, ema_update_interval=4), _mc())
+        """RFDETREMACallback receives EMA update_interval from TrainConfig."""
+        trainer = build_trainer(_tc(tmp_path, ema={"enabled": True, "update_interval": 4}), _mc())
         ema_cb = next(cb for cb in trainer.callbacks if isinstance(cb, RFDETREMACallback))
         assert ema_cb._update_interval_steps == 4
 
-    def test_no_ema_callback_when_use_ema_false(self, tmp_path):
-        """RFDETREMACallback is absent when use_ema=False."""
-        trainer = build_trainer(_tc(tmp_path, use_ema=False), _mc())
+    def test_no_ema_callback_when_disabled(self, tmp_path):
+        """RFDETREMACallback is absent when ema.enabled=False."""
+        trainer = build_trainer(_tc(tmp_path, ema={"enabled": False}), _mc())
         types = [type(cb) for cb in trainer.callbacks]
         assert RFDETREMACallback not in types
 
@@ -255,20 +255,20 @@ class TestBuildTrainerCallbacks:
 
     def test_early_stopping_when_enabled(self, tmp_path):
         """RFDETREarlyStopping is added when early_stopping=True."""
-        trainer = build_trainer(_tc(tmp_path, early_stopping=True), _mc())
+        trainer = build_trainer(_tc(tmp_path, early_stopping={"enabled": True}), _mc())
         types = [type(cb) for cb in trainer.callbacks]
         assert RFDETREarlyStopping in types
 
     def test_skip_best_epochs_forwarded_to_early_stopping(self, tmp_path):
         """RFDETREarlyStopping receives skip_best_epochs from TrainConfig."""
-        trainer = build_trainer(_tc(tmp_path, early_stopping=True, skip_best_epochs=4), _mc())
+        trainer = build_trainer(_tc(tmp_path, early_stopping={"enabled": True}, skip_best_epochs=4), _mc())
         early_stop_cb = next(cb for cb in trainer.callbacks if isinstance(cb, RFDETREarlyStopping))
         assert early_stop_cb._skip_best_epochs == 4
 
     def test_keypoint_early_stopping_monitors_keypoint_map(self, tmp_path):
         """Keypoint early stopping should use keypoint AP as the regular metric."""
         trainer = build_trainer(
-            _kp_tc(tmp_path, early_stopping=True, early_stopping_use_ema=True),
+            _kp_tc(tmp_path, early_stopping={"enabled": True, "use_ema": True}),
             RFDETRKeypointPreviewConfig(pretrain_weights=None),
         )
         early_stop_cb = next(cb for cb in trainer.callbacks if isinstance(cb, RFDETREarlyStopping))
@@ -278,7 +278,7 @@ class TestBuildTrainerCallbacks:
     def test_segmentation_early_stopping_monitors_segmentation_map(self, tmp_path):
         """Segmentation early stopping should use segmentation AP as the regular metric."""
         trainer = build_trainer(
-            _tc(tmp_path, early_stopping=True, early_stopping_use_ema=True),
+            _tc(tmp_path, early_stopping={"enabled": True, "use_ema": True}),
             _mc(segmentation_head=True),
         )
         early_stop_cb = next(cb for cb in trainer.callbacks if isinstance(cb, RFDETREarlyStopping))
@@ -287,7 +287,7 @@ class TestBuildTrainerCallbacks:
 
     def test_no_early_stopping_when_disabled(self, tmp_path):
         """RFDETREarlyStopping is absent when early_stopping=False."""
-        trainer = build_trainer(_tc(tmp_path, early_stopping=False), _mc())
+        trainer = build_trainer(_tc(tmp_path, early_stopping={"enabled": False}), _mc())
         types = [type(cb) for cb in trainer.callbacks]
         assert RFDETREarlyStopping not in types
 
@@ -314,7 +314,7 @@ class TestBuildTrainerKeypointDefaults:
     def test_keypoint_default_skip_best_epochs_is_ten(self, tmp_path):
         """KeypointTrainConfig defaults skip_best_epochs to 10; build_trainer forwards it to callbacks."""
         trainer = build_trainer(
-            _kp_tc(tmp_path, use_ema=False, early_stopping=True),
+            _kp_tc(tmp_path, use_ema=False, early_stopping={"enabled": True}),
             RFDETRKeypointPreviewConfig(pretrain_weights=None),
         )
         best_cb = next(cb for cb in trainer.callbacks if isinstance(cb, BestModelCallback))

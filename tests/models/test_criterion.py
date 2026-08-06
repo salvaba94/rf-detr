@@ -116,7 +116,6 @@ class TestNumBoxesForTargets:
         # 2 + 1 = 3 boxes; single-process so no all-reduce
         assert result.item() == pytest.approx(3.0)
 
-
 class TestCardinalityDiagnostic:
     """Tests for sigmoid-head cardinality diagnostics."""
 

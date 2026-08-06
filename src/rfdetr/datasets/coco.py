@@ -121,10 +121,26 @@ def compute_multi_scale_scales(
     expanded_scales: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
+    min_offset: int | None = None,
+    max_offset: int | None = None,
 ) -> list[int]:
     # round to the nearest multiple of 4*patch_size to enable both patching and windowing
     base_num_patches_per_window = resolution // (patch_size * num_windows)
-    offsets = [-3, -2, -1, 0, 1, 2, 3, 4] if not expanded_scales else [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
+    if min_offset is not None or max_offset is not None:
+        resolved_min_offset = -5 if min_offset is None else int(min_offset)
+        resolved_max_offset = 5 if max_offset is None else int(max_offset)
+        if resolved_min_offset > resolved_max_offset:
+            raise ValueError(
+                "multi-scale min_offset must be less than or equal to max_offset, "
+                f"got {resolved_min_offset} > {resolved_max_offset}."
+            )
+        offsets = list(range(resolved_min_offset, resolved_max_offset + 1))
+    else:
+        offsets = (
+            [-3, -2, -1, 0, 1, 2, 3, 4]
+            if not expanded_scales
+            else [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
+        )
     scales = [base_num_patches_per_window + offset for offset in offsets]
     proposed_scales = [scale * patch_size * num_windows for scale in scales]
     proposed_scales = [
@@ -570,6 +586,8 @@ def make_coco_transforms(
     resolution: int,
     multi_scale: bool = False,
     expanded_scales: bool = False,
+    multi_scale_min_offset: int | None = None,
+    multi_scale_max_offset: int | None = None,
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
@@ -603,7 +621,9 @@ def make_coco_transforms(
         multi_scale: If ``True``, sample the resize target from a range of scales
             computed by :func:`compute_multi_scale_scales` instead of using a single fixed size.
         expanded_scales: Passed to :func:`compute_multi_scale_scales`; broadens the
-            scale range when ``multi_scale=True``.
+            scale range when ``multi_scale=True`` and explicit offsets are not provided.
+        multi_scale_min_offset: Optional lowest offset from the base scale.
+        multi_scale_max_offset: Optional highest offset from the base scale.
         skip_random_resize: When ``multi_scale=True``, use only the largest scale
             and skip random selection among multiple scales.
         patch_size: Model patch size used by :func:`compute_multi_scale_scales` to
@@ -637,7 +657,14 @@ def make_coco_transforms(
     scales = [resolution]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
-        scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
+        scales = compute_multi_scale_scales(
+            resolution,
+            expanded_scales,
+            patch_size,
+            num_windows,
+            multi_scale_min_offset,
+            multi_scale_max_offset,
+        )
         if skip_random_resize:
             scales = [scales[-1]]
         logger.info(f"Using multi-scale training with scales: {scales}")
@@ -701,6 +728,8 @@ def make_coco_transforms_square_div_64(
     resolution: int,
     multi_scale: bool = False,
     expanded_scales: bool = False,
+    multi_scale_min_offset: int | None = None,
+    multi_scale_max_offset: int | None = None,
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
@@ -730,7 +759,9 @@ def make_coco_transforms_square_div_64(
         multi_scale: If True, enable multi-scale training by sampling from a set of
             square resolutions instead of a single fixed size.
         expanded_scales: If True, expand the range of scales used during
-            multi-scale training. Passed through to ``compute_multi_scale_scales``.
+            multi-scale training when explicit offsets are not provided.
+        multi_scale_min_offset: Optional lowest offset from the base scale.
+        multi_scale_max_offset: Optional highest offset from the base scale.
         skip_random_resize: If True and ``multi_scale`` is enabled, use only the
             largest scale returned by ``compute_multi_scale_scales`` and skip random selection among multiple scales.
         patch_size: Patch size used by ``compute_multi_scale_scales`` when
@@ -820,7 +851,7 @@ def _disable_eval_crop_for_sahi(
     validation_mode: str,
     eval_pre_resize_aug_config: Any,
 ) -> Any:
-    """Return eval crop config after applying SAHI validation semantics.
+    """Return eval crop config after applying tiled validation semantics.
 
     Args:
         image_set: Dataset split being built.
@@ -828,26 +859,37 @@ def _disable_eval_crop_for_sahi(
         eval_pre_resize_aug_config: User-provided eval pre-resize augmentations.
 
     Returns:
-        ``None`` for validation/test splits in SAHI mode, otherwise the original config.
+        ``None`` for validation/test splits in tiled validation modes, otherwise the original config.
     """
-    if image_set.split("_")[0] in {"val", "test"} and validation_mode == "sahi":
+    if image_set.split("_")[0] in {"val", "test"} and validation_mode in {
+        "sahi",
+        "asahi",
+        "gsahi",
+    }:
         if eval_pre_resize_aug_config is not None:
-            logger.info("validation_mode='sahi': ignoring eval_pre_resize_aug_config for full-image sliced eval.")
+            logger.info(
+                "validation_mode='%s': ignoring eval_pre_resize_aug_config for full-image tiled eval.",
+                validation_mode,
+            )
         return None
     return eval_pre_resize_aug_config
 
 
 def _preserve_eval_size_for_sahi(image_set: str, validation_mode: str) -> bool:
-    """Return whether eval transforms should keep original image size for SAHI slicing.
+    """Return whether eval transforms should keep original image size for tiled validation.
 
     Args:
         image_set: Dataset split being built.
         validation_mode: Validation strategy from ``TrainConfig``.
 
     Returns:
-        ``True`` for validation/test splits in SAHI mode.
+        ``True`` for validation/test splits in tiled validation modes.
     """
-    return image_set.split("_")[0] in {"val", "test"} and validation_mode == "sahi"
+    return image_set.split("_")[0] in {"val", "test"} and validation_mode in {
+        "sahi",
+        "asahi",
+        "gsahi",
+    }
 
 
 def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
@@ -900,6 +942,8 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 resolution,
                 multi_scale=args.multi_scale,
                 expanded_scales=args.expanded_scales,
+                multi_scale_min_offset=getattr(args, "multi_scale_min_offset", None),
+                multi_scale_max_offset=getattr(args, "multi_scale_max_offset", None),
                 skip_random_resize=not args.do_random_resize_via_padding,
                 patch_size=args.patch_size,
                 num_windows=args.num_windows,
@@ -929,6 +973,8 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 resolution,
                 multi_scale=args.multi_scale,
                 expanded_scales=args.expanded_scales,
+                multi_scale_min_offset=getattr(args, "multi_scale_min_offset", None),
+                multi_scale_max_offset=getattr(args, "multi_scale_max_offset", None),
                 skip_random_resize=not args.do_random_resize_via_padding,
                 patch_size=args.patch_size,
                 num_windows=args.num_windows,
@@ -986,6 +1032,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     include_masks = getattr(args, "segmentation_head", False)
     multi_scale = getattr(args, "multi_scale", False)
     expanded_scales = getattr(args, "expanded_scales", False)
+    multi_scale_min_offset = getattr(args, "multi_scale_min_offset", None)
+    multi_scale_max_offset = getattr(args, "multi_scale_max_offset", None)
     do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
     patch_size = getattr(args, "patch_size", 16)
     num_windows = getattr(args, "num_windows", 4)
@@ -1017,6 +1065,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 resolution,
                 multi_scale=multi_scale,
                 expanded_scales=expanded_scales,
+                multi_scale_min_offset=multi_scale_min_offset,
+                multi_scale_max_offset=multi_scale_max_offset,
                 skip_random_resize=not do_random_resize_via_padding,
                 patch_size=patch_size,
                 num_windows=num_windows,
@@ -1043,6 +1093,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 resolution,
                 multi_scale=multi_scale,
                 expanded_scales=expanded_scales,
+                multi_scale_min_offset=multi_scale_min_offset,
+                multi_scale_max_offset=multi_scale_max_offset,
                 skip_random_resize=not do_random_resize_via_padding,
                 patch_size=patch_size,
                 num_windows=num_windows,

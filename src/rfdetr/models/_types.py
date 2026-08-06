@@ -94,6 +94,10 @@ class BuilderArgs(Protocol):
     set_cost_class: float
     set_cost_bbox: float
     set_cost_giou: float
+    stal_enabled: bool
+    stal_small_box_threshold: float
+    stal_expanded_box_size: float
+    stal_reference_resolution: int
     use_varifocal_loss: bool
     use_position_supervised_loss: bool
     sum_group_losses: bool
