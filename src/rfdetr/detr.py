@@ -646,6 +646,8 @@ class RFDETR:
             return "gpu", [resolved_device.index] if resolved_device.index is not None else None
         if resolved_device.type == "mps":
             return "mps", [resolved_device.index] if resolved_device.index is not None else None
+        if resolved_device.type == "xla":
+            return "tpu", [resolved_device.index] if resolved_device.index is not None else None
 
         warnings.warn(
             f"Device type {resolved_device.type!r} is not explicitly mapped to a PyTorch Lightning "

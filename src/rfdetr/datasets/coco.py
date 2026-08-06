@@ -925,12 +925,15 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     keypoint_flip_pairs: list[int] | None = (getattr(args, "keypoint_flip_pairs", []) or []) if has_keypoints else None
     augmentation_backend = getattr(args, "augmentation_backend", "cpu")
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(augmentation_backend)
-    if resolved_augmentation_backend != augmentation_backend and resolved_augmentation_backend == "cpu":
+    from rfdetr.config import AugmentationBackend
+    from rfdetr.datasets.kornia_transforms import is_gpu_postprocess
+
+    if augmentation_backend == "auto" and resolved_augmentation_backend == AugmentationBackend.TV:
         logger.warning(
             "augmentation_backend='auto' resolved to 'cpu' because CUDA or kornia is unavailable; "
             "disabling GPU postprocess transforms and retaining CPU normalization."
         )
-    gpu_postprocess = resolved_augmentation_backend != "cpu"
+    gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
 
     if square_resize_div_64:
         logger.info(f"Building COCO {image_set} dataset with square resize at resolution {resolution}")
@@ -997,7 +1000,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     return dataset
 
 
-def _resolve_runtime_augmentation_backend(backend: str) -> str:
+def _resolve_runtime_augmentation_backend(backend: str) -> Any:
     """Resolve ``augmentation_backend`` at runtime for dataset builders.
 
     Thin wrapper around :func:`rfdetr.datasets.kornia_transforms.resolve_augmentation_backend` kept for
@@ -1006,9 +1009,9 @@ def _resolve_runtime_augmentation_backend(backend: str) -> str:
     ``"auto"`` becomes ``"gpu"`` only when CUDA and Kornia are both available, otherwise ``"cpu"``. Explicit
     ``"cpu"``/``"gpu"`` values pass through.
     """
-    from rfdetr.datasets.kornia_transforms import resolve_augmentation_backend
+    from rfdetr.datasets.kornia_transforms import resolve_backend_for_build
 
-    return resolve_augmentation_backend(backend)
+    return resolve_backend_for_build(backend)
 
 
 def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
@@ -1053,7 +1056,9 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     preserve_eval_size = _preserve_eval_size_for_sahi(image_set, getattr(args, "validation_mode", "standard"))
     eval_aug_config = getattr(args, "eval_aug_config", None)
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
-    gpu_postprocess = resolved_augmentation_backend != "cpu"
+    from rfdetr.datasets.kornia_transforms import is_gpu_postprocess
+
+    gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
 
     if square_resize_div_64:
         logger.info(f"Building Roboflow {image_set} dataset with square resize at resolution {resolution}")

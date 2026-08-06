@@ -172,7 +172,7 @@ def require_gpu_backend_ready(requested_backend: str, *, has_cuda: bool) -> None
     _require_kornia()
 
 
-def is_gpu_postprocess(resolved: AugmentationBackend) -> bool:
+def is_gpu_postprocess(resolved: AugmentationBackend | str) -> bool:
     """Return ``True`` when the resolved backend defers augmentation/normalization to the GPU.
 
     Kornia is the only on-device (GPU) backend, so a resolved backend of :attr:`AugmentationBackend.KORNIA`
@@ -197,7 +197,7 @@ def is_gpu_postprocess(resolved: AugmentationBackend) -> bool:
         >>> is_gpu_postprocess(AugmentationBackend.TV)
         False
     """
-    return resolved == AugmentationBackend.KORNIA
+    return resolved in (AugmentationBackend.KORNIA, "kornia", "gpu")
 
 
 def resolve_backend_for_build(

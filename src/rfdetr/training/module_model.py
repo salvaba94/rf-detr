@@ -22,6 +22,7 @@ from rfdetr.evaluation.tiled_gsahi import predict_gsahi
 from rfdetr.evaluation.tiled_sahi import predict_tiled
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
+from rfdetr.training.callbacks.coco_eval import _get_ema_inner_module
 from rfdetr.training.optimizers import build_optimizer
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
@@ -709,6 +710,20 @@ class RFDETRModelModule(LightningModule):
             return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+    def _resolve_eval_model(self) -> Any:
+        """Return EMA weights for validation when EMA-only evaluation is enabled."""
+        if not self.train_config.eval_ema_only:
+            return self.model
+        try:
+            callbacks = getattr(self.trainer, "callbacks", [])
+        except RuntimeError:
+            return self.model
+        for callback in callbacks:
+            ema_inner = _get_ema_inner_module(callback)
+            if ema_inner is not None:
+                return ema_inner.model
+        return self.model
+
     def validation_step(self, batch: Tuple, batch_idx: int) -> Dict[str, Any]:
         """Run forward pass and postprocess for one validation step.
 
@@ -722,6 +737,7 @@ class RFDETRModelModule(LightningModule):
         Returns:
             Dict with ``results`` (postprocessed predictions) and ``targets``.
         """
+        eval_model = self._resolve_eval_model()
         if self._validation_uses_tiled_mode():
             if self.train_config.compute_val_loss and not self._sahi_val_loss_warning_emitted:
                 logger.info(
@@ -729,10 +745,10 @@ class RFDETRModelModule(LightningModule):
                     "tiled predictions instead of running an additional full-frame loss pass."
                 )
                 self._sahi_val_loss_warning_emitted = True
-            return self.predict_validation_batch_with_model(self.model, batch)
+            return self.predict_validation_batch_with_model(eval_model, batch)
 
         samples, targets = batch
-        outputs = self.model(samples)
+        outputs = eval_model(samples)
         if self.train_config.compute_val_loss:
             loss_dict = self.criterion(outputs, targets)
             weight_dict = self.criterion.weight_dict
