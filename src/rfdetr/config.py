@@ -5,17 +5,179 @@
 # ------------------------------------------------------------------------
 
 
+import functools
+import importlib
+import json
 import os
 import warnings
+from collections.abc import Callable, Mapping
+from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, TypeAlias, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, TypeAlias, Union
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 from pydantic_core import PydanticUndefined
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 
 EncoderName: TypeAlias = Literal["dinov2_windowed_small", "dinov2_windowed_base", "dinov2_registers_windowed_small"]
 PathLikeStr: TypeAlias = str | Path
+
+__all__ = [
+    "AugmentationBackend",
+    "ModelConfig",
+    "RFDETRBaseConfig",
+    "RFDETRLargeDeprecatedConfig",
+    "RFDETRNanoConfig",
+    "RFDETRSmallConfig",
+    "RFDETRMediumConfig",
+    "RFDETRLargeConfig",
+    "RFDETRSegPreviewConfig",
+    "RFDETRSegNanoConfig",
+    "RFDETRSegSmallConfig",
+    "RFDETRSegMediumConfig",
+    "RFDETRSegLargeConfig",
+    "RFDETRSegXLargeConfig",
+    "RFDETRSeg2XLargeConfig",
+    "RFDETRKeypointPreviewConfig",
+    "TrainConfig",
+    "SegmentationTrainConfig",
+    "KeypointTrainConfig",
+]
+
+#: Legacy augmentation-backend string aliases, mapped to their current form.
+_LEGACY_AUGMENTATION_BACKEND_ALIASES: Dict[str, str] = {
+    "gpu": "kornia",
+    "tv": "torchvision",
+    "albu": "albumentations",
+}
+
+
+def _package_importable(module_name: str) -> bool:
+    """Return ``True`` when *module_name* can be imported.
+
+    Args:
+        module_name: Dotted module path to probe (e.g. ``"kornia.augmentation"``).
+
+    Returns:
+        ``True`` if the import succeeds, ``False`` on ``ImportError``.
+    """
+    try:
+        importlib.import_module(module_name)
+        return True
+    except ImportError:
+        return False
+
+
+class AugmentationBackend(str, Enum):
+    """Concrete augmentation backend selector for ``TrainConfig.augmentation_backend``.
+
+    Only holds directly-usable, concrete backends — ``TV`` (torchvision), ``ALBU`` (Albumentations), and ``KORNIA``.
+    ``GPU`` is a Python enum alias for ``KORNIA`` (same value ``"kornia"``): Kornia augmentation always runs on-device
+    (GPU), so the two names refer to the same backend; ``GPU`` exists only so legacy ``augmentation_backend="gpu"``
+    strings keep resolving correctly.
+
+    ``"cpu"`` and ``"auto"`` are accepted as *input* strings (on ``TrainConfig.augmentation_backend`` and by
+    :meth:`from_str`) but are never stored or returned as a member of this enum — they are auto-pick sentinels resolved
+    to a concrete member at :meth:`from_str` call time. Resolution stays late (re-checked at dataset-build time against
+    whatever is installed in the current environment) rather than baked into ``TrainConfig`` at construction time, so a
+    saved config using ``"cpu"``/``"auto"`` remains portable across environments with different optional packages
+    installed. Pass a concrete value (``"torchvision"``, ``"albumentations"``, or ``"kornia"``) explicitly to pin the
+    backend regardless of environment.
+    """
+
+    TV = "torchvision"
+    ALBU = "albumentations"
+    KORNIA = "kornia"
+    GPU = "kornia"  # alias for KORNIA — backward compat name; kornia is always the GPU-side path
+
+    @classmethod
+    def from_str(cls, value: str, *, has_cuda: bool = False) -> "AugmentationBackend":
+        """Resolve a string to a concrete backend, auto-picking the best installed one.
+
+        Legacy string aliases (``"gpu"``, ``"tv"``, ``"albu"``) are mapped to their current form
+        first. ``"cpu"`` auto-picks the best *installed* CPU backend: Albumentations > Kornia
+        (CPU) > torchvision. ``"auto"`` additionally prefers Kornia first when ``has_cuda=True``
+        and Kornia is installed, then falls back to the same CPU priority. The concrete backend
+        ``"cpu"``/``"auto"`` resolve to can therefore vary across environments — pass
+        ``"torchvision"`` explicitly to force torchvision regardless of what's installed.
+
+        Args:
+            value: Backend name string.
+            has_cuda: Whether a CUDA device is available. Only consulted for ``"auto"`` — callers
+                that care about CUDA-gated GPU selection (e.g. dataset builders) compute this via
+                their own fork-safe CUDA check and pass it in; this function does not probe CUDA
+                itself to avoid importing device-detection code from other modules.
+
+        Returns:
+            Concrete ``AugmentationBackend`` member.
+
+        Raises:
+            ValueError: When *value* is not a recognised backend name.
+
+        Examples:
+            >>> AugmentationBackend.from_str("torchvision")
+            <AugmentationBackend.TV: 'torchvision'>
+            >>> AugmentationBackend.from_str("gpu")
+            <AugmentationBackend.KORNIA: 'kornia'>
+        """
+        value = _LEGACY_AUGMENTATION_BACKEND_ALIASES.get(value, value)
+        if value in ("cpu", "auto"):
+            if value == "auto" and has_cuda and cls._is_kornia_available():
+                return cls.KORNIA
+            if cls._is_albu_available():
+                return cls.ALBU
+            if cls._is_kornia_available():
+                return cls.KORNIA
+            return cls.TV
+        try:
+            return cls(value)
+        except ValueError:
+            raise ValueError(
+                f"Unknown augmentation_backend {value!r}; expected one of 'cpu', 'auto', 'torchvision', "
+                "'albumentations', 'kornia'."
+            ) from None
+
+    @classmethod
+    @functools.lru_cache(maxsize=None)
+    def _is_albu_available(cls) -> bool:
+        """Return ``True`` when Albumentations is importable.
+
+        Cached for the process lifetime — package installation state does not change at runtime.
+        Tests that need to simulate "not installed" should patch this method directly (e.g.
+        ``patch.object(AugmentationBackend, "_is_albu_available", return_value=False)``) rather
+        than blocking the underlying import, since the cache is keyed on this method, not on the
+        import machinery.
+
+        Returns:
+            ``True`` if ``albumentations`` can be imported.
+        """
+        return _package_importable("albumentations")
+
+    @classmethod
+    @functools.lru_cache(maxsize=None)
+    def _is_kornia_available(cls) -> bool:
+        """Return ``True`` when Kornia's augmentation module is importable.
+
+        Cached for the process lifetime — see :meth:`_is_albu_available` for the caching and test
+        rationale.
+
+        Returns:
+            ``True`` if ``kornia.augmentation`` can be imported.
+        """
+        return _package_importable("kornia.augmentation")
+
+    @classmethod
+    def _is_tv_available(cls) -> bool:
+        """Return ``True`` — torchvision is a hard (non-optional) RF-DETR dependency.
+
+        Not cached: the result is a compile-time constant, not worth the caching machinery.
+
+        Returns:
+            Always ``True``.
+        """
+        return True
 
 
 class PretrainWeightsCompatibilityWarning(UserWarning):
@@ -63,6 +225,184 @@ def _detect_device() -> str:
 
 
 DEVICE: str = _detect_device()
+_OPTIMIZER_MANAGED_KWARGS = {"params", "lr", "weight_decay", "fused"}
+
+
+def _resolve_native_optimizer(name: str) -> type[Optimizer]:
+    """Resolve a bare optimizer short name to a ``torch.optim`` optimizer class.
+
+    Only native ``torch.optim`` optimizers may be selected by short name; the match
+    is case-insensitive (``"adamw"`` → ``torch.optim.AdamW``, ``"sgd"`` → ``torch.optim.SGD``).
+    Any other optimizer must be given as a full dotted import path or a callable.
+
+    Args:
+        name: A bare optimizer name (no dotted import path).
+
+    Returns:
+        The matching ``torch.optim`` optimizer class.
+
+    Raises:
+        ValueError: If ``name`` is not a native ``torch.optim`` optimizer.
+
+    Examples:
+        >>> _resolve_native_optimizer("adamw") is torch.optim.AdamW
+        True
+    """
+    target = name.strip().lower()
+    for attribute in dir(torch.optim):
+        candidate = getattr(torch.optim, attribute)
+        if isinstance(candidate, type) and issubclass(candidate, Optimizer) and attribute.lower() == target:
+            return candidate
+    raise ValueError(
+        f"Unknown native optimizer {name!r}. Short names must name a torch.optim optimizer "
+        "(e.g. 'adamw', 'sgd', 'adam'); use a full dotted import path or a callable for anything else."
+    )
+
+
+def _is_managed_optimizer_name(optimizer: object) -> bool:
+    """Return whether an optimizer config selects RF-DETR's managed construction.
+
+    Managed mode covers bare ``torch.optim`` short names (e.g. ``"adamw"``, ``"sgd"``);
+    RF-DETR injects ``lr`` and a signature-aware ``weight_decay`` there. A dotted import
+    path or a callable selects explicit mode, where the optimizer is built only from
+    ``optimizer_kwargs`` (or the callable's own bound arguments).
+
+    Args:
+        optimizer: The ``TrainConfig.optimizer`` value.
+
+    Returns:
+        ``True`` for managed short-name strings, ``False`` for dotted paths and callables.
+
+    Examples:
+        >>> _is_managed_optimizer_name("sgd")
+        True
+        >>> _is_managed_optimizer_name("torch.optim.AdamW")
+        False
+    """
+    return isinstance(optimizer, str) and "." not in optimizer
+
+
+def _desugar_optimizer_callable(
+    optimizer: Callable[..., Optimizer],
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Decompose a callable optimizer into a serializable ``(dotted_path, kwargs)`` form.
+
+    Reconstructable callables — an importable top-level class or function, optionally
+    wrapped in ``functools.partial`` with JSON-serializable keyword arguments and no
+    positional arguments — desugar to a dotted import path plus keyword arguments that
+    round-trip through ``training_config.json``.
+
+    Args:
+        optimizer: A callable or ``functools.partial`` given as ``TrainConfig.optimizer``.
+
+    Returns:
+        ``(dotted_path, kwargs, None)`` when reconstructable, otherwise
+        ``(None, None, reason)`` where ``reason`` explains how to make it compatible.
+    """
+    func: Any = optimizer
+    extracted_kwargs: dict[str, Any] = {}
+    if isinstance(optimizer, functools.partial):
+        if optimizer.args:
+            return None, None, "pass every functools.partial argument as a keyword, not positionally"
+        func = optimizer.func
+        extracted_kwargs = dict(optimizer.keywords or {})
+
+    module = getattr(func, "__module__", None)
+    qualname = getattr(func, "__qualname__", None)
+    if module is None or qualname is None or "<" in qualname:
+        return (
+            None,
+            None,
+            "define the optimizer as an importable top-level class or function (no lambda or nested definition)",
+        )
+
+    try:
+        json.dumps(extracted_kwargs)
+    except (TypeError, ValueError):
+        return (
+            None,
+            None,
+            "use only JSON-serializable functools.partial keyword arguments (no tensors, modules, or callables)",
+        )
+
+    return f"{module}.{qualname}", extracted_kwargs, None
+
+
+_MANAGED_SCHEDULER_PRESETS = {"step", "cosine"}
+_DEPRECATED_LR_FIELD_KWARGS = {"lr_drop": "lr_drop", "lr_min_factor": "min_factor"}
+# Keys the managed "step" / "cosine" presets actually consume from lr_scheduler_kwargs.
+_MANAGED_SCHEDULER_KWARGS = {"min_factor", "lr_drop"}
+
+# ReduceLROnPlateau does not subclass LRScheduler but is a supported explicit scheduler.
+SchedulerType: TypeAlias = LRScheduler | ReduceLROnPlateau
+
+
+def _is_managed_scheduler_name(lr_scheduler: object) -> bool:
+    """Return whether an lr_scheduler config selects an RF-DETR managed preset.
+
+    Managed presets are the built-in ``"step"`` and ``"cosine"`` schedules, which own warmup
+    and total-step sizing. A dotted import path or a callable instead selects an explicit
+    scheduler built from ``lr_scheduler_kwargs`` (or the callable's own bound arguments).
+
+    Args:
+        lr_scheduler: The ``TrainConfig.lr_scheduler`` value.
+
+    Returns:
+        ``True`` for managed preset short names, ``False`` for dotted paths and callables.
+
+    Examples:
+        >>> _is_managed_scheduler_name("cosine")
+        True
+        >>> _is_managed_scheduler_name("torch.optim.lr_scheduler.StepLR")
+        False
+    """
+    return isinstance(lr_scheduler, str) and lr_scheduler.strip().lower() in _MANAGED_SCHEDULER_PRESETS
+
+
+def _desugar_scheduler_callable(
+    lr_scheduler: Callable[..., SchedulerType],
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Decompose a callable lr_scheduler into a serializable ``(dotted_path, kwargs)`` form.
+
+    Reconstructable callables — an importable top-level class or function, optionally wrapped in
+    ``functools.partial`` with JSON-serializable keyword arguments and no positional arguments —
+    desugar to a dotted import path plus keyword arguments that round-trip through
+    ``training_config.json``. The optimizer is supplied at build time, never baked into the callable.
+
+    Args:
+        lr_scheduler: A callable or ``functools.partial`` given as ``TrainConfig.lr_scheduler``.
+
+    Returns:
+        ``(dotted_path, kwargs, None)`` when reconstructable, otherwise
+        ``(None, None, reason)`` where ``reason`` explains how to make it compatible.
+    """
+    func: Any = lr_scheduler
+    extracted_kwargs: dict[str, Any] = {}
+    if isinstance(lr_scheduler, functools.partial):
+        if lr_scheduler.args:
+            return None, None, "pass every functools.partial argument as a keyword, not positionally"
+        func = lr_scheduler.func
+        extracted_kwargs = dict(lr_scheduler.keywords or {})
+
+    module = getattr(func, "__module__", None)
+    qualname = getattr(func, "__qualname__", None)
+    if module is None or qualname is None or "<" in qualname:
+        return (
+            None,
+            None,
+            "define the lr_scheduler as an importable top-level class or function (no lambda or nested definition)",
+        )
+
+    try:
+        json.dumps(extracted_kwargs)
+    except (TypeError, ValueError):
+        return (
+            None,
+            None,
+            "use only JSON-serializable functools.partial keyword arguments (no tensors, modules, or callables)",
+        )
+
+    return f"{module}.{qualname}", extracted_kwargs, None
 
 
 class BaseConfig(BaseModel):
@@ -247,11 +587,52 @@ class GsahiValidationConfig(BaseConfig):
 
 
 class ModelConfig(BaseConfig):
+    """Core architecture configuration for RF-DETR models.
+
+    Concrete subclasses (e.g. ``RFDETRBaseConfig``, ``RFDETRLargeConfig``) must supply every field
+    that has no default; direct instantiation of ``ModelConfig`` is unsupported.
+
+    Attributes:
+        encoder: Vision-transformer backbone identifier. Must be provided by concrete subclass.
+        out_feature_indexes: Encoder layer indices whose feature maps are forwarded to the decoder.
+            Must be provided by concrete subclass.
+        dec_layers: Number of transformer decoder layers. Must be provided by concrete subclass.
+        projector_scale: Feature-pyramid levels fed to the decoder cross-attention (subset of
+            ``["P3", "P4", "P5"]``). Must be provided by concrete subclass.
+        hidden_dim: Width of the decoder hidden state. Must be provided by concrete subclass.
+        patch_size: ViT patch size used by the backbone. Must be provided by concrete subclass.
+        num_windows: Number of windowed-attention windows in the backbone. Must be provided by
+            concrete subclass.
+        sa_nheads: Number of heads in decoder self-attention. Must be provided by concrete
+            subclass.
+        ca_nheads: Number of heads in decoder cross-attention. Must be provided by concrete
+            subclass.
+        dec_n_points: Deformable attention points per head per level in the decoder. Must be
+            provided by concrete subclass.
+        resolution: Square input resolution (pixels). Must be provided by concrete subclass.
+        positional_encoding_size: Side length (in patches) of the sinusoidal positional grid.
+            Must be provided by concrete subclass.
+        num_queries: Number of object queries used during inference (and per group during
+            training). Defaults to ``300``.
+        num_classes: Number of output classes (background-free). Defaults to ``90`` (COCO).
+        group_detr: Number of duplicate query groups used during training for GroupPose-style
+            convergence acceleration. ``num_queries * group_detr`` predictions are produced in
+            training mode; ``num_queries`` in eval mode. ``num_queries`` must be divisible by
+            ``group_detr``. Defaults to ``13``.
+        amp: Enable automatic mixed precision (bfloat16/float16). Defaults to ``True``.
+        compile: Compile the model with ``torch.compile`` for faster throughput. Defaults to
+            ``False``.
+        pretrain_weights: Path or URL to pretrained checkpoint. ``None`` trains from scratch.
+        device: Target device string (e.g. ``"cuda"``, ``"cpu"``). Auto-detected if not set.
+        gradient_checkpointing: Trade compute for memory by checkpointing activations. Defaults
+            to ``False``.
+    """
+
     encoder: EncoderName
-    out_feature_indexes: List[int]
+    out_feature_indexes: list[int]
     dec_layers: int
     two_stage: bool = True
-    projector_scale: List[Literal["P3", "P4", "P5"]]
+    projector_scale: list[Literal["P3", "P4", "P5"]]
     hidden_dim: int
     patch_size: int
     num_windows: int
@@ -259,9 +640,7 @@ class ModelConfig(BaseConfig):
     ca_nheads: int
     dec_n_points: int
     num_queries: int = 300
-    # NOTE:
-    # - ModelConfig is the authoritative source of `num_select` for PTL/inference; it is read via `build_namespace`.
-    # - Any `num_select` field on TrainConfig / SegmentationTrainConfig is deprecated and ignored by PTL/inference.
+    # ModelConfig is the sole owner of `num_select` for PTL/inference; it is read via `_namespace_from_configs`.
     num_select: int = 300
     postprocess_trace_alpha: float = Field(default=0.2, ge=0.0)
     bbox_reparam: bool = True
@@ -270,7 +649,7 @@ class ModelConfig(BaseConfig):
     amp: bool = True
     num_channels: int = Field(default=3, ge=1)
     num_classes: int = 90
-    pretrain_weights: Optional[PathLikeStr] = None
+    pretrain_weights: PathLikeStr | None = None
     # torch.device values are accepted at validation time and normalized to string.
     device: str = DEVICE
     resolution: int
@@ -280,7 +659,6 @@ class ModelConfig(BaseConfig):
     fused_optimizer: bool = True
     positional_encoding_size: int
     ia_bce_loss: bool = True
-    cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     use_grouppose_keypoints: bool = False
     keypoint_cross_attn: bool = True
@@ -288,13 +666,13 @@ class ModelConfig(BaseConfig):
     grouppose_keypoint_dim_downscale: int = 1
     dual_projector: bool = False
     dual_projector_kp_only: bool = False
-    num_keypoints_per_class: List[int] = Field(default_factory=list)
+    num_keypoints_per_class: list[int] = Field(default_factory=list)
     num_decoder_registers: int = 0
     mask_downsample_ratio: int = 4
     backbone_lora: bool = False
     freeze_encoder: bool = False
     license: str = "Apache-2.0"
-    model_name: Optional[str] = Field(
+    model_name: str | None = Field(
         default=None,
         description=(
             'Name of the model class stored in training checkpoints (e.g. ``"RFDETRLarge"``). '
@@ -303,26 +681,6 @@ class ModelConfig(BaseConfig):
             "without inspecting ``pretrain_weights``."
         ),
     )
-
-    @model_validator(mode="after")
-    def _warn_deprecated_model_config_fields(self) -> "ModelConfig":
-        """Emit DeprecationWarning when cls_loss_coef is explicitly set on ModelConfig.
-
-        ``cls_loss_coef`` ownership is moving to ``TrainConfig`` (Item #3, v1.7). Setting it on ``ModelConfig`` is
-        deprecated.  Use ``TrainConfig(cls_loss_coef=...)`` instead.
-        """
-        if "cls_loss_coef" in self.model_fields_set:
-            # stacklevel=2 points into Pydantic internals rather than the user call
-            # site — this is unavoidable with @model_validator(mode="after") in
-            # Pydantic v2.  The warning still fires correctly; the origin frame is
-            # less precise than ideal.
-            warnings.warn(
-                "ModelConfig.cls_loss_coef is deprecated since v1.7.0 and will be removed in v1.9.0. "
-                "Set cls_loss_coef on TrainConfig instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return self
 
     @model_validator(mode="after")
     def _sync_pe_with_resolution(self) -> "ModelConfig":
@@ -491,7 +849,7 @@ class ModelConfig(BaseConfig):
             if _mdr_info is not None and not _mdr_info.is_required():
                 _mdr_default = _mdr_info.default
                 if _mdr_default is not PydanticUndefined:
-                    _mdr_current = getattr(self, "mask_downsample_ratio")
+                    _mdr_current = self.mask_downsample_ratio
                     if _mdr_current != _mdr_default:
                         overrides.append(("mask_downsample_ratio", _mdr_current, _mdr_default))
 
@@ -577,9 +935,9 @@ class RFDETRBaseConfig(ModelConfig):
     dec_n_points: int = 2
     num_queries: int = 300
     num_select: int = 300
-    projector_scale: List[Literal["P3", "P4", "P5"]] = ["P4"]
-    out_feature_indexes: List[int] = [2, 5, 8, 11]
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-base.pth"
+    projector_scale: list[Literal["P3", "P4", "P5"]] = ["P4"]
+    out_feature_indexes: list[int] = [2, 5, 8, 11]
+    pretrain_weights: PathLikeStr | None = "rf-detr-base.pth"
     resolution: int = 560
     positional_encoding_size: int = 37
 
@@ -592,48 +950,50 @@ class RFDETRLargeDeprecatedConfig(RFDETRBaseConfig):
     sa_nheads: int = 12
     ca_nheads: int = 24
     dec_n_points: int = 4
-    projector_scale: List[Literal["P3", "P4", "P5"]] = ["P3", "P5"]
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-large.pth"
+    projector_scale: list[Literal["P3", "P4", "P5"]] = ["P3", "P5"]
+    pretrain_weights: PathLikeStr | None = "rf-detr-large.pth"
 
 
 class RFDETRNanoConfig(RFDETRBaseConfig):
     """The configuration for an RF-DETR Nano model."""
 
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 2
     patch_size: int = 16
     resolution: int = 384
     positional_encoding_size: int = 24
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-nano.pth"
+    pretrain_weights: PathLikeStr | None = "rf-detr-nano.pth"
 
 
 class RFDETRSmallConfig(RFDETRBaseConfig):
     """The configuration for an RF-DETR Small model."""
 
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 3
     patch_size: int = 16
     resolution: int = 512
     positional_encoding_size: int = 32
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-small.pth"
+    pretrain_weights: PathLikeStr | None = "rf-detr-small.pth"
 
 
 class RFDETRMediumConfig(RFDETRBaseConfig):
     """The configuration for an RF-DETR Medium model."""
 
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 16
     resolution: int = 576
     positional_encoding_size: int = 36
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-medium.pth"
+    pretrain_weights: PathLikeStr | None = "rf-detr-medium.pth"
 
 
 # res 704, ps 16, 2 windows, 4 dec layers, 300 queries, ViT-S basis
 class RFDETRLargeConfig(ModelConfig):
+    """Configuration for the RF-DETR Large model variant."""
+
     encoder: Literal["dinov2_windowed_small"] = "dinov2_windowed_small"
     hidden_dim: int = 256
     dec_layers: int = 4
@@ -642,11 +1002,11 @@ class RFDETRLargeConfig(ModelConfig):
     dec_n_points: int = 2
     num_windows: int = 2
     patch_size: int = 16
-    projector_scale: List[Literal["P4",]] = ["P4"]
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    projector_scale: list[Literal["P4",]] = ["P4"]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_classes: int = 90
     positional_encoding_size: int = 704 // 16
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-large-2026.pth"
+    pretrain_weights: PathLikeStr | None = "rf-detr-large-2026.pth"
     resolution: int = 704
     # Explicit so populate_args and _build_args_from_configs agree.
     # ModelConfig does not define these fields; without them the legacy path
@@ -657,8 +1017,10 @@ class RFDETRLargeConfig(ModelConfig):
 
 
 class RFDETRSegPreviewConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation Preview model."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 12
@@ -666,13 +1028,15 @@ class RFDETRSegPreviewConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 36
     num_queries: int = 200
     num_select: int = 200
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-preview.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-preview.pt"
     num_classes: int = 90
 
 
 class RFDETRSegNanoConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation Nano model variant."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 1
     dec_layers: int = 4
     patch_size: int = 12
@@ -680,13 +1044,15 @@ class RFDETRSegNanoConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 312 // 12
     num_queries: int = 100
     num_select: int = 100
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-nano.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-nano.pt"
     num_classes: int = 90
 
 
 class RFDETRSegSmallConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation Small model variant."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 12
@@ -694,13 +1060,15 @@ class RFDETRSegSmallConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 384 // 12
     num_queries: int = 100
     num_select: int = 100
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-small.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-small.pt"
     num_classes: int = 90
 
 
 class RFDETRSegMediumConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation Medium model variant."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 5
     patch_size: int = 12
@@ -708,13 +1076,15 @@ class RFDETRSegMediumConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 432 // 12
     num_queries: int = 200
     num_select: int = 200
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-medium.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-medium.pt"
     num_classes: int = 90
 
 
 class RFDETRSegLargeConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation Large model variant."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 5
     patch_size: int = 12
@@ -722,13 +1092,15 @@ class RFDETRSegLargeConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 504 // 12
     num_queries: int = 200
     num_select: int = 200
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-large.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-large.pt"
     num_classes: int = 90
 
 
 class RFDETRSegXLargeConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation XLarge model variant."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 6
     patch_size: int = 12
@@ -736,13 +1108,15 @@ class RFDETRSegXLargeConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 624 // 12
     num_queries: int = 300
     num_select: int = 300
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-xlarge.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-xlarge.pt"
     num_classes: int = 90
 
 
 class RFDETRSeg2XLargeConfig(RFDETRBaseConfig):
+    """Configuration for the RF-DETR Segmentation 2XLarge model variant."""
+
     segmentation_head: bool = True
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 6
     patch_size: int = 12
@@ -750,7 +1124,7 @@ class RFDETRSeg2XLargeConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 768 // 12
     num_queries: int = 300
     num_select: int = 300
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-seg-xxlarge.pt"
+    pretrain_weights: PathLikeStr | None = "rf-detr-seg-xxlarge.pt"
     num_classes: int = 90
 
 
@@ -760,11 +1134,11 @@ class RFDETRKeypointPreviewConfig(RFDETRBaseConfig):
     use_grouppose_keypoints: bool = True
     dual_projector: bool = True
     dual_projector_kp_only: bool = True
-    num_keypoints_per_class: List[int] = [17]
+    num_keypoints_per_class: list[int] = [17]
     keypoint_cross_attn: bool = True
     inter_instance_kp_attn: bool = False
     grouppose_keypoint_dim_downscale: int = 1
-    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    out_feature_indexes: list[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 12
@@ -772,7 +1146,7 @@ class RFDETRKeypointPreviewConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 576 // 12
     num_queries: int = 100
     num_select: int = 100
-    pretrain_weights: Optional[PathLikeStr] = "rf-detr-keypoint-preview-xlarge.pth"
+    pretrain_weights: PathLikeStr | None = "rf-detr-keypoint-preview-xlarge.pth"
     num_classes: int = 90
 
 
@@ -812,19 +1186,19 @@ class TrainConfig(BaseConfig):
     lr_vit_layer_decay: float = 0.8
     lr_component_decay: float = 0.7
     drop_path: float = 0.0
-    group_detr: int = 13
-    ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
-    num_select: int = 300
-    keypoint_flip_pairs: List[int] = Field(default_factory=list)
+    # Detection-vs-keypoint distinction is derived by callers via `include_keypoints`, not
+    # stored on this field. See rfdetr.datasets.transforms.AlbumentationsWrapper.from_config
+    # for the None/[]/[...] tri-state contract applied at the augmentation-pipeline boundary.
+    keypoint_flip_pairs: list[int] = Field(default_factory=list)
     keypoint_l1_loss_coef: float = 0
     keypoint_findable_loss_coef: float = 0
     keypoint_visible_loss_coef: float = 0
     keypoint_nll_loss_coef: float = 0
-    keypoint_oks_sigmas: List[float] | None = None
+    keypoint_oks_sigmas: list[float] | None = None
     dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
-    dataset_dir: Optional[PathLikeStr]
+    dataset_dir: PathLikeStr | None
     output_dir: PathLikeStr = "output"
     multi_scale: MultiScaleConfig = Field(default_factory=MultiScaleConfig)
     ema: EmaConfig = Field(default_factory=EmaConfig)
@@ -852,14 +1226,16 @@ class TrainConfig(BaseConfig):
     mlflow_log_artifacts: bool = True
     mlflow_log_system_metrics: bool = True
     clearml: bool = False  # Not yet implemented — reserved for future use.
-    project: Optional[str] = None
-    run: Optional[str] = None
-    class_names: Optional[List[str]] = None
+    project: str | None = None
+    run: str | None = None
+    class_names: list[str] | None = None
     run_test: bool = False
     validate_before_fit: bool = False
     segmentation_head: bool = False
     eval_max_dets: int = 500
     eval_interval: int = 1
+    eval_ema_only: bool = False
+    eval_masks_head_resolution: bool = False
     log_per_class_metrics: bool = True
     validation_batch_size: Optional[int] = Field(default=None, ge=1)
     validation_mode: Literal[
@@ -877,7 +1253,7 @@ class TrainConfig(BaseConfig):
     aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_pre_resize_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     eval_aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
-    augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
+    augmentation_backend: AugmentationBackend | Literal["cpu", "auto"] = "cpu"
     save_dataset_grids: bool = False
     save_prediction_grids: bool = False
     notes: Optional[Any] = Field(
@@ -890,6 +1266,44 @@ class TrainConfig(BaseConfig):
             "all other types are JSON-encoded."
         ),
     )
+
+    @field_validator("augmentation_backend", mode="before")
+    @classmethod
+    def _coerce_augmentation_backend(cls, value: Any) -> Any:
+        """Map legacy augmentation backend aliases to current names."""
+        if isinstance(value, str):
+            return _LEGACY_AUGMENTATION_BACKEND_ALIASES.get(value, value)
+        return value
+
+    @field_serializer("augmentation_backend")
+    def _serialize_augmentation_backend(self, value: AugmentationBackend | str) -> str:
+        """Serialize augmentation backend enums as JSON-safe strings."""
+        return value.value if isinstance(value, AugmentationBackend) else value
+
+    @property
+    def use_ema(self) -> bool:
+        """Return the legacy flat alias for structured EMA enablement."""
+        return self.ema.enabled
+
+    @property
+    def ema_decay(self) -> float:
+        """Return the legacy flat alias for structured EMA decay."""
+        return self.ema.decay
+
+    @property
+    def ema_tau(self) -> int:
+        """Return the legacy flat alias for structured EMA warmup."""
+        return self.ema.tau
+
+    @property
+    def ema_update_interval(self) -> int:
+        """Return the legacy flat alias for the structured EMA update interval."""
+        return self.ema.update_interval
+
+    @property
+    def auto_batch_ema_headroom(self) -> float:
+        """Return the legacy flat alias for structured EMA auto-batch headroom."""
+        return self.ema.auto_batch_headroom
 
     @model_validator(mode="before")
     @classmethod
@@ -1004,15 +1418,22 @@ class TrainConfig(BaseConfig):
         optimizer_fields_set = "optimizer_config" in self.model_fields_set
         scheduler_fields_set = optimizer_fields_set and "scheduler" in self.optimizer_config.model_fields_set
         scheduler = self.optimizer_config.scheduler
+        explicit_nonmanaged_scheduler = (
+            "lr_scheduler" in self.model_fields_set and not _is_managed_scheduler_name(self.lr_scheduler)
+        )
+        synchronize_scheduler = not explicit_nonmanaged_scheduler and (
+            scheduler_fields_set or _is_managed_scheduler_name(self.lr_scheduler)
+        )
 
         if not optimizer_fields_set:
             self.optimizer_config.lr = self.lr
             self.optimizer_config.lr_encoder = self.lr_encoder
             self.optimizer_config.weight_decay = self.weight_decay
-            scheduler.name = self.lr_scheduler
-            scheduler.min_factor = self.lr_min_factor
-            scheduler.warmup_epochs = self.warmup_epochs
-            scheduler.drop_epoch = self.lr_drop
+            if synchronize_scheduler:
+                scheduler.name = self.lr_scheduler
+                scheduler.min_factor = self.lr_min_factor
+                scheduler.warmup_epochs = self.warmup_epochs
+                scheduler.drop_epoch = self.lr_drop
             return self
 
         if "lr" not in self.optimizer_config.model_fields_set and "lr" in self.model_fields_set:
@@ -1022,7 +1443,7 @@ class TrainConfig(BaseConfig):
         if "weight_decay" not in self.optimizer_config.model_fields_set and "weight_decay" in self.model_fields_set:
             self.optimizer_config.weight_decay = self.weight_decay
 
-        if not scheduler_fields_set:
+        if synchronize_scheduler and not scheduler_fields_set:
             if "lr_scheduler" in self.model_fields_set:
                 scheduler.name = self.lr_scheduler
             if "lr_min_factor" in self.model_fields_set:
@@ -1031,7 +1452,7 @@ class TrainConfig(BaseConfig):
                 scheduler.warmup_epochs = self.warmup_epochs
             if "lr_drop" in self.model_fields_set:
                 scheduler.drop_epoch = self.lr_drop
-        else:
+        elif synchronize_scheduler:
             if "name" not in scheduler.model_fields_set and "lr_scheduler" in self.model_fields_set:
                 scheduler.name = self.lr_scheduler
             if "min_factor" not in scheduler.model_fields_set and "lr_min_factor" in self.model_fields_set:
@@ -1044,10 +1465,11 @@ class TrainConfig(BaseConfig):
         object.__setattr__(self, "lr", self.optimizer_config.lr)
         object.__setattr__(self, "lr_encoder", self.optimizer_config.lr_encoder)
         object.__setattr__(self, "weight_decay", self.optimizer_config.weight_decay)
-        object.__setattr__(self, "lr_scheduler", scheduler.name)
-        object.__setattr__(self, "lr_min_factor", scheduler.min_factor)
-        object.__setattr__(self, "warmup_epochs", scheduler.warmup_epochs)
-        object.__setattr__(self, "lr_drop", scheduler.drop_epoch)
+        if synchronize_scheduler:
+            object.__setattr__(self, "lr_scheduler", scheduler.name)
+            object.__setattr__(self, "lr_min_factor", scheduler.min_factor)
+            object.__setattr__(self, "warmup_epochs", scheduler.warmup_epochs)
+            object.__setattr__(self, "lr_drop", scheduler.drop_epoch)
         return self
 
     @model_validator(mode="before")
@@ -1218,18 +1640,24 @@ class TrainConfig(BaseConfig):
     # device is intentionally absent: PTL auto-detects accelerator via Trainer(accelerator="auto").
     accelerator: str = "auto"
     clip_max_norm: float = 0.1
-    seed: Optional[int] = None
+    seed: int | None = None
     sync_bn: bool = False
     # strategy maps to PTL Trainer(strategy=...). Common values: "auto", "ddp",
     # "ddp_spawn", "fsdp", "deepspeed". Invalid values surface as PTL errors.
     strategy: str = "auto"
-    devices: Union[int, str] = 1
+    devices: int | str = 1
     # num_nodes maps to PTL Trainer(num_nodes=...) for multi-machine training.
     # Single-machine DDP users should leave this at 1 (the default).
     num_nodes: int = 1
     fp16_eval: bool = False
-    lr_scheduler: Literal["step", "cosine"] = "step"
+    lr_scheduler: str | Callable[..., SchedulerType] = "step"
+    lr_scheduler_kwargs: dict[str, Any] = Field(default_factory=dict)
+    lr_scheduler_interval: Literal["step", "epoch"] = "step"
+    lr_scheduler_monitor: str = "val/loss"
+    # Deprecated aux LR knobs — kept for one cycle; folded into lr_scheduler_kwargs (see _map_deprecated_lr_fields).
     lr_min_factor: float = 0.0
+    optimizer: str | Callable[..., Optimizer] = "adamw"
+    optimizer_kwargs: dict[str, Any] = Field(default_factory=dict)
     dont_save_weights: bool = False
     # PTL runtime/perf tuning knobs.
     train_log_sync_dist: bool = False
@@ -1237,9 +1665,9 @@ class TrainConfig(BaseConfig):
     compute_train_metrics: bool = False
     compute_val_loss: bool = True
     compute_test_loss: bool = True
-    pin_memory: Optional[bool] = None
-    persistent_workers: Optional[bool] = None
-    prefetch_factor: Optional[int] = None
+    pin_memory: bool | None = None
+    persistent_workers: bool | None = None
+    prefetch_factor: int | None = None
 
     @field_validator("batch_size", mode="after")
     @classmethod
@@ -1279,9 +1707,216 @@ class TrainConfig(BaseConfig):
             raise ValueError("Interval fields must be >= 1.")
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def _desugar_callable_optimizer(cls, data: Any) -> Any:
+        """Desugar a reconstructable callable optimizer into its serializable string form.
+
+        A callable ``optimizer`` (a class or ``functools.partial``) that can be imported is rewritten to a dotted import
+        path plus ``optimizer_kwargs`` so the config round-trips through ``training_config.json``. User-supplied
+        ``optimizer_kwargs`` are ignored for callable optimizers (bake arguments into the callable instead). Non-
+        reconstructable callables are kept as-is and only warned about.
+        """
+        if not isinstance(data, dict):
+            return data
+        optimizer = data.get("optimizer")
+        if optimizer is None or isinstance(optimizer, str) or not callable(optimizer):
+            return data
+
+        if data.get("optimizer_kwargs"):
+            warnings.warn(
+                "optimizer_kwargs is ignored when optimizer is a callable; bake arguments into the "
+                "callable (for example with functools.partial) instead.",
+                stacklevel=2,
+            )
+
+        path, kwargs, reason = _desugar_optimizer_callable(optimizer)
+        if reason is None:
+            data["optimizer"] = path
+            data["optimizer_kwargs"] = kwargs
+        else:
+            data["optimizer_kwargs"] = {}
+            label = getattr(optimizer, "__qualname__", None) or repr(optimizer)
+            warnings.warn(
+                f"optimizer callable {label!r} cannot be saved to training_config.json and restored: "
+                f"{reason}. Training proceeds with the in-memory callable; only saved-config "
+                "reproducibility is affected.",
+                stacklevel=2,
+            )
+        return data
+
+    @field_validator("optimizer", mode="after")
+    @classmethod
+    def validate_optimizer_name(cls, v: str | Callable[..., Optimizer]) -> str | Callable[..., Optimizer]:
+        """Validate a string optimizer: a bare name must be a native torch.optim optimizer."""
+        if not isinstance(v, str):
+            return v
+        optimizer = v.strip()
+        if not optimizer:
+            raise ValueError("optimizer must be a non-empty string.")
+        if optimizer.lower() in {"muadamw", "musgd"}:
+            return optimizer.lower()
+        # Bare short names must resolve to a torch.optim optimizer (checked eagerly).
+        # Dotted import paths are validated lazily at train start (the module may be optional).
+        if "." not in optimizer:
+            _resolve_native_optimizer(optimizer)
+        return optimizer
+
+    @model_validator(mode="after")
+    def validate_eval_ema_only(self) -> "TrainConfig":
+        """``eval_ema_only`` has no EMA model to evaluate without ``use_ema=True``."""
+        if self.eval_ema_only and not self.use_ema:
+            raise ValueError("eval_ema_only=True requires use_ema=True.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_optimizer_kwargs(self) -> "TrainConfig":
+        """Reserved optimizer kwargs are only rejected for managed (short-name) optimizers."""
+        if _is_managed_optimizer_name(self.optimizer):
+            reserved_present = _OPTIMIZER_MANAGED_KWARGS.intersection(self.optimizer_kwargs)
+            if reserved_present:
+                reserved = ", ".join(sorted(reserved_present))
+                raise ValueError(f"optimizer_kwargs cannot include RF-DETR-managed key(s): {reserved}.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_lr_scheduler_kwargs(self) -> "TrainConfig":
+        """Reject unknown ``lr_scheduler_kwargs`` keys for the managed ``"step"`` / ``"cosine"`` presets.
+
+        Managed presets consume only ``min_factor`` and ``lr_drop``; any other key would be silently ignored, so surface
+        it as an error (mirroring ``validate_optimizer_kwargs``). Explicit schedulers forward their kwargs verbatim to
+        the constructor and are left unchecked here.
+        """
+        if _is_managed_scheduler_name(self.lr_scheduler):
+            unknown = set(self.lr_scheduler_kwargs) - _MANAGED_SCHEDULER_KWARGS
+            if unknown:
+                allowed = ", ".join(sorted(_MANAGED_SCHEDULER_KWARGS))
+                unknown_keys = ", ".join(sorted(unknown))
+                raise ValueError(
+                    f"lr_scheduler_kwargs for a managed preset ({self.lr_scheduler!r}) accepts only "
+                    f"{{{allowed}}}; unknown key(s): {unknown_keys}."
+                )
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_deprecated_lr_fields(cls, data: Any) -> Any:
+        """Fold the deprecated ``lr_drop`` / ``lr_min_factor`` fields into ``lr_scheduler_kwargs``.
+
+        These loose knobs are deprecated in favor of ``lr_scheduler_kwargs``. When either is supplied with a non-default
+        value for a managed preset (``"step"`` / ``"cosine"``), it is copied into ``lr_scheduler_kwargs`` (without
+        overriding an explicit kwarg) and a ``FutureWarning`` is emitted. Default values are ignored silently so round-
+        tripping a dumped config (which always carries these fields) never warns. For explicit (dotted-path / callable)
+        schedulers the deprecated fields are preset-specific and left untouched.
+        """
+        if not isinstance(data, dict):
+            return data
+        # Only managed presets consume these knobs; default lr_scheduler ("step") is managed.
+        if not _is_managed_scheduler_name(data.get("lr_scheduler", "step")):
+            # Explicit / callable scheduler: these preset knobs are inert. Warn (never fold) when a non-default
+            # value is set so a stale lr_drop / lr_min_factor carried over from a managed config is not silently
+            # dropped — a reproducibility footgun when migrating a saved config to an explicit scheduler.
+            for field_name in _DEPRECATED_LR_FIELD_KWARGS:
+                if field_name in data and data[field_name] != cls.model_fields[field_name].default:
+                    warnings.warn(
+                        f"{field_name} is ignored for the explicit (non-managed) lr_scheduler "
+                        f"{data.get('lr_scheduler')!r}; it only applies to the managed 'step'/'cosine' presets.",
+                        FutureWarning,
+                        stacklevel=2,
+                    )
+            return data
+        kwargs = dict(data.get("lr_scheduler_kwargs") or {})
+        for field_name, kwarg_name in _DEPRECATED_LR_FIELD_KWARGS.items():
+            if field_name not in data:
+                continue
+            # A default value (common when reloading a dumped config) is a no-op: the managed builder falls back to
+            # the same default. Skip silently so serialization round-trips don't emit spurious deprecation warnings.
+            if data[field_name] == cls.model_fields[field_name].default:
+                continue
+            # Already migrated: a dumped config carries both the top-level field and the folded kwarg. If the kwarg
+            # already holds this value, the field adds nothing — skip silently so migrated-config reloads never warn.
+            if kwargs.get(kwarg_name) == data[field_name]:
+                continue
+            # Both set to different values: the kwarg wins (setdefault below is a no-op). Say so explicitly rather
+            # than implying the deprecated field was migrated, which would mislead — the field value is discarded.
+            if kwarg_name in kwargs:
+                warnings.warn(
+                    f"{field_name}={data[field_name]!r} is ignored because lr_scheduler_kwargs already sets "
+                    f"{kwarg_name!r}={kwargs[kwarg_name]!r} (the kwarg wins); remove the deprecated {field_name}.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+                continue
+            warnings.warn(
+                f"{field_name} is deprecated; pass it via lr_scheduler_kwargs={{'{kwarg_name}': ...}} instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            kwargs[kwarg_name] = data[field_name]
+        if kwargs:
+            data["lr_scheduler_kwargs"] = kwargs
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _desugar_callable_lr_scheduler(cls, data: Any) -> Any:
+        """Desugar a reconstructable callable lr_scheduler into its serializable string form.
+
+        A callable ``lr_scheduler`` (a class or ``functools.partial``) that can be imported is rewritten to a dotted
+        import path plus ``lr_scheduler_kwargs`` so the config round-trips through ``training_config.json``. User-
+        supplied ``lr_scheduler_kwargs`` are ignored for callable schedulers (bake arguments into the callable instead).
+        Non-reconstructable callables are kept as-is and only warned about.
+        """
+        if not isinstance(data, dict):
+            return data
+        lr_scheduler = data.get("lr_scheduler")
+        if lr_scheduler is None or isinstance(lr_scheduler, str) or not callable(lr_scheduler):
+            return data
+
+        if data.get("lr_scheduler_kwargs"):
+            warnings.warn(
+                "lr_scheduler_kwargs is ignored when lr_scheduler is a callable; bake arguments into the "
+                "callable (for example with functools.partial) instead.",
+                stacklevel=2,
+            )
+
+        path, kwargs, reason = _desugar_scheduler_callable(lr_scheduler)
+        if reason is None:
+            data["lr_scheduler"] = path
+            data["lr_scheduler_kwargs"] = kwargs
+        else:
+            data["lr_scheduler_kwargs"] = {}
+            label = getattr(lr_scheduler, "__qualname__", None) or repr(lr_scheduler)
+            warnings.warn(
+                f"lr_scheduler callable {label!r} cannot be saved to training_config.json and restored: "
+                f"{reason}. Training proceeds with the in-memory callable; only saved-config "
+                "reproducibility is affected.",
+                stacklevel=2,
+            )
+        return data
+
+    @field_validator("lr_scheduler", mode="after")
+    @classmethod
+    def validate_lr_scheduler_name(cls, v: str | Callable[..., SchedulerType]) -> str | Callable[..., SchedulerType]:
+        """Validate a string lr_scheduler: a bare name must be a managed preset, else use a dotted path."""
+        if not isinstance(v, str):
+            return v
+        lr_scheduler = v.strip()
+        if not lr_scheduler:
+            raise ValueError("lr_scheduler must be a non-empty string.")
+        # Bare names must be a managed preset; dotted import paths are validated lazily at train start.
+        if "." not in lr_scheduler and not _is_managed_scheduler_name(lr_scheduler):
+            presets = ", ".join(sorted(_MANAGED_SCHEDULER_PRESETS))
+            raise ValueError(
+                f"Unknown lr_scheduler {v!r}. Bare names must be a managed preset ({presets}); "
+                "use a full dotted import path (e.g. 'torch.optim.lr_scheduler.StepLR') or a callable "
+                "for anything else."
+            )
+        return lr_scheduler
+
     @field_validator("prefetch_factor", mode="after")
     @classmethod
-    def validate_prefetch_factor(cls, v: Optional[int]) -> Optional[int]:
+    def validate_prefetch_factor(cls, v: int | None) -> int | None:
         """Validate prefetch_factor is None or >= 1."""
         if v is not None and v < 1:
             raise ValueError("prefetch_factor must be >= 1 when provided.")
@@ -1316,8 +1951,6 @@ class SegmentationTrainConfig(TrainConfig):
     Extends :class:`TrainConfig` with segmentation-specific loss coefficients.
 
     Attributes:
-        num_select: Maximum number of predictions to keep per image. ``None`` uses
-            the model default.
         mask_point_sample_ratio: Number of points sampled per mask for point-based
             mask loss computation.
         mask_ce_loss_coef: Cross-entropy loss weight for mask prediction.
@@ -1327,15 +1960,12 @@ class SegmentationTrainConfig(TrainConfig):
             silently activated a dormant ``5.0``; this field restores the correct
             weight). To reproduce pre-fix segmentation behaviour pass
             ``cls_loss_coef=5.0`` explicitly.
-        segmentation_head: Whether to attach the segmentation head.
     """
 
-    num_select: Optional[int] = None
     mask_point_sample_ratio: int = 16
     mask_ce_loss_coef: float = 5.0
     mask_dice_loss_coef: float = 5.0
     cls_loss_coef: float = 1.0
-    segmentation_head: bool = True
 
 
 class KeypointTrainConfig(TrainConfig):

@@ -26,6 +26,13 @@ from rfdetr.models.weights import _warn_on_partial_load
 def _make_checkpoint(num_classes: int = 91, num_queries: int = 300, group_detr: int = 13) -> dict:
     """Build a minimal checkpoint dict with the given class count.
 
+    Examples:
+        >>> ckpt = _make_checkpoint(num_classes=3, num_queries=2, group_detr=2)
+        >>> ckpt["model"]["query_feat.weight"].shape
+        torch.Size([4, 256])
+
+
+
     Args:
         num_classes: Total classes including background (bias shape).
         num_queries: Number of object queries per group.
@@ -50,6 +57,13 @@ def _make_checkpoint(num_classes: int = 91, num_queries: int = 300, group_detr: 
 def _make_train_config(tmp_path=None) -> TrainConfig:
     """Return a minimal TrainConfig for use in load_pretrain_weights.
 
+    Examples:
+        >>> cfg = _make_train_config()
+        >>> cfg.dataset_dir.endswith("dataset")
+        True
+
+
+
     Args:
         tmp_path: Optional pytest tmp_path fixture value.
     """
@@ -61,7 +75,7 @@ def _make_train_config(tmp_path=None) -> TrainConfig:
         lr_encoder=1.5e-4,
         batch_size=2,
         weight_decay=1e-4,
-        lr_drop=8,
+        lr_scheduler_kwargs={"lr_drop": 8},
         warmup_epochs=1.0,
         drop_path=0.0,
         multi_scale=False,
@@ -74,6 +88,13 @@ def _make_train_config(tmp_path=None) -> TrainConfig:
 
 def _fake_nn_model() -> MagicMock:
     """Return a MagicMock that behaves enough like an LWDETR nn.Module.
+
+    Examples:
+        >>> model = _fake_nn_model()
+        >>> hasattr(model, "load_state_dict")
+        True
+
+
 
     Returns:
         MagicMock with reinitialize_detection_head and load_state_dict stubs.
@@ -351,6 +372,51 @@ class TestLoadPretrainWeightsClassNames:
 
 
 # ---------------------------------------------------------------------------
+# load_pretrain_weights — trust propagation
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPretrainWeightsTrustPropagation:
+    """Verify the ``trust`` kwarg reaches ``_safe_torch_load`` unchanged.
+
+    Regression coverage for a gap where ``RFDETR.from_checkpoint(path, trust_checkpoint=True)`` bypassed the safe-load
+    check only for its own metadata read, then silently reverted to ``trust=False`` when the constructed model reloaded
+    the same file here — making ``trust_checkpoint=True`` inert for any checkpoint that actually needed it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_io(self, monkeypatch):
+        monkeypatch.setattr("rfdetr.models.weights.download_pretrain_weights", lambda *a, **kw: None)
+        monkeypatch.setattr("rfdetr.models.weights.validate_pretrain_weights", lambda *a, **kw: None)
+        monkeypatch.setattr("rfdetr.models.weights.validate_checkpoint_compatibility", lambda *a, **kw: None)
+        monkeypatch.setattr("rfdetr.models.weights.os.path.isfile", lambda _: True)
+
+    def test_trust_true_forwarded_to_safe_torch_load(self):
+        """load_pretrain_weights(trust=True) calls _safe_torch_load with trust=True."""
+        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu")
+        checkpoint = _make_checkpoint(num_classes=91)
+
+        with patch("rfdetr.utilities.io._safe_torch_load", return_value=checkpoint) as mock_load:
+            from rfdetr.models.weights import load_pretrain_weights
+
+            load_pretrain_weights(_fake_nn_model(), mc, trust=True)
+
+        mock_load.assert_called_once_with(mc.pretrain_weights, trust=True)
+
+    def test_trust_defaults_to_false(self):
+        """load_pretrain_weights without a trust kwarg calls _safe_torch_load with trust=False."""
+        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu")
+        checkpoint = _make_checkpoint(num_classes=91)
+
+        with patch("rfdetr.utilities.io._safe_torch_load", return_value=checkpoint) as mock_load:
+            from rfdetr.models.weights import load_pretrain_weights
+
+            load_pretrain_weights(_fake_nn_model(), mc)
+
+        mock_load.assert_called_once_with(mc.pretrain_weights, trust=False)
+
+
+# ---------------------------------------------------------------------------
 # load_pretrain_weights — PTL .ckpt format
 # ---------------------------------------------------------------------------
 
@@ -617,6 +683,10 @@ def _labelled_query_tensor(num_queries: int, group_detr: int, dim: int = 2) -> t
 
     This lets tests check the per-group ordering of the result without floating-point
     fuzz: the first column carries the (group, query) identity directly.
+
+    Examples:
+        >>> _labelled_query_tensor(2, 2, dim=1).squeeze(-1).tolist()
+        [0.0, 1.0, 100.0, 101.0]
     """
     rows = []
     for g in range(group_detr):
@@ -1070,6 +1140,37 @@ class TestPartialLoadDetector:
         _warn_on_partial_load(result, "/fake/weights.pth")
         assert len(captured) == 1
         assert "not consumed by model" in captured[0]
+
+    def test_removed_keypoint_projection_keys_do_not_warn(self, captured):
+        """Legacy keypoint projection tensors are intentionally ignored during partial-load checks."""
+        result = SimpleNamespace(
+            missing_keys=[],
+            unexpected_keys=[
+                "keypoint_head.keypoint_proj.0.weight",
+                "keypoint_head.keypoint_proj.0.bias",
+                "keypoint_head.keypoint_proj.2.weight",
+                "keypoint_head.keypoint_proj.2.bias",
+            ],
+        )
+        _warn_on_partial_load(result, "/fake/weights.pth")
+        assert captured == []
+
+    def test_removed_keypoint_projection_keys_do_not_mask_other_unexpected_keys(self, captured):
+        """Only the removed keypoint projection tensors are filtered from the partial-load warning."""
+        result = SimpleNamespace(
+            missing_keys=[],
+            unexpected_keys=[
+                "keypoint_head.keypoint_proj.0.weight",
+                "keypoint_head.keypoint_proj.0.bias",
+                "keypoint_head.keypoint_proj.2.weight",
+                "keypoint_head.keypoint_proj.2.bias",
+                "backbone.0.encoder.legacy_module.weight",
+            ],
+        )
+        _warn_on_partial_load(result, "/fake/weights.pth")
+        assert len(captured) == 1
+        assert "legacy_module" in captured[0]
+        assert "keypoint_proj" not in captured[0]
 
     def test_handles_non_iterable_input_gracefully(self, captured):
         """A MagicMock-style result (used in many existing tests) must not raise."""

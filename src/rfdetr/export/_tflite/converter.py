@@ -64,12 +64,14 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Generator, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
+from rfdetr.export._resize import _bilinear_resize_half_pixel
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -435,7 +437,7 @@ def _replace_gridsample_for_tflite(onnx_path: Path, output_dir: Path) -> Path:
     except ImportError as exc:
         raise ImportError(
             "onnx and onnx_graphsurgeon are required for the GridSample TFLite "
-            "patch.  Install with: pip install rfdetr[onnx,tflite]"
+            "patch.  Install with: pip install rfdetr[tflite]"
         ) from exc
 
     model = onnx.load(str(onnx_path))
@@ -481,9 +483,8 @@ def _check_onnx2tf_available() -> None:
         import onnx2tf  # noqa: F401
     except ImportError as exc:
         raise ImportError(
-            "onnx2tf is not installed. TFLite export requires both ONNX and "
-            "TFLite export dependencies. Install them with: "
-            "pip install rfdetr[onnx,tflite]"
+            "onnx2tf is not installed. TFLite export requires the tflite extra. "
+            "Install it with: pip install rfdetr[tflite]"
         ) from exc
 
     from importlib.metadata import PackageNotFoundError as _PkgNotFound
@@ -511,6 +512,11 @@ def _check_onnx2tf_available() -> None:
         )
 
 
+# Serializes the global ``np.load`` monkey-patch below so concurrent conversions in the
+# same process cannot clobber each other's patch/restore cycle.
+_NUMPY_LOAD_PATCH_LOCK = threading.Lock()
+
+
 @contextlib.contextmanager
 def _numpy_allow_pickle() -> Generator[None, None, None]:
     """Temporarily patch :func:`numpy.load` to set ``allow_pickle=True``.
@@ -519,19 +525,21 @@ def _numpy_allow_pickle() -> Generator[None, None, None]:
     1.16.3 defaults that flag to ``False`` and raises :class:`ValueError` for pickled files.
 
     This context manager monkey-patches ``np.load`` for the duration of the ``onnx2tf`` conversion and restores the
-    original afterwards.
+    original afterwards.  Because ``np.load`` is process-global, the patch/restore cycle is guarded by a module-level
+    lock so it is safe when multiple conversions run on separate threads.
     """
-    _original_load = np.load
+    with _NUMPY_LOAD_PATCH_LOCK:
+        _original_load = np.load
 
-    def _patched_load(*args: Any, **kwargs: Any) -> Any:
-        kwargs.setdefault("allow_pickle", True)
-        return _original_load(*args, **kwargs)
+        def _patched_load(*args: Any, **kwargs: Any) -> Any:
+            kwargs.setdefault("allow_pickle", True)
+            return _original_load(*args, **kwargs)
 
-    np.load = _patched_load  # type: ignore[assignment,unused-ignore]
-    try:
-        yield
-    finally:
-        np.load = _original_load  # type: ignore[assignment,unused-ignore]
+        np.load = _patched_load  # type: ignore[assignment,unused-ignore]
+        try:
+            yield
+        finally:
+            np.load = _original_load  # type: ignore[assignment,unused-ignore]
 
 
 @contextlib.contextmanager
@@ -559,12 +567,12 @@ def _patch_validation_download(npy_path: str) -> Generator[None, None, None]:
             NHWC format.
     """
 
-    def _replacement() -> NDArray[Any]:
+    def _replacement() -> NDArray[np.float32]:
         # Calibration data prepared by _prepare_calibration_data() is always
         # a plain float32 ndarray — never pickled.  allow_pickle=False is
         # intentional here; allow_pickle=True is handled by _numpy_allow_pickle()
         # for onnx2tf's own internal np.load calls.
-        return cast(NDArray[Any], np.load(npy_path, allow_pickle=False))
+        return cast(NDArray[np.float32], np.load(npy_path, allow_pickle=False))
 
     originals: dict[str, Any] = {}
     modules = [
@@ -629,9 +637,13 @@ def _load_calibration_images(
     arrays: list[NDArray[np.float32]] = []
     for img_path in image_paths:
         try:
-            img = Image.open(img_path).convert("RGB").resize((width, height))
-            image_array = np.asarray(img, dtype=np.float32)
-            image_array /= np.float32(255.0)
+            with Image.open(img_path) as _img:
+                img = _img.convert("RGB")
+            # Resize with predict()'s convention (bilinear, half-pixel, no antialias) so the INT8
+            # calibration ranges come from the same pixel distribution the model sees at inference.
+            # PIL's default resize (BICUBIC + adaptive antialias) diverges from that distribution.
+            chw = np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / np.float32(255.0)
+            image_array = _bilinear_resize_half_pixel(chw, height, width).transpose(1, 2, 0)
             arrays.append(image_array)
         except Exception:
             logger.debug(f"Skipping unreadable image: {img_path}")
@@ -657,9 +669,8 @@ def _get_onnx_input_info(onnx_path: Path) -> tuple[str, list[int]]:
         import onnx
     except ImportError as exc:
         raise ImportError(
-            "onnx is not installed. TFLite export requires both ONNX and "
-            "TFLite export dependencies. Install them with: "
-            "pip install rfdetr[onnx,tflite]"
+            "onnx is not installed. TFLite export requires the tflite extra. "
+            "Install it with: pip install rfdetr[tflite]"
         ) from exc
 
     model = onnx.load(str(onnx_path))
@@ -671,7 +682,7 @@ def _get_onnx_input_info(onnx_path: Path) -> tuple[str, list[int]]:
 
 def _prepare_calibration_data(
     onnx_path: Path,
-    calibration_data: str | os.PathLike[str] | np.ndarray | None,
+    calibration_data: str | os.PathLike[str] | NDArray[np.float32] | None,
     output_dir: Path,
     quantization: str | None,
     max_images: int = _DEFAULT_DIR_CALIB_SAMPLES,
@@ -749,6 +760,24 @@ def _prepare_calibration_data(
     return npy_path
 
 
+def _rename_precision_outputs(output_dir: Path, model_stem: str) -> None:
+    """Rename onnx2tf's hardcoded ``_float32``/``_float16`` outputs to the ``_fp32``/``_fp16`` tokens.
+
+    ``onnx2tf`` always writes ``{model_stem}_float32.tflite`` and ``{model_stem}_float16.tflite`` — that
+    naming is internal to the library and not configurable. Rename both (when present) so the RF-DETR
+    export surface uses the same ``fp32``/``fp16`` vocabulary as the ONNX/CoreML/ExecuTorch/TensorRT
+    backends. Missing files (e.g. onnx2tf skipped one precision on a given run) are silently ignored.
+
+    Args:
+        output_dir: Directory onnx2tf wrote its ``.tflite`` outputs to.
+        model_stem: Stem of the (possibly GridSample-patched) ONNX file passed to onnx2tf.
+    """
+    for old_token, new_token in (("float32", "fp32"), ("float16", "fp16")):
+        old_path = output_dir / f"{model_stem}_{old_token}.tflite"
+        if old_path.is_file():
+            old_path.replace(output_dir / f"{model_stem}_{new_token}.tflite")
+
+
 def _quantize_dynamic_range(saved_model_dir: Path, model_stem: str) -> Path:
     """Build a dynamic-range INT8 TFLite model from the onnx2tf SavedModel.
 
@@ -774,7 +803,7 @@ def export_tflite(
     onnx_path: str | os.PathLike[str],
     output_dir: str | os.PathLike[str],
     quantization: str | None = None,
-    calibration_data: str | os.PathLike[str] | np.ndarray | None = None,
+    calibration_data: str | os.PathLike[str] | NDArray[np.float32] | None = None,
     verbosity: str = "error",
     max_images: int = _DEFAULT_DIR_CALIB_SAMPLES,
     *,
@@ -787,8 +816,10 @@ def export_tflite(
     Args:
         onnx_path: Path to the source ``.onnx`` file.
         output_dir: Directory where TFLite artifacts will be written.
-            ``onnx2tf`` creates ``{stem}_float32.tflite`` and ``{stem}_float16.tflite``.  When ``quantization="int8"`` a
-            ``{stem}_dynamic_range_quant.tflite`` is additionally written.
+            ``onnx2tf`` creates ``{stem}_float32.tflite`` and ``{stem}_float16.tflite`` (its own hardcoded
+            naming); both are renamed to ``{stem}_fp32.tflite`` / ``{stem}_fp16.tflite`` to match the naming
+            used by the other export backends.  When ``quantization="int8"`` a ``{stem}_dynamic_range_quant.tflite``
+            is additionally written.
         quantization: Quantization mode.
 
             * ``None`` / ``"fp32"`` / ``"fp16"`` — FP32 + FP16 output
@@ -816,9 +847,10 @@ def export_tflite(
             (silent).
 
     Returns:
-        Path to the primary artifact.  ``onnx2tf`` always writes both ``{stem}_float32.tflite`` and
-        ``{stem}_float16.tflite`` to *output_dir*; ``quantization="int8"`` adds ``{stem}_dynamic_range_quant.tflite``.
-        The returned path is the dynamic-range file for ``int8``, otherwise the float32 file.
+        Path to the primary artifact.  ``onnx2tf`` always writes both an FP32 and FP16 model (renamed to
+        ``{stem}_fp32.tflite`` / ``{stem}_fp16.tflite``) to *output_dir*; ``quantization="int8"`` adds
+        ``{stem}_dynamic_range_quant.tflite``. The returned path is the dynamic-range file for ``int8``,
+        otherwise the fp32 file.
 
     Raises:
         FileNotFoundError: If *onnx_path* does not exist or
@@ -879,7 +911,7 @@ def export_tflite(
         logger.warning(
             "GridSample TFLite patch skipped — onnx/onnx_graphsurgeon not available (%s). "
             "TFLite inference may produce incorrect scores if the model contains GridSample nodes. "
-            "Install with: pip install rfdetr[onnx,tflite]",
+            "Install with: pip install rfdetr[tflite]",
             exc,
         )
 
@@ -955,13 +987,19 @@ def export_tflite(
     # reflects that new name and must match the TFLite files onnx2tf created.
     model_stem = onnx_path.stem
 
+    # onnx2tf always writes both "{stem}_float32.tflite" and "{stem}_float16.tflite"
+    # (its own hardcoded naming, regardless of the requested quantization mode) — rename
+    # to the RF-DETR-wide "fp32"/"fp16" token before either return path below, so both
+    # files carry the same vocabulary as the other export backends.
+    _rename_precision_outputs(output_dir, model_stem)
+
     if quantization == "int8":
         # Dynamic-range INT8; static full-integer INT8 is rejected as unsupported.
         primary = _quantize_dynamic_range(output_dir, model_stem)
         logger.info(f"TFLite model exported to: {primary}")
         return primary
 
-    primary = output_dir / f"{model_stem}_float32.tflite"
+    primary = output_dir / f"{model_stem}_fp32.tflite"
 
     if not primary.is_file():
         # Fallback: look for any .tflite file produced from this specific ONNX stem.
@@ -971,7 +1009,7 @@ def export_tflite(
         if tflite_files:
             primary = tflite_files[0]
             logger.warning(
-                f"Expected TFLite output {output_dir / f'{model_stem}_float32.tflite'} not found; "
+                f"Expected TFLite output {output_dir / f'{model_stem}_fp32.tflite'} not found; "
                 f"searched for '{model_stem}_*.tflite' in {output_dir} and using {primary.name} instead. "
                 "The returned model may have a different dtype (e.g. int8) than the caller expects."
             )

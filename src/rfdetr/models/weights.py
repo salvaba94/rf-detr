@@ -303,7 +303,7 @@ def load_pretrain_weights(
         mc.pretrain_weights = pretrain_weights
     class_names: List[str] = []
 
-    from rfdetr.util.io import _safe_torch_load
+    from rfdetr.utilities.io import _safe_torch_load
 
     # Download first (no-op if already present and hash is valid).
     download_pretrain_weights(pretrain_weights)

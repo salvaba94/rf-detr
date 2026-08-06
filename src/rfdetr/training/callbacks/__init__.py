@@ -10,6 +10,7 @@ from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
 from rfdetr.training.callbacks.dataset_grids import DatasetGridCallback, PredictionGridCallback
 from rfdetr.training.callbacks.drop_schedule import DropPathCallback
 from rfdetr.training.callbacks.ema import RFDETREMACallback
+from rfdetr.training.callbacks.gpu_memory_progress_bar import GPUMemoryRichProgressBar, GPUMemoryTQDMProgressBar
 from rfdetr.training.callbacks.mlflow import MLFlowSystemMonitorCallback, RFDETRMLflowArtifactCallback
 
 __all__ = [
@@ -17,6 +18,8 @@ __all__ = [
     "COCOEvalCallback",
     "DatasetGridCallback",
     "DropPathCallback",
+    "GPUMemoryRichProgressBar",
+    "GPUMemoryTQDMProgressBar",
     "MLFlowSystemMonitorCallback",
     "PredictionGridCallback",
     "RFDETREMACallback",

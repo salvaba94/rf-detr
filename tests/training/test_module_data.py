@@ -27,14 +27,26 @@ from rfdetr.utilities.tensors import NestedTensor
 
 
 def _base_model_config(**overrides):
-    """Return a minimal RFDETRBaseConfig with pretrain_weights disabled."""
+    """Return a minimal RFDETRBaseConfig with pretrain_weights disabled.
+
+    Examples:
+        >>> config = _base_model_config(num_classes=7)
+        >>> config.device, config.num_classes, config.pretrain_weights
+        ('cpu', 7, None)
+    """
     defaults = dict(pretrain_weights=None, device="cpu", num_classes=5)
     defaults.update(overrides)
     return RFDETRBaseConfig(**defaults)
 
 
 def _base_train_config(tmp_path=None, **overrides):
-    """Return a minimal TrainConfig suitable for unit tests."""
+    """Return a minimal TrainConfig suitable for unit tests.
+
+    Examples:
+        >>> config = _base_train_config(batch_size=4)
+        >>> config.batch_size, config.dataset_dir.endswith("dataset"), config.output_dir.endswith("output")
+        (4, True, True)
+    """
     dataset_dir = str(tmp_path / "dataset") if tmp_path else "/nonexistent/dataset"
     output_dir = str(tmp_path / "output") if tmp_path else "/nonexistent/output"
     defaults = dict(
@@ -45,7 +57,7 @@ def _base_train_config(tmp_path=None, **overrides):
         lr_encoder=1.5e-4,
         batch_size=2,
         weight_decay=1e-4,
-        lr_drop=8,
+        lr_scheduler_kwargs={"lr_drop": 8},
         warmup_epochs=1.0,
         drop_path=0.0,
         multi_scale=False,
@@ -84,7 +96,13 @@ class _FakeDataset(torch.utils.data.Dataset):
 
 
 def _fake_dataset(length: int = 100, with_coco: bool = False) -> _FakeDataset:
-    """Return a minimal ``_FakeDataset`` with a controllable length."""
+    """Return a minimal ``_FakeDataset`` with a controllable length.
+
+    Examples:
+        >>> dataset = _fake_dataset(length=3, with_coco=True)
+        >>> len(dataset), dataset.coco.cats[1]["name"]
+        (3, 'cat')
+    """
     return _FakeDataset(length, with_coco)
 
 
@@ -109,7 +127,13 @@ class _VisualDataset(torch.utils.data.Dataset):
 
 
 def _make_batch(batch_size: int = 2, channels: int = 3, h: int = 16, w: int = 16):
-    """Build a ``(NestedTensor, targets)`` tuple for transfer_batch_to_device tests."""
+    """Build a ``(NestedTensor, targets)`` tuple for transfer_batch_to_device tests.
+
+    Examples:
+        >>> samples, targets = _make_batch(batch_size=2, h=8, w=8)
+        >>> samples.tensors.shape, len(targets)
+        (torch.Size([2, 3, 8, 8]), 2)
+    """
     tensors = torch.randn(batch_size, channels, h, w)
     mask = torch.zeros(batch_size, h, w, dtype=torch.bool)
     samples = NestedTensor(tensors, mask)
@@ -126,7 +150,13 @@ def _make_batch(batch_size: int = 2, channels: int = 3, h: int = 16, w: int = 16
 
 
 def _build_datamodule(model_config=None, train_config=None, tmp_path=None):
-    """Construct RFDETRDataModule (build_dataset is not called at init time)."""
+    """Construct RFDETRDataModule (build_dataset is not called at init time).
+
+    Examples:
+        >>> datamodule = _build_datamodule()
+        >>> datamodule.model_config.device, datamodule.train_config.batch_size
+        ('cpu', 2)
+    """
     mc = model_config or _base_model_config()
     tc = train_config or _base_train_config(tmp_path)
     from rfdetr.training.module_data import RFDETRDataModule
@@ -1094,18 +1124,13 @@ class TestBackendResolution:
 
     def test_auto_no_kornia_falls_back_to_cpu(self, tmp_path):
         """Auto + CUDA available but kornia not installed: fallback to CPU."""
+        from rfdetr.config import AugmentationBackend
+
         dm = self._build_dm_with_backend(tmp_path, "auto")
-
-        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-
-        def _mock_import(name, *args, **kwargs):
-            if name == "kornia" or name.startswith("kornia."):
-                raise ImportError("No module named 'kornia'")
-            return original_import(name, *args, **kwargs)
 
         with (
             patch("rfdetr.training.module_data._has_cuda_device", return_value=True),
-            patch("builtins.__import__", side_effect=_mock_import),
+            patch.object(AugmentationBackend, "_is_kornia_available", return_value=False),
         ):
             dm = self._setup_with_mock_build(dm)
 
@@ -1124,19 +1149,14 @@ class TestBackendResolution:
 
     def test_gpu_no_kornia_raises_import_error(self, tmp_path):
         """Gpu + CUDA but no kornia: must raise ImportError with install hint."""
+        from rfdetr.config import AugmentationBackend
+
         dm = self._build_dm_with_backend(tmp_path, "gpu")
-
-        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-
-        def _mock_import(name, *args, **kwargs):
-            if name == "kornia" or name.startswith("kornia."):
-                raise ImportError("No module named 'kornia'")
-            return original_import(name, *args, **kwargs)
 
         with (
             patch("rfdetr.training.module_data._has_cuda_device", return_value=True),
-            patch("builtins.__import__", side_effect=_mock_import),
-            pytest.raises(ImportError, match="rfdetr\\[kornia\\]"),
+            patch.object(AugmentationBackend, "_is_kornia_available", return_value=False),
+            pytest.raises(ImportError, match="rfdetr\\[augment\\]"),
         ):
             self._setup_with_mock_build(dm)
 
@@ -1148,9 +1168,9 @@ class TestBackendResolution:
 
     def test_gpu_path_uses_aug_config_fallback(self, tmp_path):
         """When aug_config=None (default), GPU path passes AUG_CONFIG to build_kornia_pipeline."""
-        import sys
         from unittest.mock import MagicMock, patch
 
+        from rfdetr.config import AugmentationBackend
         from rfdetr.datasets.aug_configs import AUG_CONFIG
 
         dm = self._build_dm_with_backend(tmp_path, "auto")
@@ -1165,7 +1185,7 @@ class TestBackendResolution:
         with (
             patch("rfdetr.training.module_data._has_cuda_device", return_value=True),
             patch("rfdetr.training.module_data.build_dataset", side_effect=lambda *a, **k: _fake_dataset(10)),
-            patch.dict(sys.modules, {"kornia": MagicMock(), "kornia.augmentation": MagicMock()}),
+            patch.object(AugmentationBackend, "_is_kornia_available", return_value=True),
             patch("rfdetr.datasets.kornia_transforms.build_kornia_pipeline", side_effect=_fake_build_kornia),
             patch("rfdetr.datasets.kornia_transforms.build_normalize", return_value=MagicMock()),
         ):
@@ -1195,25 +1215,6 @@ class TestBackendResolution:
         assert captured_gpu_postprocess.get("train") == "cpu", (
             "auto + no CUDA must resolve to cpu before dataset build to preserve CPU Normalize"
         )
-
-    def test_resolve_augmentation_backend_auto_no_cuda(self):
-        """_resolve_augmentation_backend returns 'cpu' for auto when CUDA is absent."""
-        from rfdetr.training.module_data import _resolve_augmentation_backend
-
-        with patch("rfdetr.training.module_data._has_cuda_device", return_value=False):
-            assert _resolve_augmentation_backend("auto") == "cpu"
-
-    def test_resolve_augmentation_backend_cpu_passthrough(self):
-        """_resolve_augmentation_backend passes 'cpu' through unchanged."""
-        from rfdetr.training.module_data import _resolve_augmentation_backend
-
-        assert _resolve_augmentation_backend("cpu") == "cpu"
-
-    def test_resolve_augmentation_backend_gpu_passthrough(self):
-        """_resolve_augmentation_backend passes 'gpu' through unchanged."""
-        from rfdetr.training.module_data import _resolve_augmentation_backend
-
-        assert _resolve_augmentation_backend("gpu") == "gpu"
 
 
 # ---------------------------------------------------------------------------
@@ -1501,3 +1502,57 @@ class TestKorniaSetupDoneSentinel:
             dm.setup("fit")
 
         assert call_count == 1, f"_setup_kornia_pipeline called {call_count} times; expected exactly 1"
+
+
+class TestWorkerInitFn:
+    """DataLoaders seed NumPy/random per worker so augmentation streams are not duplicated across workers."""
+
+    def test_worker_init_fn_seeds_from_torch_initial_seed(self, monkeypatch):
+        """_worker_init_fn derives a reproducible NumPy/random seed from ``torch.initial_seed``."""
+        import random as py_random
+
+        import numpy as np
+
+        from rfdetr.training.module_data import _worker_init_fn
+
+        monkeypatch.setattr(torch, "initial_seed", lambda: 12345)
+        _worker_init_fn(0)
+        first = (float(np.random.rand()), py_random.random())
+
+        # worker_id is irrelevant; the seed is derived from torch's per-worker seed.
+        monkeypatch.setattr(torch, "initial_seed", lambda: 12345)
+        _worker_init_fn(3)
+        second = (float(np.random.rand()), py_random.random())
+
+        assert first == second
+
+    @pytest.mark.parametrize(
+        "loader_name",
+        [
+            pytest.param("val_dataloader", id="val"),
+            pytest.param("test_dataloader", id="test"),
+            pytest.param("predict_dataloader", id="predict"),
+        ],
+    )
+    def test_eval_dataloaders_set_worker_init_fn(self, build_datamodule, loader_name):
+        """Validation/test/predict DataLoaders wire the module-level worker seeding hook."""
+        from rfdetr.training.module_data import _worker_init_fn
+
+        dm = build_datamodule()
+        dm._dataset_val = _fake_dataset()
+        dm._dataset_test = _fake_dataset()
+
+        loader = getattr(dm, loader_name)()
+
+        assert loader.worker_init_fn is _worker_init_fn
+
+    def test_train_dataloader_sets_worker_init_fn(self, build_datamodule):
+        """The training DataLoader wires the module-level worker seeding hook."""
+        from rfdetr.training.module_data import _worker_init_fn
+
+        dm = build_datamodule()
+        dm._dataset_train = _fake_dataset()
+
+        loader = dm.train_dataloader()
+
+        assert loader.worker_init_fn is _worker_init_fn

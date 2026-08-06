@@ -4,11 +4,14 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
+from collections.abc import Callable
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
+from torchvision.ops import box_iou
 
 from rfdetr.evaluation.matching import (
     _compute_mask_iou,
@@ -185,6 +188,92 @@ class TestMatchSingleClass:
         assert matches[0] == 1
         assert total_gt == 1
 
+    @staticmethod
+    def _reference_greedy_match(
+        order: list[int],
+        iou_matrix: torch.Tensor,
+        gt_crowd: torch.Tensor,
+        iou_threshold: float,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """Naive, independently-written greedy matcher used as a ground-truth oracle.
+
+        Reimplements the COCO greedy-matching contract directly from spec with plain Python
+        loops and no shared code with ``_match_single_class`` (no numpy vectorization, no
+        hoisted crowd mask) — a divergence in the optimized/numpy-ported implementation (e.g. a
+        tie-break or crowd-handling regression) will disagree with this reference instead of
+        silently agreeing with itself.
+
+        Args:
+            order: Detection indices into ``iou_matrix``'s rows, in descending-score order.
+            iou_matrix: Pairwise IoU, ``[n_preds, n_gt]``, rows in original (unsorted) order.
+            gt_crowd: Bool tensor ``[n_gt]``, ``True`` for crowd instances.
+            iou_threshold: Minimum IoU to count as a positive match.
+
+        Returns:
+            Tuple ``(matches, ignore, total_gt)`` aligned to ``order``.
+        """
+        n_gt = iou_matrix.shape[1]
+        gt_matched = [False] * n_gt
+        matches = np.zeros(len(order), dtype=np.int64)
+        ignore = np.zeros(len(order), dtype=np.bool_)
+        for out_i, orig_i in enumerate(order):
+            best_iou, best_gt = -1.0, -1
+            for j in range(n_gt):
+                if gt_crowd[j] or gt_matched[j]:
+                    continue
+                iou = float(iou_matrix[orig_i, j])
+                if iou > best_iou:
+                    best_iou, best_gt = iou, j
+            if best_gt != -1 and best_iou >= iou_threshold:
+                matches[out_i] = 1
+                gt_matched[best_gt] = True
+                continue
+            for j in range(n_gt):
+                if gt_crowd[j] and float(iou_matrix[orig_i, j]) >= iou_threshold:
+                    ignore[out_i] = True
+                    break
+        total_gt = int((~gt_crowd.numpy()).sum())
+        return matches, ignore, total_gt
+
+    def test_greedy_loop_does_not_sync_a_tensor_per_detection(self) -> None:
+        """Regression test for #416: the per-detection greedy loop must not force one device-to-host tensor sync
+        (``Tensor.__bool__``) per detection, and the numpy-ported matching output must agree with an independent
+        reference implementation of the same algorithm at scale (matches/ignore/total_gt) — the sync-count assert alone
+        cannot catch a logic regression in the torch->numpy port (e.g. a tie-break or crowd-handling change)."""
+        n, m = 50, 10
+        scores = torch.rand(n)
+        preds = torch.rand(n, 4) * 100
+        preds[:, 2:] += preds[:, :2] + 1.0
+        gts = torch.rand(m, 4) * 100
+        gts[:, 2:] += gts[:, :2] + 1.0
+        gt_crowd = torch.zeros(m, dtype=torch.bool)
+        gt_crowd[:3] = True  # exercise the crowd/ignore branch at scale, not just n<=3 cases
+
+        call_count = 0
+        orig_bool = torch.Tensor.__bool__
+
+        def counting_bool(self: torch.Tensor) -> bool:
+            nonlocal call_count
+            call_count += 1
+            return orig_bool(self)
+
+        with patch.object(torch.Tensor, "__bool__", counting_bool):
+            scores_out, matches, ignore, total_gt = self._run(scores, preds, gts, gt_crowd=gt_crowd)
+
+        assert call_count < n, (
+            f"_match_single_class triggered {call_count} tensor->bool syncs for n={n} "
+            "detections; expected O(1) syncs, not O(n) — the greedy loop should operate "
+            "on host data, not per-iteration device tensor comparisons"
+        )
+
+        order = torch.argsort(scores, descending=True).tolist()
+        iou_matrix = box_iou(preds, gts)
+        ref_matches, ref_ignore, ref_total_gt = self._reference_greedy_match(order, iou_matrix, gt_crowd, 0.5)
+        assert list(scores_out) == pytest.approx(scores[order].tolist())
+        assert np.array_equal(matches, ref_matches)
+        assert np.array_equal(ignore, ref_ignore)
+        assert total_gt == ref_total_gt
+
 
 # ---------------------------------------------------------------------------
 # build_matching_data
@@ -339,6 +428,127 @@ class TestBuildMatchingData:
         assert result[99]["total_gt"] == 0
         assert result[99]["matches"][0] == 0
 
+    def test_crowd_gt_without_predictions_is_not_counted(self) -> None:
+        """Crowd GTs of a class with no predictions must stay out of total_gt."""
+        pred = self._make_pred([[0, 0, 10, 10]], [0.9], [0])
+        target = self._make_target(
+            [[0, 0, 10, 10], [50, 50, 60, 60], [70, 70, 80, 80]],
+            [0, 7, 7],
+            iscrowd=[0, 1, 0],
+        )
+        result = build_matching_data([pred], [target])
+        assert result[7]["total_gt"] == 1
+        assert len(result[7]["scores"]) == 0
+        assert result[0]["total_gt"] == 1
+
+    def test_iscrowd_length_mismatch_raises(self) -> None:
+        """An ``iscrowd`` that does not line up with ``labels`` must be rejected, not counted."""
+        pred = self._make_pred([[0, 0, 10, 10]], [0.9], [0])
+        target = self._make_target([[0, 0, 10, 10], [50, 50, 60, 60]], [0, 7], iscrowd=[0])
+        with pytest.raises(ValueError, match="one entry per GT label"):
+            build_matching_data([pred], [target])
+
+    def test_iscrowd_length_mismatch_raises_on_image_without_classes(self) -> None:
+        """The mismatch is rejected even on an image with no labels and no predictions to loop over."""
+        pred = self._make_pred([], [], [])
+        target = self._make_target([], [], iscrowd=[1])
+        with pytest.raises(ValueError, match="one entry per GT label"):
+            build_matching_data([pred], [target])
+
+    @pytest.mark.parametrize(
+        "iscrowd",
+        [
+            pytest.param(torch.zeros(2, 1, dtype=torch.int64), id="column-vector"),
+            pytest.param(torch.tensor(0, dtype=torch.int64), id="scalar"),
+        ],
+    )
+    def test_iscrowd_with_wrong_rank_raises(self, iscrowd: torch.Tensor) -> None:
+        """An ``iscrowd`` of the right length but the wrong rank must be rejected, not silently applied.
+
+        A ``[M, 1]`` tensor passes a length-only check, and then every row is a non-empty list and therefore truthy, so
+        each GT of a class without predictions would drop out of ``total_gt``.
+        """
+        pred = self._make_pred([[0, 0, 10, 10]], [0.9], [0])
+        target = self._make_target([[0, 0, 10, 10], [50, 50, 60, 60]], [0, 7])
+        target["iscrowd"] = iscrowd
+        with pytest.raises(ValueError, match="one entry per GT label"):
+            build_matching_data([pred], [target])
+
+    @pytest.mark.parametrize("num_classes", [pytest.param(40, id="40-classes"), pytest.param(80, id="80-classes")])
+    @pytest.mark.parametrize(
+        ("with_preds", "with_gts", "expected_matches", "expected_total_gt"),
+        [
+            pytest.param(True, True, [1], 1, id="preds-and-gts"),
+            pytest.param(False, True, [], 1, id="gt-only-classes"),
+            pytest.param(True, False, [0], 0, id="pred-only-classes"),
+        ],
+    )
+    def test_does_not_sync_a_tensor_per_class(
+        self,
+        num_classes: int,
+        with_preds: bool,
+        with_gts: bool,
+        expected_matches: list[int],
+        expected_total_gt: int,
+    ) -> None:
+        """Regression test: the per-class loop must not force a scalar device-to-host read per class per image — that
+        turns an O(1) per-image cost into O(num_classes), which dominates wall time on datasets with hundreds of classes
+        (e.g. COCO's 80). The branch cases cover the three exits of the loop, each of which used to sync: the matcher
+        path, the ``n_pred == 0`` path (which synced a third time on the non-crowd GT count), and ``n_gt == 0``.
+
+        Two properties are asserted, both exact rather than bounds and both at two class counts, so
+        that neither a per-class sync nor a fraction of one can creep back in:
+
+        1. every scalar read out of a tensor (``item``/``__bool__``/``__int__``/``__float__``/
+           ``__index__``) is gone, not just ``item()``;
+        2. the bulk reads that remain (``tolist``) are exactly three per image — the pred labels, the
+           GT labels and ``iscrowd`` — and do not grow with the class count.
+
+        Not covered: ``_match_single_class`` still moves its own scores and IoUs to host with
+        ``.cpu()/.numpy()`` once per class that has detections. That is pre-existing and untouched
+        here; this test fixes the cost of the classes that never reach the matcher.
+        """
+        # One pred and one GT per class, on a per-image diagonal grid so each parametrized case
+        # drives every class down the same branch.
+        boxes = [[i * 20, i * 20, i * 20 + 10, i * 20 + 10] for i in range(num_classes)]
+        labels = list(range(num_classes))
+        pred = self._make_pred(boxes, [0.9] * num_classes, labels) if with_preds else self._make_pred([], [], [])
+        target = self._make_target(boxes, labels) if with_gts else self._make_target([], [])
+
+        scalar_reads = ["item", "__bool__", "__int__", "__float__", "__index__"]
+        counts: dict[str, int] = dict.fromkeys([*scalar_reads, "tolist"], 0)
+        originals = {name: getattr(torch.Tensor, name) for name in counts}
+
+        def make_counter(name: str) -> Callable[..., object]:
+            original = originals[name]
+
+            def counting(self: torch.Tensor, *args: object, **kwargs: object) -> object:
+                counts[name] += 1
+                return original(self, *args, **kwargs)
+
+            return counting
+
+        with ExitStack() as stack:
+            for name in counts:
+                stack.enter_context(patch.object(torch.Tensor, name, make_counter(name)))
+            result = build_matching_data([pred], [target])
+
+        synced = {name: counts[name] for name in scalar_reads if counts[name]}
+        assert not synced, (
+            f"build_matching_data triggered scalar tensor->host reads {synced} for "
+            f"num_classes={num_classes}; the per-class counts come from the host-side label lists, "
+            "so no branch of the loop should read a scalar out of a tensor at all"
+        )
+        assert counts["tolist"] == 3, (
+            f"build_matching_data called Tensor.tolist() {counts['tolist']} times for "
+            f"num_classes={num_classes}; it must be exactly three per image (pred labels, GT labels, "
+            "iscrowd), independent of how many classes the image contains"
+        )
+        assert len(result) == num_classes
+        for class_id in range(num_classes):
+            assert result[class_id]["matches"].tolist() == expected_matches
+            assert result[class_id]["total_gt"] == expected_total_gt
+
 
 # ---------------------------------------------------------------------------
 # Helper shared by TestMergeMatchingData and TestDistributedMergeMatchingData
@@ -352,7 +562,15 @@ def _make_matching_entry(
     ignore: list,
     total_gt: int,
 ) -> dict:
-    """Return a compact matching dict as produced by ``build_matching_data()``."""
+    """Return a compact matching dict as produced by ``build_matching_data()``.
+
+    Examples:
+        >>> entry = _make_matching_entry([0.9, 0.5], [1, -1], [False, False], 2)
+        >>> entry["total_gt"]
+        2
+        >>> [round(float(x), 3) for x in entry["scores"]]
+        [0.9, 0.5]
+    """
     return {
         "scores": np.array(scores, dtype=np.float32),
         "matches": np.array(matches, dtype=np.int64),

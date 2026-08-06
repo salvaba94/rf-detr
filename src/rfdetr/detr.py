@@ -382,7 +382,7 @@ class RFDETR:
         # Use the safe-load helper which tries weights_only=True first (with
         # legacy argparse.Namespace safe globals), falling back to full pickle
         # only when the caller explicitly passes trust_checkpoint=True.
-        from rfdetr.util.io import _safe_torch_load
+        from rfdetr.utilities.io import _safe_torch_load
 
         ckpt: dict[str, Any] = _safe_torch_load(path, trust=trust_checkpoint)
         args = ckpt["args"]

@@ -10,10 +10,11 @@ import io
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from rfdetr.models.ops.functions import ms_deform_attn_core_pytorch
 from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
-from rfdetr.models.transformer import gen_encoder_output_proposals, gen_sineembed_for_position
+from rfdetr.models.transformer import Transformer, gen_encoder_output_proposals, gen_sineembed_for_position
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +36,12 @@ def _build_ms_deform_inputs(
     levels: list[tuple[int, int]] | None = None,
 ) -> _MSDeformInputs:
     """Build minimal valid inputs for ms_deform_attn_core_pytorch.
+
+    Examples:
+        >>> value, spatial_shapes, sampling_locations, attention_weights, levels = _build_ms_deform_inputs()
+        >>> value.shape, spatial_shapes.shape, len(levels)
+        (torch.Size([1, 2, 4, 20]), torch.Size([2, 2]), 2)
+
 
     Args:
         bsz: Batch size.
@@ -329,6 +336,33 @@ class TestMSDeformAttnModule:
         bsz, len_q, _ = query.shape
         assert output.shape == (bsz, len_q, self._d_model)
 
+    def test_export_mode_forward_with_full_level_dim_and_last_dim_4(self) -> None:
+        """Export mode forward with reference_points level dim == n_levels and last dim 4 must match eager output.
+
+        Regression: test_export_mode_forward_with_hw_param only exercises the n_ref_levels==n_levels skip-branch
+        (ms_deform_attn.py:206-210) with last dim 2. This covers the sibling last-dim-4 branch combined with a
+        level dim that is already n_levels (not the singleton-broadcast case).
+        """
+        module = MSDeformAttn(
+            d_model=self._d_model, n_levels=self._n_levels, n_heads=self._n_heads, n_points=self._n_points
+        )
+        module.eval()
+        query, _, input_flatten, spatial_shapes, level_start_index, hw_pairs = self._make_module_inputs()
+        ref_pts = torch.rand(query.shape[0], query.shape[1], self._n_levels, 4)
+
+        with torch.no_grad():
+            eager_out = module(
+                query, ref_pts, input_flatten, spatial_shapes, level_start_index, input_spatial_shapes_hw=hw_pairs
+            )
+            module.export()
+            export_out = module(
+                query, ref_pts, input_flatten, spatial_shapes, level_start_index, input_spatial_shapes_hw=hw_pairs
+            )
+
+        bsz, len_q, _ = query.shape
+        assert export_out.shape == (bsz, len_q, self._d_model)
+        torch.testing.assert_close(export_out, eager_out, rtol=1e-5, atol=1e-5)
+
     def test_export_flag_set_after_export_call(self) -> None:
         """Calling .export() must set _export=True, enabling the torch._assert guard path."""
         module = MSDeformAttn(
@@ -339,6 +373,209 @@ class TestMSDeformAttnModule:
         module.export()
 
         assert module._export
+
+    @pytest.mark.parametrize(
+        "last_dim,batch_size",
+        [
+            pytest.param(4, 1, id="last-dim-4-batch-1"),
+            pytest.param(2, 1, id="last-dim-2-batch-1"),
+            pytest.param(4, 2, id="last-dim-4-batch-2"),
+        ],
+    )
+    def test_export_mode_broadcasts_singleton_level_dim(self, last_dim: int, batch_size: int) -> None:
+        """Checks export mode accepts decoder-style ``(B, Q, 1, last_dim)`` refs when ``n_levels > 1``.
+
+        Regression: the original case only covered last_dim=4 with batch_size=1. The singleton-broadcast
+        ``.expand()`` (ms_deform_attn.py:194) feeds both the last-dim-2 (ms_deform_attn.py:199-205) and
+        last-dim-4 (ms_deform_attn.py:206-210) sampling-location branches, and must also broadcast
+        correctly when batch_size > 1 since the expand only touches the level axis, not batch. This also
+        checks that gradients flow back through the ``.expand()`` view to the original singleton-shaped
+        reference_points.
+        """
+        # Use n_points > 1 so a missing expand would yield length n_points vs n_levels*n_points.
+        module = MSDeformAttn(d_model=self._d_model, n_levels=self._n_levels, n_heads=self._n_heads, n_points=2)
+        module.eval()
+        hw_pairs = self._hw_pairs
+        total_len = sum(ht * wd for ht, wd in hw_pairs)
+        num_queries = 3
+        query = torch.randn(batch_size, num_queries, self._d_model)
+        # Decoder export shape: one shared box broadcast across feature levels.
+        ref_pts = torch.rand(batch_size, num_queries, 1, last_dim, requires_grad=True)
+        input_flatten = torch.randn(batch_size, total_len, self._d_model)
+        spatial_shapes = torch.tensor(hw_pairs, dtype=torch.long)
+        starts = [sum(ht * wd for ht, wd in hw_pairs[:idx]) for idx in range(self._n_levels)]
+        level_start_index = torch.tensor(starts, dtype=torch.long)
+        assert ref_pts.shape[2] == 1
+        assert self._n_levels > 1
+
+        with torch.no_grad():
+            eager_out = module(
+                query,
+                ref_pts,
+                input_flatten,
+                spatial_shapes,
+                level_start_index,
+                input_spatial_shapes_hw=hw_pairs,
+            )
+        module.export()
+        export_out = module(
+            query,
+            ref_pts,
+            input_flatten,
+            spatial_shapes,
+            level_start_index,
+            input_spatial_shapes_hw=hw_pairs,
+        )
+
+        torch.testing.assert_close(export_out.detach(), eager_out, rtol=1e-5, atol=1e-5)
+
+        # Backward-pass check on the new `.expand()` view op (ms_deform_attn.py:194): gradients must
+        # flow back to the original singleton-shaped reference_points, not just the expanded view.
+        export_out.sum().backward()
+        assert ref_pts.grad is not None
+        assert ref_pts.grad.shape == ref_pts.shape
+
+    @pytest.mark.parametrize(
+        "last_dim",
+        [pytest.param(2, id="last-dim-2"), pytest.param(4, id="last-dim-4")],
+    )
+    def test_export_mode_single_level_config_matches_eager(self, last_dim: int) -> None:
+        """Export mode with n_levels=1 (degenerate no-op expand branch) must match eager output.
+
+        Regression: TestMSDeformAttnModule hardcodes n_levels=2 everywhere else, so the
+        ``n_ref_levels == 1`` no-op ``.expand(-1, -1, 1, -1)`` branch (ms_deform_attn.py:192-194) that
+        fires specifically when self.n_levels == 1 was never exercised.
+        """
+        hw_pairs: list[tuple[int, int]] = [(4, 4)]
+        d_model, n_heads, n_points, n_levels = 32, 4, 2, 1
+        module = MSDeformAttn(d_model=d_model, n_levels=n_levels, n_heads=n_heads, n_points=n_points)
+        module.eval()
+        total_len = sum(ht * wd for ht, wd in hw_pairs)
+        batch_size, num_queries = 1, 3
+        query = torch.randn(batch_size, num_queries, d_model)
+        ref_pts = torch.rand(batch_size, num_queries, n_levels, last_dim)
+        input_flatten = torch.randn(batch_size, total_len, d_model)
+        spatial_shapes = torch.tensor(hw_pairs, dtype=torch.long)
+        level_start_index = torch.tensor([0], dtype=torch.long)
+
+        with torch.no_grad():
+            eager_out = module(
+                query, ref_pts, input_flatten, spatial_shapes, level_start_index, input_spatial_shapes_hw=hw_pairs
+            )
+            module.export()
+            export_out = module(
+                query, ref_pts, input_flatten, spatial_shapes, level_start_index, input_spatial_shapes_hw=hw_pairs
+            )
+
+        assert export_out.shape == (batch_size, num_queries, d_model)
+        torch.testing.assert_close(export_out, eager_out, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "last_dim,n_points",
+        [
+            pytest.param(4, 1, id="last-dim-4-points-1"),
+            pytest.param(2, 1, id="last-dim-2-points-1"),
+            pytest.param(4, 2, id="last-dim-4-points-2"),
+        ],
+    )
+    def test_export_mode_rejects_invalid_reference_level_dim(self, last_dim: int, n_points: int) -> None:
+        """Checks export mode raises when reference level dim is neither 1 nor ``n_levels``.
+
+        Regression: the original case only covered last_dim=4 with n_points=1 (self._n_points). The
+        level-dim guard (ms_deform_attn.py:195-198) fires before the last-dim branch and before the
+        n_points-dependent merged axis is built, so it must also be verified with last_dim=2 and with
+        n_points>1 (which changes the size of the merged n_levels*n_points sampling axis).
+        """
+        module = MSDeformAttn(d_model=self._d_model, n_levels=self._n_levels, n_heads=self._n_heads, n_points=n_points)
+        module.export()
+        query, _, input_flatten, spatial_shapes, level_start_index, hw_pairs = self._make_module_inputs()
+        bad_ref = torch.rand(query.shape[0], query.shape[1], self._n_levels + 1, last_dim)
+
+        with pytest.raises(ValueError, match="level dim must be 1 or n_levels"):
+            module(
+                query,
+                bad_ref,
+                input_flatten,
+                spatial_shapes,
+                level_start_index,
+                input_spatial_shapes_hw=hw_pairs,
+            )
+
+    def test_eager_mode_rejects_invalid_reference_level_dim(self) -> None:
+        """Eager mode forward must raise ValueError when reference level dim is neither 1 nor n_levels.
+
+        Regression: the level-dim guard was hoisted above the export/eager split so both modes
+        reject malformed input with the same message (ms_deform_attn.py:192-198), but only the
+        export-mode path (test_export_mode_rejects_invalid_reference_level_dim) was covered.
+        """
+        module = MSDeformAttn(
+            d_model=self._d_model, n_levels=self._n_levels, n_heads=self._n_heads, n_points=self._n_points
+        )
+        query, _, input_flatten, spatial_shapes, level_start_index, hw_pairs = self._make_module_inputs()
+        bad_ref = torch.rand(query.shape[0], query.shape[1], self._n_levels + 1, 4)
+
+        with pytest.raises(ValueError, match="level dim must be 1 or n_levels"):
+            module(
+                query,
+                bad_ref,
+                input_flatten,
+                spatial_shapes,
+                level_start_index,
+                input_spatial_shapes_hw=hw_pairs,
+            )
+
+    @pytest.mark.parametrize(
+        "last_dim",
+        [pytest.param(1, id="last-dim-1"), pytest.param(3, id="last-dim-3")],
+    )
+    def test_eager_mode_rejects_invalid_reference_last_dim(self, last_dim: int) -> None:
+        """Eager mode forward must raise ValueError when reference_points last dim is neither 2 nor 4.
+
+        Regression: the ``Raises:`` docstring entry for MSDeformAttn.forward names this contract
+        explicitly (ms_deform_attn.py:233-238), but no test previously exercised it.
+        """
+        module = MSDeformAttn(
+            d_model=self._d_model, n_levels=self._n_levels, n_heads=self._n_heads, n_points=self._n_points
+        )
+        query, _, input_flatten, spatial_shapes, level_start_index, hw_pairs = self._make_module_inputs()
+        bad_ref = torch.rand(query.shape[0], query.shape[1], self._n_levels, last_dim)
+
+        with pytest.raises(ValueError, match="Last dim of reference_points must be 2 or 4"):
+            module(
+                query,
+                bad_ref,
+                input_flatten,
+                spatial_shapes,
+                level_start_index,
+                input_spatial_shapes_hw=hw_pairs,
+            )
+
+    @pytest.mark.parametrize(
+        "last_dim",
+        [pytest.param(1, id="last-dim-1"), pytest.param(3, id="last-dim-3")],
+    )
+    def test_export_mode_rejects_invalid_reference_last_dim(self, last_dim: int) -> None:
+        """Export mode forward must raise ValueError when reference_points last dim is neither 2 nor 4.
+
+        Regression: the ``Raises:`` docstring entry for MSDeformAttn.forward names this contract
+        explicitly (ms_deform_attn.py:211-216), but no test previously exercised it.
+        """
+        module = MSDeformAttn(
+            d_model=self._d_model, n_levels=self._n_levels, n_heads=self._n_heads, n_points=self._n_points
+        )
+        module.export()
+        query, _, input_flatten, spatial_shapes, level_start_index, hw_pairs = self._make_module_inputs()
+        bad_ref = torch.rand(query.shape[0], query.shape[1], self._n_levels, last_dim)
+
+        with pytest.raises(ValueError, match="Last dim of reference_points must be 2 or 4"):
+            module(
+                query,
+                bad_ref,
+                input_flatten,
+                spatial_shapes,
+                level_start_index,
+                input_spatial_shapes_hw=hw_pairs,
+            )
 
 
 class TestGenEncoderOutputProposalsDynamicBatch:
@@ -499,3 +736,444 @@ def test_ms_deform_attn_core_pytorch_export_compatible() -> None:
 
     exported = torch.export.export(module, args=(value, spatial_shapes, sampling_locations, attention_weights))
     assert exported is not None
+
+
+def test_ms_deform_attn_module_export_compatible_with_singleton_level_dim() -> None:
+    """torch.export.export must succeed on MSDeformAttn.forward with decoder-style singleton-level refs.
+
+    Regression test: TestMSDeformAttnModule.test_export_mode_broadcasts_singleton_level_dim only calls
+    module.export() and then runs the module eagerly in Python — it never traces through
+    torch.export.export itself, so the reference_points.shape[2] control-flow branch
+    (ms_deform_attn.py:192-198) was never verified under a real FakeTensor-traced export, which is
+    the actual regime the export() mode is designed for.
+    """
+    hw_pairs: list[tuple[int, int]] = [(4, 4), (2, 2)]
+    d_model, n_heads, n_levels, n_points = 32, 4, 2, 2
+    total_len = sum(ht * wd for ht, wd in hw_pairs)
+    batch_size, num_queries = 1, 3
+
+    class _MSDeformAttnExportWrapper(torch.nn.Module):
+        """Thin wrapper exporting MSDeformAttn.forward via torch.export.export."""
+
+        def __init__(self, hw: list[tuple[int, int]]) -> None:
+            super().__init__()
+            self.attn = MSDeformAttn(d_model=d_model, n_levels=n_levels, n_heads=n_heads, n_points=n_points)
+            self.attn.export()
+            self.hw = hw
+
+        def forward(
+            self,
+            query: torch.Tensor,
+            reference_points: torch.Tensor,
+            input_flatten: torch.Tensor,
+            input_spatial_shapes: torch.Tensor,
+            input_level_start_index: torch.Tensor,
+        ) -> torch.Tensor:
+            """Forward using the module's Python int pairs for export compatibility."""
+            return self.attn(
+                query,
+                reference_points,
+                input_flatten,
+                input_spatial_shapes,
+                input_level_start_index,
+                input_spatial_shapes_hw=self.hw,
+            )
+
+    query = torch.randn(batch_size, num_queries, d_model)
+    # Decoder export shape: one shared box broadcast across feature levels (n_ref_levels == 1 branch).
+    reference_points = torch.rand(batch_size, num_queries, 1, 4)
+    input_flatten = torch.randn(batch_size, total_len, d_model)
+    input_spatial_shapes = torch.tensor(hw_pairs, dtype=torch.long)
+    starts = [sum(ht * wd for ht, wd in hw_pairs[:idx]) for idx in range(n_levels)]
+    input_level_start_index = torch.tensor(starts, dtype=torch.long)
+
+    module = _MSDeformAttnExportWrapper(hw=hw_pairs)
+
+    exported = torch.export.export(
+        module,
+        args=(query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index),
+    )
+    assert exported is not None
+
+
+class _FixedTopkScores(nn.Module):
+    """Returns pre-set per-position scores regardless of its input.
+
+    Stubs ``enc_out_class_embed`` so the two-stage top-k selection in ``Transformer.forward`` picks known positions in a
+    known, deliberately out-of-position-order rank.
+    """
+
+    def __init__(self, scores: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("scores", scores)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Ignore ``x`` and return the fixed scores."""
+        return self.scores
+
+
+def test_two_stage_topk_gather_selects_correct_rows_out_of_position_order(monkeypatch) -> None:
+    """The two-stage top-k gather must copy each selected proposal's exact memory row and box.
+
+    ``torch.topk`` ranks proposals by score, not by position, so the selected indices are rarely in ascending position
+    order. This pins that ``memory_ts``/``boxes_ts`` reproduce the source rows picked by an out-of-order, per-batch-row-
+    distinct selection, and additionally asserts that every ``torch.gather`` index used by the two-stage selection is a
+    broadcast view produced by ``Tensor.expand`` (its broadcast dim keeps stride 0), not a materialised copy.
+    """
+    torch.manual_seed(0)
+    batch_size, hidden_dim, num_queries = 2, 16, 3
+    spatial_shapes_hw = [(4, 4), (2, 2)]
+    total_hw = sum(ht * wd for ht, wd in spatial_shapes_hw)
+
+    srcs = [torch.randn(batch_size, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    masks = [torch.zeros(batch_size, ht, wd, dtype=torch.bool) for ht, wd in spatial_shapes_hw]
+    pos_embeds = [torch.randn(batch_size, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    refpoint_embed = torch.rand(num_queries, 4)
+    query_feat = torch.randn(num_queries, hidden_dim)
+
+    transformer = Transformer(
+        d_model=hidden_dim,
+        num_queries=num_queries,
+        num_decoder_layers=1,
+        sa_nhead=4,
+        ca_nhead=4,
+        num_feature_levels=len(spatial_shapes_hw),
+        dec_n_points=1,
+        return_intermediate_dec=True,
+        lite_refpoint_refine=True,
+        two_stage=True,
+        bbox_reparam=False,
+        group_detr=1,
+    )
+
+    # Deliberately out-of-position-order and batch-row-distinct top-3 picks.
+    scores = torch.full((batch_size, total_hw, 1), -100.0)
+    scores[0, 17, 0], scores[0, 2, 0], scores[0, 9, 0] = 30.0, 20.0, 10.0
+    scores[1, 5, 0], scores[1, 19, 0], scores[1, 0, 0] = 25.0, 15.0, 5.0
+    transformer.enc_out_class_embed = nn.ModuleList([_FixedTopkScores(scores)])
+    transformer.enc_out_bbox_embed = nn.ModuleList([nn.Linear(hidden_dim, 4)])
+
+    gather_index_calls: list[torch.Tensor] = []
+    original_gather = torch.gather
+
+    def _tracking_gather(input: torch.Tensor, dim: int, index: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        gather_index_calls.append(index)
+        return original_gather(input, dim, index, **kwargs)
+
+    monkeypatch.setattr(torch, "gather", _tracking_gather)
+
+    _, _, memory_ts, boxes_ts = transformer(srcs, masks, pos_embeds, refpoint_embed, query_feat, cross_attn_srcs=None)
+
+    # Every gather index used by the two-stage top-k selection (Transformer.forward two-stage top-k
+    # gather) must still be a broadcast view produced by Tensor.expand: its broadcast dim keeps
+    # stride 0. Tensor.repeat, Tensor.tile, Tensor.expand(...).contiguous(), and
+    # Tensor.repeat_interleave all re-materialise that same allocation into a nonzero-stride tensor,
+    # so checking the index's stride catches all four regression variants directly instead of only
+    # detecting the literal absence of a Tensor.repeat call.
+    assert gather_index_calls, "expected torch.gather to be called during the two-stage top-k selection"
+    for index in gather_index_calls:
+        assert index.stride(-1) == 0, (
+            "the two-stage top-k gather index must broadcast its last dim via Tensor.expand "
+            "(Transformer.forward two-stage top-k gather); got a materialised index with nonzero "
+            f"last-dim stride {index.stride()} for shape {tuple(index.shape)}"
+        )
+
+    # Ground truth computed independently of the gather under test: the same flatten/proposal
+    # machinery Transformer.forward uses internally, then plain (non-gather) row indexing.
+    memory = torch.cat([src.flatten(2).transpose(1, 2) for src in srcs], 1)
+    mask_flatten = torch.cat([m.flatten(1) for m in masks], 1)
+    output_memory, output_proposals = gen_encoder_output_proposals(
+        memory, mask_flatten, spatial_shapes_hw, unsigmoid=True
+    )
+    output_memory_gidx = transformer.enc_output_norm[0](transformer.enc_output[0](output_memory))
+    coord_unselected = transformer.enc_out_bbox_embed[0](output_memory_gidx) + output_proposals
+    chosen_idx = scores.squeeze(-1).topk(num_queries, dim=1).indices  # mirrors forward()'s torch.topk call
+
+    assert torch.equal(chosen_idx, torch.tensor([[17, 2, 9], [5, 19, 0]]))  # sanity: out of position order
+    expected_memory = torch.stack([output_memory_gidx[b, chosen_idx[b]] for b in range(batch_size)])
+    # forward() returns boxes_ts.sigmoid() when bbox_reparam=False (Transformer.forward two-stage return).
+    expected_coord = torch.stack([coord_unselected[b, chosen_idx[b]] for b in range(batch_size)]).sigmoid()
+    assert torch.equal(memory_ts, expected_memory)
+    assert torch.equal(boxes_ts, expected_coord)
+
+
+def _make_out_of_order_scores(total_hw: int, picks: list[int]) -> torch.Tensor:
+    """Build batch=1 per-position class scores with `picks` as the strictly descending top-k winners.
+
+    Args:
+        total_hw: Total number of flattened spatial positions across all feature levels.
+        picks: Position indices to rank first, second, third, ... in descending score order.
+
+    Returns:
+        Score tensor of shape (1, total_hw, 1); every position not in `picks` scores -100.0.
+
+    Examples:
+        >>> _make_out_of_order_scores(5, [3, 1]).squeeze(-1).tolist()
+        [[-100.0, 20.0, -100.0, 30.0, -100.0]]
+    """
+    scores = torch.full((1, total_hw, 1), -100.0)
+    picks_tensor = torch.tensor(picks)
+    scores[0, picks_tensor, 0] = 30.0 - 10.0 * torch.arange(len(picks), dtype=torch.float32)
+    return scores
+
+
+def test_two_stage_topk_gather_broadcasts_correctly_across_groups_in_training_mode(monkeypatch) -> None:
+    """With group_detr>1 and the module left in its default training mode, every per-group gather index
+    must still broadcast via Tensor.expand, and the concatenated memory_ts/boxes_ts must reproduce each
+    group's exact top-k rows.
+
+    Regression: test_two_stage_topk_gather_selects_correct_rows_out_of_position_order only exercises
+    group_detr=1, where the ``group_detr = self.group_detr if self.training else 1`` guard in
+    Transformer.forward degenerates to a single gather per stage. This pins the group_detr>1 branch,
+    which loops the same two gathers twice more (once per extra group) and concatenates the results
+    along the query dimension. The module intentionally never calls .eval(): group_detr>1 only takes
+    effect while nn.Module.training is True (its default), and calling .eval() would silently fall back
+    to the already-covered group_detr=1 path.
+    """
+    torch.manual_seed(0)
+    hidden_dim, num_queries, group_detr = 16, 3, 3
+    spatial_shapes_hw = [(4, 4), (2, 2)]
+    total_hw = sum(ht * wd for ht, wd in spatial_shapes_hw)
+
+    srcs = [torch.randn(1, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    masks = [torch.zeros(1, ht, wd, dtype=torch.bool) for ht, wd in spatial_shapes_hw]
+    pos_embeds = [torch.randn(1, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    refpoint_embed = torch.rand(num_queries * group_detr, 4)
+    query_feat = torch.randn(num_queries * group_detr, hidden_dim)
+
+    transformer = Transformer(
+        d_model=hidden_dim,
+        num_queries=num_queries,
+        num_decoder_layers=1,
+        sa_nhead=4,
+        ca_nhead=4,
+        num_feature_levels=len(spatial_shapes_hw),
+        dec_n_points=1,
+        return_intermediate_dec=True,
+        lite_refpoint_refine=True,
+        two_stage=True,
+        bbox_reparam=False,
+        group_detr=group_detr,
+    )
+    assert transformer.training  # default nn.Module state; group_detr>1 only takes effect while training
+
+    # Deliberately out-of-position-order, distinct picks per group.
+    picks_per_group = [[17, 2, 9], [5, 19, 0], [11, 14, 3]]
+    scores_per_group = [_make_out_of_order_scores(total_hw, picks) for picks in picks_per_group]
+    transformer.enc_out_class_embed = nn.ModuleList([_FixedTopkScores(scores) for scores in scores_per_group])
+    transformer.enc_out_bbox_embed = nn.ModuleList([nn.Linear(hidden_dim, 4) for _ in range(group_detr)])
+
+    gather_index_calls: list[torch.Tensor] = []
+    original_gather = torch.gather
+
+    def _tracking_gather(input: torch.Tensor, dim: int, index: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        gather_index_calls.append(index)
+        return original_gather(input, dim, index, **kwargs)
+
+    monkeypatch.setattr(torch, "gather", _tracking_gather)
+
+    _, _, memory_ts, boxes_ts = transformer(srcs, masks, pos_embeds, refpoint_embed, query_feat, cross_attn_srcs=None)
+
+    # Two gather calls (refpoint, memory) per group -- the only torch.gather call sites in
+    # Transformer.forward's two-stage top-k selection.
+    assert len(gather_index_calls) == 2 * group_detr
+    for index in gather_index_calls:
+        assert index.stride(-1) == 0, (
+            "every per-group two-stage top-k gather index must broadcast its last dim via Tensor.expand "
+            f"(Transformer.forward two-stage top-k gather); got a materialised index with nonzero "
+            f"last-dim stride {index.stride()} for shape {tuple(index.shape)}"
+        )
+
+    # Ground truth computed independently of the gather under test, per group.
+    memory = torch.cat([src.flatten(2).transpose(1, 2) for src in srcs], 1)
+    mask_flatten = torch.cat([m.flatten(1) for m in masks], 1)
+    output_memory, output_proposals = gen_encoder_output_proposals(
+        memory, mask_flatten, spatial_shapes_hw, unsigmoid=True
+    )
+    picks_tensors = [torch.tensor(picks) for picks in picks_per_group]
+    output_memory_per_group = [
+        transformer.enc_output_norm[g](transformer.enc_output[g](output_memory)) for g in range(group_detr)
+    ]
+    coord_unselected_per_group = [
+        transformer.enc_out_bbox_embed[g](output_memory_per_group[g]) + output_proposals for g in range(group_detr)
+    ]
+
+    expected_memory = torch.cat(
+        [output_memory_per_group[g][0, picks_tensors[g]] for g in range(group_detr)], dim=0
+    ).unsqueeze(0)
+    # forward() returns boxes_ts.sigmoid() when bbox_reparam=False.
+    expected_coord = (
+        torch.cat([coord_unselected_per_group[g][0, picks_tensors[g]] for g in range(group_detr)], dim=0)
+        .unsqueeze(0)
+        .sigmoid()
+    )
+    assert torch.equal(memory_ts, expected_memory)
+    assert torch.equal(boxes_ts, expected_coord)
+
+
+def test_two_stage_topk_gather_selects_correct_rows_with_bbox_reparam(monkeypatch) -> None:
+    """With bbox_reparam=True, the coordinate-delta reparameterisation path must still gather the exact selected rows
+    via a stride-0 broadcast index, and boxes_ts must be returned un-sigmoided.
+
+    Regression: test_two_stage_topk_gather_selects_correct_rows_out_of_position_order only exercises
+    bbox_reparam=False (the ``enc_out_bbox_embed(...) + output_proposals`` branch of Transformer.forward).
+    bbox_reparam=True instead builds the unselected coordinates from a cx/cy delta scaled by proposal
+    size plus a log-space w/h delta, and Transformer.forward skips the final ``.sigmoid()`` on
+    ``boxes_ts`` in that mode -- neither computation shares code with the bbox_reparam=False branch, so
+    this covers the gather correctness independently for it.
+    """
+    torch.manual_seed(0)
+    batch_size, hidden_dim, num_queries = 2, 16, 3
+    spatial_shapes_hw = [(4, 4), (2, 2)]
+    total_hw = sum(ht * wd for ht, wd in spatial_shapes_hw)
+
+    srcs = [torch.randn(batch_size, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    masks = [torch.zeros(batch_size, ht, wd, dtype=torch.bool) for ht, wd in spatial_shapes_hw]
+    pos_embeds = [torch.randn(batch_size, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    refpoint_embed = torch.rand(num_queries, 4)
+    query_feat = torch.randn(num_queries, hidden_dim)
+
+    transformer = Transformer(
+        d_model=hidden_dim,
+        num_queries=num_queries,
+        num_decoder_layers=1,
+        sa_nhead=4,
+        ca_nhead=4,
+        num_feature_levels=len(spatial_shapes_hw),
+        dec_n_points=1,
+        return_intermediate_dec=True,
+        lite_refpoint_refine=True,
+        two_stage=True,
+        bbox_reparam=True,
+        group_detr=1,
+    )
+
+    scores = torch.full((batch_size, total_hw, 1), -100.0)
+    scores[0, 17, 0], scores[0, 2, 0], scores[0, 9, 0] = 30.0, 20.0, 10.0
+    scores[1, 5, 0], scores[1, 19, 0], scores[1, 0, 0] = 25.0, 15.0, 5.0
+    transformer.enc_out_class_embed = nn.ModuleList([_FixedTopkScores(scores)])
+    transformer.enc_out_bbox_embed = nn.ModuleList([nn.Linear(hidden_dim, 4)])
+
+    gather_index_calls: list[torch.Tensor] = []
+    original_gather = torch.gather
+
+    def _tracking_gather(input: torch.Tensor, dim: int, index: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        gather_index_calls.append(index)
+        return original_gather(input, dim, index, **kwargs)
+
+    monkeypatch.setattr(torch, "gather", _tracking_gather)
+
+    _, _, memory_ts, boxes_ts = transformer(srcs, masks, pos_embeds, refpoint_embed, query_feat, cross_attn_srcs=None)
+
+    assert gather_index_calls, "expected torch.gather to be called during the two-stage top-k selection"
+    for index in gather_index_calls:
+        assert index.stride(-1) == 0, (
+            "the two-stage top-k gather index must broadcast its last dim via Tensor.expand "
+            f"(Transformer.forward two-stage top-k gather); got a materialised index with nonzero "
+            f"last-dim stride {index.stride()} for shape {tuple(index.shape)}"
+        )
+
+    # Ground truth computed independently of the gather under test: the bbox_reparam=True coordinate
+    # formula (cx/cy delta scaled by proposal size, log-space w/h delta), then plain row indexing.
+    memory = torch.cat([src.flatten(2).transpose(1, 2) for src in srcs], 1)
+    mask_flatten = torch.cat([m.flatten(1) for m in masks], 1)
+    output_memory, output_proposals = gen_encoder_output_proposals(
+        memory, mask_flatten, spatial_shapes_hw, unsigmoid=False
+    )
+    output_memory_gidx = transformer.enc_output_norm[0](transformer.enc_output[0](output_memory))
+    coord_delta = transformer.enc_out_bbox_embed[0](output_memory_gidx)
+    coord_cxcy = coord_delta[..., :2] * output_proposals[..., 2:] + output_proposals[..., :2]
+    coord_wh = coord_delta[..., 2:].exp() * output_proposals[..., 2:]
+    coord_unselected = torch.concat([coord_cxcy, coord_wh], dim=-1)
+    chosen_idx = scores.squeeze(-1).topk(num_queries, dim=1).indices  # mirrors forward()'s torch.topk call
+
+    assert torch.equal(chosen_idx, torch.tensor([[17, 2, 9], [5, 19, 0]]))  # sanity: out of position order
+    expected_memory = torch.stack([output_memory_gidx[b, chosen_idx[b]] for b in range(batch_size)])
+    # forward() returns boxes_ts as-is (no sigmoid) when bbox_reparam=True.
+    expected_coord = torch.stack([coord_unselected[b, chosen_idx[b]] for b in range(batch_size)])
+    assert torch.equal(memory_ts, expected_memory)
+    assert torch.equal(boxes_ts, expected_coord)
+
+
+def test_two_stage_topk_gather_backward_routes_gradient_only_to_selected_rows() -> None:
+    """The two-stage top-k gather is a plain row copy, so backward() through it must route gradient only to the
+    flattened source positions that were selected -- every unselected position must see exactly zero gradient.
+
+    Regression: the forward-value assertions in the sibling tests confirm memory_ts/boxes_ts *equal* the
+    correct rows, but a broadcast-index bug that accidentally selected the wrong rows in a way that still
+    passed those value checks (e.g. by coincidence on this fixture) would still corrupt exactly which
+    upstream positions receive gradient during training. Every position in this fixture's 4x4+2x2
+    spatial grid is a "valid" proposal (see gen_encoder_output_proposals's 0.01-0.99 validity window), so
+    output_memory is an untouched pass-through of memory and gradient must localise per-row exactly.
+    """
+    torch.manual_seed(0)
+    batch_size, hidden_dim, num_queries = 1, 16, 3
+    spatial_shapes_hw = [(4, 4), (2, 2)]
+    total_hw = sum(ht * wd for ht, wd in spatial_shapes_hw)
+
+    srcs = [torch.randn(batch_size, hidden_dim, ht, wd, requires_grad=True) for ht, wd in spatial_shapes_hw]
+    masks = [torch.zeros(batch_size, ht, wd, dtype=torch.bool) for ht, wd in spatial_shapes_hw]
+    pos_embeds = [torch.randn(batch_size, hidden_dim, ht, wd) for ht, wd in spatial_shapes_hw]
+    refpoint_embed = torch.rand(num_queries, 4)
+    query_feat = torch.randn(num_queries, hidden_dim)
+
+    transformer = Transformer(
+        d_model=hidden_dim,
+        num_queries=num_queries,
+        num_decoder_layers=1,
+        sa_nhead=4,
+        ca_nhead=4,
+        num_feature_levels=len(spatial_shapes_hw),
+        dec_n_points=1,
+        return_intermediate_dec=True,
+        lite_refpoint_refine=True,
+        two_stage=True,
+        bbox_reparam=False,
+        group_detr=1,
+    )
+
+    picks = [17, 2, 9]
+    transformer.enc_out_class_embed = nn.ModuleList([_FixedTopkScores(_make_out_of_order_scores(total_hw, picks))])
+    transformer.enc_out_bbox_embed = nn.ModuleList([nn.Linear(hidden_dim, 4)])
+
+    _, _, memory_ts, boxes_ts = transformer(srcs, masks, pos_embeds, refpoint_embed, query_feat, cross_attn_srcs=None)
+    (memory_ts.sum() + boxes_ts.sum()).backward()
+
+    assert all(src.grad is not None for src in srcs)
+    # Reproduce Transformer.forward's memory flatten order: cat(src.flatten(2).transpose(1, 2)).
+    flattened_grads = torch.cat([src.grad.flatten(2).transpose(1, 2) for src in srcs], dim=1)  # (1, total_hw, dim)
+
+    selected_mask = torch.zeros(total_hw, dtype=torch.bool)
+    selected_mask[torch.tensor(picks)] = True
+
+    assert (flattened_grads[0, selected_mask] != 0).any(dim=-1).all(), (
+        "every selected row must receive nonzero gradient through the two-stage top-k gather"
+    )
+    assert torch.equal(flattened_grads[0, ~selected_mask], torch.zeros_like(flattened_grads[0, ~selected_mask])), (
+        "every unselected row must receive exactly zero gradient through the two-stage top-k gather"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_two_stage_topk_gather_cuda_matches_cpu_for_out_of_position_order_indices() -> None:
+    """The two-stage top-k gather (Transformer.forward two-stage top-k gather) is an arithmetic-free row
+    copy -- torch.gather with an index broadcast via Tensor.expand -- so CUDA must reproduce the CPU
+    result bit-for-bit for the same out-of-order, per-batch-row-distinct indices used by
+    test_two_stage_topk_gather_selects_correct_rows_out_of_position_order.
+
+    Mirrors the CPU/CUDA parity twin added for the analogous arithmetic-free row-copy gather in
+    PostProcess._gather_and_scale_boxes (PR #1268,
+    test_gather_and_scale_boxes_cuda_matches_cpu_for_duplicated_indices): both isolate the bare
+    gather+expand pattern rather than running a full model forward, so the comparison is not exposed to
+    unrelated CPU/CUDA floating-point non-determinism in surrounding Linear/LayerNorm layers.
+    """
+    batch_size, hidden_dim, num_positions = 2, 16, 20
+    source = torch.randn(batch_size, num_positions, hidden_dim)
+    # Same out-of-position-order, per-batch-row-distinct picks as the CPU-only sibling test.
+    topk_proposals = torch.tensor([[17, 2, 9], [5, 19, 0]])
+
+    cpu_selected = torch.gather(source, 1, topk_proposals.unsqueeze(-1).expand(-1, -1, hidden_dim))
+    cuda_selected = torch.gather(source.cuda(), 1, topk_proposals.cuda().unsqueeze(-1).expand(-1, -1, hidden_dim))
+
+    assert torch.equal(cpu_selected, cuda_selected.cpu())

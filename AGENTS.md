@@ -69,7 +69,7 @@ uv sync --all-groups
 See `pyproject.toml` for complete dependency specifications:
 
 - **Core:** PyTorch, torchvision, transformers, supervision, pydantic, pyDeprecate
-- **Optional:** `[train]` (training, including peft and pycocotools), `[lora]` (LoRA fine-tuning), `[plus]` (Plus models), `[onnx]` (ONNX export), `[loggers]` (tensorboard, wandb, mlflow, clearml)
+- **Optional:** `[train]` (minimal training loop dependencies), `[augment]` (custom Albumentations CPU augmentations and Kornia GPU augmentations), `[lora]` (LoRA fine-tuning), `[plus]` (Plus models), `[onnx]` (ONNX export), `[loggers]` (tensorboard, wandb, mlflow, clearml)
 - **Development:** `tests`, `docs`, `build` groups
 
 **Important version constraints:**
@@ -88,10 +88,10 @@ See `pyproject.toml` for complete dependency specifications:
 
 ```bash
 # CPU tests (default for local development; mirrors CI)
-uv run --no-sync pytest src/ tests/ -n 1 -m "not gpu" --ignore=tests/run_smoke_all_models.py --cov=rfdetr --cov-report=xml --timeout=240 --durations=50
+uv run --no-sync pytest src/ tests/ -n 1 -m "not gpu" --ignore=tests/run_smoke_all_models.py --ignore=tests/legacy/test_checkpoint_compat.py --cov=rfdetr --cov-report=xml --timeout=240 --durations=50
 
 # GPU tests (requires GPU; mirrors CI)
-uv run --no-sync pytest tests/ -m gpu -n 2 --reruns 1 --only-rerun "OutOfMemoryError" --cov=rfdetr --cov-report=xml --timeout=600 --durations=20
+uv run --no-sync pytest tests/ -m gpu --ignore=tests/legacy/test_checkpoint_compat.py -n 2 --reruns 1 --only-rerun "OutOfMemoryError" --cov=rfdetr --cov-report=xml --timeout=600 --durations=20
 
 # Pre-commit checks (ALWAYS run before committing)
 pre-commit run --all-files
@@ -205,19 +205,33 @@ uv run twine check --strict dist/*
 
 ### Key Patterns
 
+**Augmentations:**
+
+- Default training, validation, prediction, and export preprocessing use torchvision-native transforms.
+- Custom non-empty `aug_config` values on the CPU path use Albumentations and require `rfdetr[augment]`.
+- `augmentation_backend="gpu"` uses Kornia and requires `rfdetr[augment]`; `augmentation_backend="auto"` falls back to CPU when CUDA or Kornia is unavailable.
+
 **Model Architecture:**
 
 - RFDETR wrappers: `self.model` is the model context returned by `get_model()`
 - Underlying PyTorch module: `self.model.model`
 - Segmentation models return `pred_masks` as `torch.Tensor` or dict with keys `['spatial_features', 'query_features', 'bias']`
 
+**Model Selection (examples, docs, tests, defaults):**
+
+- **Default to `RFDETRSmall` / `"rfdetr-small"`.** Use it wherever an example needs a concrete detection model.
+- **Never use base models** (`RFDETRBase` / `"rfdetr-base"`) in new examples, docs, or tests — treat as deprecated; substitute `small`.
+- **Released detection sizes** — `nano`, `small`, `medium`, `large` (plus `xlarge`/`2xlarge` Plus models). Always pick one of these for plain object detection; never a `-preview` variant.
+- **Released segmentation sizes** — `RFDETRSegNano`/`Small`/`Medium`/`Large` / `"rfdetr-seg-{nano,small,medium,large}"` (plus `xlarge`/`2xlarge`). Use a sized seg model for segmentation; `RFDETRSegPreview` / `"rfdetr-seg-preview"` is now superseded — do not use it in new examples, docs, or tests.
+- **`-preview` variants** are for capabilities with **no released sized version yet**. Only keypoints remain preview-only: `RFDETRKeypointPreview` / `"rfdetr-keypoint-preview"`. Use a preview variant **only** for that task — never as a stand-in for detection or segmentation.
+
 **Imports:**
 
 ```python
 # Prefer direct project imports. Standard aliases such as `numpy as np`,
 # `torch.nn.functional as F`, and lazy module aliases are allowed when conventional.
-from rfdetr.util.misc import get_rank, get_world_size, is_main_process, save_on_master
-from rfdetr.util.logger import get_logger
+from rfdetr.utilities.distributed import get_rank, get_world_size, is_main_process, save_on_master
+from rfdetr.utilities.logger import get_logger
 
 # Logger usage
 logger = get_logger()  # Default name: "rf-detr", reads LOG_LEVEL env var
@@ -267,6 +281,7 @@ result = subprocess.run(
 - MANDATORY Google-style docstrings for all functions and classes
 - **Do not duplicate types in docstrings** - types are in the function signature
 - Target Python version: 3.10+
+- **Helper functions in `tests/` need a doctest too**: any non-`test_*` function used by tests (fixture builders, assertion helpers, reference implementations) needs a docstring with an `Examples` doctest that exercises it directly — `pyproject.toml` runs `--doctest-plus` across `tests/` on purpose. Skip the live doctest (`# doctest: +SKIP` + one-line reason) only when the helper can't run standalone (e.g. a `@pytest.fixture`, or needs real GPU/XLA/network hardware).
 
 ## Common Workflows
 
@@ -281,7 +296,7 @@ result = subprocess.run(
 4. **Testing:**
     - Bug fixes: Write test first, then fix
     - Features: Test all major use cases
-    - Run: `uv run --no-sync pytest src/ tests/ -n 2 -m "not gpu" --ignore=tests/run_smoke_all_models.py --timeout=240 --durations=50`
+    - Run: `uv run --no-sync pytest src/ tests/ -n 2 -m "not gpu" --ignore=tests/run_smoke_all_models.py --ignore=tests/legacy/test_checkpoint_compat.py --timeout=240 --durations=50`
 5. **Quality checks:** `pre-commit run --all-files`
 6. **Build (if needed):** `uv build`
 7. **Commit:** Pre-commit hooks run automatically
@@ -306,6 +321,8 @@ GitHub Actions workflows in `.github/workflows/`:
 
 - **ci-tests-cpu.yml:** CPU tests across OS/Python versions
 - **ci-tests-gpu.yml:** GPU-dependent tests
+- **ci-legacy-checkpoints.yml:** Backward-compatibility checkpoint-loading tests across historical rfdetr releases (advisory only — not a required check; a compat break does not block merge)
+- **ci-deps-resolution.yml:** Dependency resolution (`uv lock`) plus an install-plan check (`uv sync --dry-run`) for every extra on every Python interpreter allowed by requires-python (3.10-3.14). Resolution alone does not prove a pinned version ships a wheel for the interpreter in use. The `list-extras` job derives the checked set from every `[project.optional-dependencies]` extra, so a new extra is covered automatically
 - **build-package.yml:** Build and validate distributions
 - **ci-build-docs.yml:** Documentation builds
 - **publish-docs.yml:** Deploy docs to GitHub Pages

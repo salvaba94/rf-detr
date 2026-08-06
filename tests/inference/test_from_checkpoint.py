@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from rfdetr.config import PretrainWeightsCompatibilityWarning
 from rfdetr.detr import RFDETR
 from rfdetr.detr import logger as detr_logger
 from rfdetr.platform import _IS_RFDETR_PLUS_AVAILABLE
@@ -34,12 +36,28 @@ class _CustomObj:
 
 
 def _ns(pretrain_weights: str, num_classes: int = 80) -> dict:
-    """Fake legacy checkpoint with argparse.Namespace args."""
+    """Fake legacy checkpoint with argparse.Namespace args.
+
+    Examples:
+        >>> ckpt = _ns("rf-detr-small.pth", num_classes=3)
+        >>> ckpt["args"].num_classes
+        3
+        >>> ckpt["args"].pretrain_weights
+        'rf-detr-small.pth'
+    """
     return {"args": argparse.Namespace(pretrain_weights=pretrain_weights, num_classes=num_classes)}
 
 
 def _dict(pretrain_weights: str, num_classes: int = 80) -> dict:
-    """Fake PTL-style checkpoint with dict args."""
+    """Fake PTL-style checkpoint with dict args.
+
+    Examples:
+        >>> ckpt = _dict("rf-detr-small.pth", num_classes=5)
+        >>> ckpt["args"]["num_classes"]
+        5
+        >>> ckpt["args"]["pretrain_weights"]
+        'rf-detr-small.pth'
+    """
     return {"args": {"pretrain_weights": pretrain_weights, "num_classes": num_classes}}
 
 
@@ -54,6 +72,13 @@ def _call_from_checkpoint(ckpt: dict, path: Path, cls_patch_target: str, **kwarg
 
     Returns:
         Tuple of (result, mock_class).
+
+    Examples:
+        This helper patches ``torch.load`` and a model class — it cannot be run without a real
+        ``Path`` argument or live imports, so the doctest is illustrative only.
+
+        >>> callable(_call_from_checkpoint)  # doctest: +SKIP
+        True
     """
     mock_instance = MagicMock()
     with (
@@ -177,6 +202,16 @@ class TestFromCheckpointDictArgs:
 class TestFromCheckpointEdgeCases:
     """Edge-case handling in from_checkpoint."""
 
+    def test_nonexistent_path_raises_file_not_found(self, tmp_path: Path) -> None:
+        """from_checkpoint raises FileNotFoundError when path does not exist."""
+        with pytest.raises(FileNotFoundError):
+            RFDETR.from_checkpoint(tmp_path / "nope.pth")
+
+    def test_directory_path_raises_os_error(self, tmp_path: Path) -> None:
+        """from_checkpoint raises OSError when path is a directory, not a file."""
+        with pytest.raises((OSError, IsADirectoryError)):
+            RFDETR.from_checkpoint(tmp_path)
+
     def test_characterization_unknown_pretrain_weights_raises_value_error(self, tmp_path: Path) -> None:
         """Unrecognised pretrain_weights name raises a descriptive ValueError."""
         ckpt = _ns("/my/custom/finetuned.pth")
@@ -229,6 +264,33 @@ class TestFromCheckpointEdgeCases:
         )
         call_kwargs = mock_cls.call_args.kwargs
         assert call_kwargs.get("resolution") == 640
+
+    def test_trust_checkpoint_true_forwarded_to_constructor(self, tmp_path: Path) -> None:
+        """trust_checkpoint=True reaches the model constructor, not just the metadata read.
+
+        Regression coverage: the constructor reloads the same checkpoint file via
+        ``load_pretrain_weights`` — without forwarding ``trust_checkpoint`` into
+        ``constructor_kwargs``, that reload always used the unsafe-load default, making
+        ``trust_checkpoint=True`` inert for checkpoints that actually need it.
+        """
+        _, mock_cls = _call_from_checkpoint(
+            _ns("rf-detr-small.pth"),
+            tmp_path / "ckpt.pth",
+            "rfdetr.variants.RFDETRSmall",
+            trust_checkpoint=True,
+        )
+        call_kwargs = mock_cls.call_args.kwargs
+        assert call_kwargs["trust_checkpoint"] is True
+
+    def test_trust_checkpoint_defaults_to_false_in_constructor(self, tmp_path: Path) -> None:
+        """trust_checkpoint defaults to False in the forwarded constructor kwargs."""
+        _, mock_cls = _call_from_checkpoint(
+            _ns("rf-detr-small.pth"),
+            tmp_path / "ckpt.pth",
+            "rfdetr.variants.RFDETRSmall",
+        )
+        call_kwargs = mock_cls.call_args.kwargs
+        assert call_kwargs["trust_checkpoint"] is False
 
     def test_characterization_pretrain_weights_in_kwargs_is_overridden(self, tmp_path: Path) -> None:
         """pretrain_weights passed in **kwargs is silently overridden by the checkpoint path."""
@@ -348,7 +410,15 @@ class TestDeprecatedClassInstantiation:
 
 
 def _ckpt_with_model_name(model_name: str, num_classes: int = 80) -> dict:
-    """Fake checkpoint with model_name key (new format)."""
+    """Fake checkpoint with model_name key (new format).
+
+    Examples:
+        >>> ckpt = _ckpt_with_model_name("RFDETRSmall", num_classes=2)
+        >>> ckpt["model_name"]
+        'RFDETRSmall'
+        >>> ckpt["args"]["num_classes"]
+        2
+    """
     return {
         "args": {"pretrain_weights": "rf-detr-small.pth", "num_classes": num_classes},
         "model_name": model_name,
@@ -563,8 +633,10 @@ class TestFromCheckpointNumClassesProvenance:
     """
 
     def test_checkpoint_num_classes_is_not_marked_user_set(self, two_class_checkpoint: Path) -> None:
-        """from_checkpoint adopts the checkpoint class count without marking it as a user override."""
-        model = RFDETR.from_checkpoint(two_class_checkpoint)
+        """from_checkpoint adopts the checkpoint class count without warning about pretrained weights."""
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=PretrainWeightsCompatibilityWarning)
+            model = RFDETR.from_checkpoint(two_class_checkpoint)
 
         assert model.model_config.num_classes == 2
         assert model.model.model.class_embed.bias.shape[0] == 3, "Head must match checkpoint (2 classes + background)."
@@ -714,6 +786,15 @@ def _make_kp_active_mask(schema: list[int]) -> torch.Tensor:
 
     Returns:
         Bool tensor of shape ``[len(schema), max(schema)]`` with True in active keypoint slots.
+
+    Examples:
+        >>> mask = _make_kp_active_mask([0, 3])
+        >>> mask.shape
+        torch.Size([2, 3])
+        >>> mask[0].tolist()
+        [False, False, False]
+        >>> mask[1].tolist()
+        [True, True, True]
     """
     if not schema or max(schema) == 0:
         return torch.zeros(0, 0, dtype=torch.bool)

@@ -3,7 +3,11 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-"""Augmentation presets and default configuration for RF-DETR training.
+"""Optional Albumentations augmentation presets for RF-DETR training.
+
+RF-DETR's default training augmentation path is torchvision-native and does not require Albumentations. Importing and
+passing the presets in this module as ``aug_config`` uses the optional Albumentations integration; install it with
+``pip install 'rfdetr[augment]'``.
 
 Import a preset and pass it as ``aug_config`` to your training call:
 
@@ -39,7 +43,7 @@ model.train(dataset_dir="...", aug_config={"HorizontalFlip": {"p": 0.5}})
 - Target-aware native transforms: CopyPaste
 
 **Pixel-level transforms** (preserve bounding boxes):
-- Color: ColorJitter, HueSaturationValue, RandomBrightnessContrast
+- Color: ColorJitter, HueSaturationValue, RandomBrightnessContrast, ToGray
 - Blur/Noise: GaussianBlur, GaussNoise, Blur
 - Enhancement: CLAHE, Sharpen, Equalize
 
@@ -64,8 +68,9 @@ GEOMETRIC_TRANSFORMS = {
 
 ## Kornia GPU Backend
 
-When ``augmentation_backend="auto"`` or ``"gpu"`` is set in ``TrainConfig``, augmentations run on the GPU via Kornia
-instead of Albumentations.
+When ``augmentation_backend="kornia"`` is set in ``TrainConfig`` (or ``"auto"``/``"cpu"`` resolves to it because
+Kornia is installed and CUDA is available), augmentations run on the GPU via Kornia instead of CPU Albumentations
+or torchvision defaults. Install it with ``pip install 'rfdetr[augment]'``.
 
 **Supported transforms** (Kornia-compatible presets only; ``AUG_SAHI`` is CPU-only):
 
@@ -76,12 +81,22 @@ instead of Albumentations.
 | ``Rotate`` | ``K.RandomRotation`` | ``limit`` may be scalar or tuple |
 | ``Affine`` | ``K.RandomAffine`` | ``translate_percent`` treated as fraction |
 | ``ColorJitter`` | ``K.ColorJiggle`` | Same multiplicative semantics |
+| ``ToGray`` | ``K.RandomGrayscale`` | Grayscale, 3 channels; only ``p`` honored, method/num_output_channels ignored |
 | ``RandomBrightnessContrast`` | ``K.ColorJiggle`` | ``brightness_limit`` / ``contrast_limit`` direct |
 | ``GaussianBlur`` | ``K.RandomGaussianBlur`` | ``blur_limit`` rounded up to odd; ``sigma=(0.1, 2.0)`` |
 | ``GaussNoise`` | ``K.RandomGaussianNoise`` | Upper bound of ``std_range`` used as fixed std |
+| ``Blur`` | ``K.RandomBoxBlur`` | Box blur; ``blur_limit`` rounded up to odd, pair collapses to its upper bound |
+| ``Sharpen`` | ``K.RandomSharpness`` | ``sharpness = 1.0 + alpha`` (1.0-pivoted); ``lightness``/``method`` ignored |
+| ``Equalize`` | ``K.RandomEqualize`` | Only ``p`` honored; ``mode``/``by_channels``/``mask`` ignored |
+| ``CLAHE`` | ``K.RandomClahe`` | ``clip_limit`` and ``tile_grid_size`` map directly |
 
-**Phase 1 limitation**: Segmentation models (``segmentation_head=True``) skip GPU augmentation; CPU Albumentations are
-used instead. Mask support is planned for Phase 2.
+Not yet supported on Kornia: ``HueSaturationValue`` (Albumentations shifts hue/saturation/value additively,
+Kornia's ``ColorJiggle`` scales them multiplicatively, so there is no faithful mapping), and the geometric
+group ``ShiftScaleRotate``, ``RandomCrop``, ``CenterCrop``, ``RandomResizedCrop``, ``Perspective``,
+``ElasticTransform`` and ``GridDistortion``, which move boxes and masks and need the auxiliary-target
+handling settled first. These still work on the Albumentations backend.
+
+Segmentation models are supported by the GPU augmentation path; masks are augmented in sync with images and boxes.
 """
 
 # ---------------------------------------------------------------------------

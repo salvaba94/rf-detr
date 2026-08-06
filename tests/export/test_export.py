@@ -27,9 +27,10 @@ import pytest
 import torch
 from torch.jit import TracerWarning
 
-from rfdetr import RFDETRSegNano
+from rfdetr import RFDETRNano, RFDETRSegNano
 from rfdetr import detr as _detr_module
 from rfdetr.export import main as _cli_export_module
+from rfdetr.models.backbone.dinov2 import DinoV2
 
 _IS_ONNX_INSTALLED = importlib.util.find_spec("onnx") is not None
 
@@ -60,6 +61,9 @@ class _DummyCoreModel:
 
     def cpu(self):
         return self
+
+    def modules(self):
+        return iter(())
 
     def __call__(self, *_args, **_kwargs):
         out = {"pred_boxes": torch.zeros(1, 1, 4), "pred_logits": torch.zeros(1, 1, 2)}
@@ -116,6 +120,70 @@ def test_segmentation_model_export_no_crash(tmp_path: Path) -> None:
     # Verify export produced output files
     onnx_files = list(tmp_path.glob("*.onnx"))
     assert len(onnx_files) > 0, "Export should produce ONNX file(s)"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for export test")
+@pytest.mark.skipif(not _IS_ONNX_INSTALLED, reason="onnx not installed, run: pip install rfdetr[onnx]")
+def test_export_with_rectangular_shape_different_from_resolution_no_crash(tmp_path: Path) -> None:
+    """Integration test: exporting with a valid rectangular shape should not crash.
+
+    A mismatched shape forces the DINOv2 backbone to interpolate its position embeddings for the new grid size. This
+    must not trace an antialiased bicubic resize (``aten::_upsample_bicubic2d_aa``), which has no ONNX opset-17
+    symbolic function.
+    """
+    model = RFDETRNano()
+    block_size = model.model_config.patch_size * model.model_config.num_windows
+    native_resolution = model.model.resolution
+    export_shape = (native_resolution, native_resolution + block_size)
+    assert all(dimension % block_size == 0 for dimension in export_shape)
+    assert export_shape != (native_resolution, native_resolution)
+
+    with ignore_tracer_warnings():
+        model.export(output_dir=str(tmp_path), shape=export_shape, verbose=False)
+
+    onnx_files = list(tmp_path.glob("*.onnx"))
+    assert len(onnx_files) > 0, "Export should produce ONNX file(s)"
+
+
+def test_dinov2_export_uses_precomputed_positions_for_exact_rectangular_grid() -> None:
+    """DINOv2 export must bypass interpolation only for its precomputed rectangular grid."""
+    patch_size = 8
+    export_shape = (32, 48)
+    source_positions = torch.nn.Parameter(torch.randn(1, 17, 2))
+    original_calls: list[tuple[int, int]] = []
+    fallback_positions = torch.randn(1, 1, 2)
+
+    def original_interpolate_pos_encoding(_embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Record fallback interpolation calls made by the exported backbone."""
+        original_calls.append((height, width))
+        return fallback_positions
+
+    backbone = DinoV2.__new__(DinoV2)
+    torch.nn.Module.__init__(backbone)
+    backbone.shape = export_shape
+    backbone._export = False
+    backbone.encoder = types.SimpleNamespace(
+        config=types.SimpleNamespace(patch_size=patch_size),
+        embeddings=types.SimpleNamespace(
+            position_embeddings=source_positions,
+            interpolate_pos_encoding=original_interpolate_pos_encoding,
+        ),
+    )
+
+    backbone.export()
+    patch_count = (export_shape[0] // patch_size) * (export_shape[1] // patch_size)
+    embeddings = torch.randn(1, patch_count + 1, 2)
+
+    fixed_positions = backbone.encoder.embeddings.interpolate_pos_encoding(embeddings, *export_shape)
+    assert fixed_positions is backbone.encoder.embeddings.position_embeddings
+    assert original_calls == []
+
+    transposed_positions = backbone.encoder.embeddings.interpolate_pos_encoding(
+        embeddings, export_shape[1], export_shape[0]
+    )
+    assert transposed_positions is fallback_positions
+    assert original_calls == [(export_shape[1], export_shape[0])]
 
 
 @pytest.mark.gpu
@@ -200,9 +268,139 @@ def test_rfdetr_export_dynamic_batch_forwards_dynamic_axes(
     assert set(dynamic_axes.keys()) == expected_names, f"expected keys {expected_names}, got {set(dynamic_axes.keys())}"
 
 
+class _DeviceTrackingCoreModel(_DummyCoreModel):
+    """`_DummyCoreModel` variant that records every `.to()` call's target device."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.to_calls: list[str] = []
+
+    def to(self, device, *_args, **_kwargs):
+        self.to_calls.append(device)
+        return self
+
+
+def _make_tensorrt_export_model(*, device: str = "cpu") -> types.SimpleNamespace:
+    """Build the minimal `self`-like fake `RFDETR.export()` needs for the format="tensorrt" branch.
+
+    Examples:
+        >>> m = _make_tensorrt_export_model()
+        >>> m.model.device
+        'cpu'
+        >>> m = _make_tensorrt_export_model(device="cuda")
+        >>> m.model.device
+        'cuda'
+    """
+    return types.SimpleNamespace(
+        model=types.SimpleNamespace(model=_DeviceTrackingCoreModel(), device=device, resolution=14),
+        model_config=types.SimpleNamespace(segmentation_head=False, use_grouppose_keypoints=False, num_channels=3),
+        size=None,
+    )
+
+
+def _make_mock_infer_tensor() -> MagicMock:
+    """Mock tensor standing in for `make_infer_image()`'s return value — avoids real-device `.to()`/`.cpu()`.
+
+    Examples:
+        >>> t = _make_mock_infer_tensor()
+        >>> t.to("cpu") is t
+        True
+        >>> t.cpu() is t
+        True
+    """
+    mock_tensor = MagicMock()
+    mock_tensor.to.return_value = mock_tensor
+    mock_tensor.cpu.return_value = mock_tensor
+    return mock_tensor
+
+
+@pytest.mark.parametrize(
+    "export_format",
+    [
+        pytest.param("tensorrt", id="canonical"),
+        pytest.param("trt", id="alias"),
+    ],
+)
+def test_rfdetr_export_tensorrt_calls_build_engine_with_onnx_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, export_format: str
+) -> None:
+    """`RFDETR.export(format="tensorrt")` — and its `"trt"` alias — must call `build_engine` once with the ONNX path.
+
+    Covers the public-API wrapper directly (as opposed to the CLI `main()` path, which
+    `TestCliExportMain.test_tensorrt_flag_calls_build_engine` already covers).
+    """
+    model = _make_tensorrt_export_model()
+    onnx_output = str(tmp_path / "inference_model.onnx")
+    mock_build_engine = MagicMock(return_value=str(tmp_path / "inference_model.trt"))
+
+    monkeypatch.setattr("rfdetr.export.main.make_infer_image", lambda *_a, **_kw: _make_mock_infer_tensor())
+    monkeypatch.setattr("rfdetr.export.main.export_onnx", lambda *_a, **_kw: onnx_output)
+    monkeypatch.setattr("rfdetr.detr.deepcopy", lambda x: x)
+    monkeypatch.setattr("rfdetr.export._tensorrt.build_engine", mock_build_engine)
+
+    result = _detr_module.RFDETR.export(model, output_dir=str(tmp_path), format=export_format, shape=(14, 14))
+
+    mock_build_engine.assert_called_once()
+    assert mock_build_engine.call_args.args == (onnx_output,), (
+        f"ONNX path must be passed positionally, got {mock_build_engine.call_args.args!r}"
+    )
+    assert str(result) == str(tmp_path / "inference_model.trt")
+
+
+@pytest.mark.parametrize("fp16", [pytest.param(True, id="fp16"), pytest.param(False, id="fp32")])
+def test_rfdetr_export_tensorrt_forwards_fp16(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fp16: bool) -> None:
+    """`RFDETR.export(format="tensorrt", fp16=...)` must forward the precision flag to `build_engine`.
+
+    Passing ``fp16=False`` lets callers build an FP32 engine on TensorRT builds that lack the FP16 builder flag.
+    """
+    model = _make_tensorrt_export_model()
+    onnx_output = str(tmp_path / "inference_model.onnx")
+    mock_build_engine = MagicMock(return_value=str(tmp_path / "inference_model.trt"))
+
+    monkeypatch.setattr("rfdetr.export.main.make_infer_image", lambda *_a, **_kw: _make_mock_infer_tensor())
+    monkeypatch.setattr("rfdetr.export.main.export_onnx", lambda *_a, **_kw: onnx_output)
+    monkeypatch.setattr("rfdetr.detr.deepcopy", lambda x: x)
+    monkeypatch.setattr("rfdetr.export._tensorrt.build_engine", mock_build_engine)
+
+    _detr_module.RFDETR.export(model, output_dir=str(tmp_path), format="tensorrt", fp16=fp16, shape=(14, 14))
+
+    assert mock_build_engine.call_args.kwargs["fp16"] == fp16
+
+
+def test_rfdetr_export_tensorrt_failure_restores_device(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A `build_engine` failure must still restore the live model to its original device.
+
+    Regression test for the try/finally around the CPU-move .. TensorRT-conversion span in `RFDETR.export()` — a build
+    failure previously (pre-merge) could strand the model on CPU.
+    """
+    # Deliberately distinct from the "cpu" staging move inside export() — if this were "cpu" too, the
+    # assertion below would pass even with the `finally` restore deleted (both moves would look identical).
+    original_device = "original-device"
+    model = _make_tensorrt_export_model(device=original_device)
+    onnx_output = str(tmp_path / "inference_model.onnx")
+
+    def _raise_build_engine(*_args, **_kwargs):
+        raise RuntimeError("engine build failed")
+
+    monkeypatch.setattr("rfdetr.export.main.make_infer_image", lambda *_a, **_kw: _make_mock_infer_tensor())
+    monkeypatch.setattr("rfdetr.export.main.export_onnx", lambda *_a, **_kw: onnx_output)
+    # Real deepcopy (not identity) — the exported `model` local must be a distinct object from
+    # `self.model.model` so only the latter's `.to()` calls are tracked, matching production behavior.
+    monkeypatch.setattr("rfdetr.export._tensorrt.build_engine", _raise_build_engine)
+
+    with pytest.raises(RuntimeError):
+        _detr_module.RFDETR.export(model, output_dir=str(tmp_path), format="tensorrt", shape=(14, 14))
+
+    core_model = model.model.model
+    assert core_model.to_calls == ["cpu", original_device], (
+        f"expected exactly one staging move to 'cpu' then one restore to {original_device!r} even though "
+        f"build_engine raised, got device move sequence {core_model.to_calls!r}"
+    )
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("mode", ["train", "eval"], ids=["train_mode", "eval_mode"])
+@pytest.mark.parametrize("mode", [pytest.param("train", id="train_mode"), pytest.param("eval", id="eval_mode")])
 def test_segmentation_outputs_present_in_train_and_eval(mode: Literal["train", "eval"]) -> None:
     """Use case: segmentation outputs are present in both train and eval modes."""
     model = RFDETRSegNano()
@@ -257,6 +455,8 @@ class TestCliExportMain:
         verbose: bool = False,
         opset_version: int = 17,
         tensorrt: bool = False,
+        profile: bool = False,
+        dry_run: bool = False,
         dynamic_batch: bool = False,
     ) -> types.SimpleNamespace:
         return types.SimpleNamespace(
@@ -273,6 +473,8 @@ class TestCliExportMain:
             verbose=verbose,
             opset_version=opset_version,
             tensorrt=tensorrt,
+            profile=profile,
+            dry_run=dry_run,
             dynamic_batch=dynamic_batch,
         )
 
@@ -472,6 +674,117 @@ class TestCliExportMain:
         assert set(dynamic_axes.keys()) == expected_names, (
             f"expected keys {expected_names}, got {set(dynamic_axes.keys())}"
         )
+
+    def test_tensorrt_flag_calls_build_engine(self, output_dir: str) -> None:
+        """When tensorrt=True, main() must call build_engine with the ONNX output path."""
+        build_engine_calls: list[str] = []
+
+        def fake_build_engine(onnx_path: str, **_kwargs) -> str:
+            build_engine_calls.append(onnx_path)
+            return onnx_path.replace(".onnx", ".trt")
+
+        args = self._make_args(output_dir=output_dir, tensorrt=True)
+        onnx_output = str(args.output_dir) + "/inference_model.onnx"
+
+        mock_model = MagicMock()
+        mock_model.parameters.return_value = []
+        mock_model.backbone.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.projector.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.encoder.parameters.return_value = []
+        mock_model.transformer.parameters.return_value = []
+        mock_model.to.return_value = mock_model
+        mock_model.cpu.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_model.return_value = {
+            "pred_boxes": torch.zeros(1, 300, 4),
+            "pred_logits": torch.zeros(1, 300, 90),
+        }
+        mock_tensor = MagicMock()
+        mock_tensor.to.return_value = mock_tensor
+        mock_tensor.cpu.return_value = mock_tensor
+
+        with (
+            patch.object(_cli_export_module, "build_model", return_value=(mock_model, MagicMock(), MagicMock())),
+            patch.object(_cli_export_module, "make_infer_image", return_value=mock_tensor),
+            patch.object(_cli_export_module, "export_onnx", return_value=onnx_output),
+            patch.object(_cli_export_module, "build_engine", side_effect=fake_build_engine),
+            patch.object(_cli_export_module, "get_rank", return_value=0),
+        ):
+            _cli_export_module.main(args)
+
+        assert len(build_engine_calls) == 1, "build_engine should be called exactly once"
+        assert build_engine_calls[0] == onnx_output, (
+            f"build_engine called with {build_engine_calls[0]!r}, expected {onnx_output!r}"
+        )
+
+    def test_tensorrt_flag_forwards_verbose_and_dry_run_kwargs(self, output_dir: str) -> None:
+        """Main() must forward args.verbose/args.dry_run to build_engine as keyword args, not attribute access on
+        build_engine's side — regression test for the latent AttributeError risk when args lacks these attrs."""
+        args = self._make_args(output_dir=output_dir, tensorrt=True, verbose=True, dry_run=True)
+        onnx_output = str(args.output_dir) + "/inference_model.onnx"
+
+        mock_model = MagicMock()
+        mock_model.parameters.return_value = []
+        mock_model.backbone.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.projector.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.encoder.parameters.return_value = []
+        mock_model.transformer.parameters.return_value = []
+        mock_model.to.return_value = mock_model
+        mock_model.cpu.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_model.return_value = {
+            "pred_boxes": torch.zeros(1, 300, 4),
+            "pred_logits": torch.zeros(1, 300, 90),
+        }
+        mock_tensor = MagicMock()
+        mock_tensor.to.return_value = mock_tensor
+        mock_tensor.cpu.return_value = mock_tensor
+        mock_build_engine = MagicMock(return_value=str(args.output_dir) + "/inference_model.trt")
+
+        with (
+            patch.object(_cli_export_module, "build_model", return_value=(mock_model, MagicMock(), MagicMock())),
+            patch.object(_cli_export_module, "make_infer_image", return_value=mock_tensor),
+            patch.object(_cli_export_module, "export_onnx", return_value=onnx_output),
+            patch.object(_cli_export_module, "build_engine", mock_build_engine),
+            patch.object(_cli_export_module, "get_rank", return_value=0),
+        ):
+            _cli_export_module.main(args)
+
+        mock_build_engine.assert_called_once_with(onnx_output, fp16=True, verbose=True, dry_run=True, output_name=None)
+
+    def test_tensorrt_false_does_not_call_build_engine(self, output_dir: str) -> None:
+        """When tensorrt=False (default), main() must not call build_engine."""
+        build_engine_calls: list[str] = []
+
+        def fake_build_engine(onnx_path: str, **_kwargs) -> str:
+            build_engine_calls.append(onnx_path)
+            return onnx_path.replace(".onnx", ".trt")
+
+        args = self._make_args(output_dir=output_dir, tensorrt=False)
+
+        mock_model = MagicMock()
+        mock_model.parameters.return_value = []
+        mock_model.backbone.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.projector.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.encoder.parameters.return_value = []
+        mock_model.transformer.parameters.return_value = []
+        mock_model.to.return_value = mock_model
+        mock_model.cpu.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_tensor = MagicMock()
+        mock_tensor.to.return_value = mock_tensor
+        mock_tensor.cpu.return_value = mock_tensor
+
+        with (
+            patch.object(_cli_export_module, "build_model", return_value=(mock_model, MagicMock(), MagicMock())),
+            patch.object(_cli_export_module, "make_infer_image", return_value=mock_tensor),
+            patch.object(_cli_export_module, "export_onnx", return_value=str(args.output_dir) + "/model.onnx"),
+            patch.object(_cli_export_module, "build_engine", side_effect=fake_build_engine),
+            patch.object(_cli_export_module, "get_rank", return_value=0),
+        ):
+            _cli_export_module.main(args)
+
+        assert len(build_engine_calls) == 0, "build_engine must not be called when tensorrt=False"
 
     @pytest.mark.parametrize(
         "device",
@@ -789,6 +1102,54 @@ class TestExportOnnxVariantNaming:
 
         assert captured["output_file"].endswith("backbone_model.onnx")
 
+    def test_output_name_overrides_variant_name(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """output_name takes precedence over variant_name and is used verbatim."""
+        captured: dict = {}
+
+        def _fake_onnx_export(*args, **kwargs) -> None:
+            captured["output_file"] = args[2]
+
+        monkeypatch.setattr(_cli_export_module.torch.onnx, "export", _fake_onnx_export)
+
+        _cli_export_module.export_onnx(
+            output_dir=str(tmp_path),
+            model=torch.nn.Identity(),
+            input_names=["input"],
+            input_tensors=torch.randn(1, 3, 8, 8),
+            output_names=["dets"],
+            dynamic_axes=None,
+            verbose=False,
+            variant_name="rfdetr-medium",
+            output_name="my-model",
+        )
+
+        assert captured["output_file"].endswith("my-model.onnx")
+
+    def test_output_name_with_backbone_keeps_structural_suffix(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """output_name + backbone_only still appends '-backbone' (structural, not a precision detail)."""
+        captured: dict = {}
+
+        def _fake_onnx_export(*args, **kwargs) -> None:
+            captured["output_file"] = args[2]
+
+        monkeypatch.setattr(_cli_export_module.torch.onnx, "export", _fake_onnx_export)
+
+        _cli_export_module.export_onnx(
+            output_dir=str(tmp_path),
+            model=torch.nn.Identity(),
+            input_names=["input"],
+            input_tensors=torch.randn(1, 3, 8, 8),
+            output_names=["features"],
+            dynamic_axes=None,
+            backbone_only=True,
+            verbose=False,
+            output_name="my-model",
+        )
+
+        assert captured["output_file"].endswith("my-model-backbone.onnx")
+
     def test_rfdetr_export_passes_variant_name(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """RFDETR.export() passes self.size as variant_name to export_onnx."""
         captured: dict = {}
@@ -846,6 +1207,37 @@ class TestExportOnnxVariantNaming:
         _detr_module.RFDETR.export(model, output_dir=str(tmp_path), shape=(14, 14))
 
         assert captured["variant_name"] is None
+
+    def test_rfdetr_export_passes_output_name(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """RFDETR.export()'s output_name kwarg reaches export_onnx alongside variant_name (output_name wins)."""
+        captured: dict = {}
+
+        model = types.SimpleNamespace(
+            model=types.SimpleNamespace(model=_DummyCoreModel(), device="cpu", resolution=14),
+            model_config=types.SimpleNamespace(
+                segmentation_head=False,
+                use_grouppose_keypoints=False,
+                num_channels=3,
+            ),
+            size="rfdetr-medium",
+        )
+
+        def _fake_make_infer_image(*_args, **_kwargs):
+            return torch.zeros(1, 3, 14, 14)
+
+        def _fake_export_onnx(*_args, variant_name=None, output_name=None, **_kw):
+            captured["variant_name"] = variant_name
+            captured["output_name"] = output_name
+            return str(tmp_path / "my-model.onnx")
+
+        monkeypatch.setattr("rfdetr.export.main.make_infer_image", _fake_make_infer_image)
+        monkeypatch.setattr("rfdetr.export.main.export_onnx", _fake_export_onnx)
+        monkeypatch.setattr("rfdetr.detr.deepcopy", lambda x: x)
+
+        _detr_module.RFDETR.export(model, output_dir=str(tmp_path), shape=(14, 14), output_name="my-model")
+
+        assert captured["variant_name"] == "rfdetr-medium"
+        assert captured["output_name"] == "my-model"
 
     @pytest.mark.parametrize(
         "variant_name, expected_suffix",

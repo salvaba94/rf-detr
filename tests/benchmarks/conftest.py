@@ -3,7 +3,6 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-import socket
 from pathlib import Path
 
 import pytest
@@ -16,19 +15,12 @@ from rfdetr.datasets._develop import (
     _nonempty_file_exists,
 )
 from rfdetr.utilities.reproducibility import seed_all
+from tests._online import is_online
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DATA_DIR = _PROJECT_ROOT / "data"
 _COCO_HOST = "images.cocodataset.org"
 _COCO_PORT = 80
-
-
-def _is_online(host: str, port: int, timeout_s: float = 3.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout_s):
-            return True
-    except OSError:
-        return False
 
 
 @pytest.fixture(scope="session")
@@ -37,8 +29,12 @@ def download_coco_val() -> tuple[Path, Path]:
 
     Returns:
         Tuple containing the images root directory and annotations file path.
+
+    Example:
+        >>> download_coco_val.__name__
+        'download_coco_val'
     """
-    if not _is_online(_COCO_HOST, _COCO_PORT):
+    if not is_online(_COCO_HOST, _COCO_PORT):
         pytest.skip("Offline environment, skipping COCO val2017 benchmark tests.")
 
     images_root = _DATA_DIR / "val2017"
@@ -56,8 +52,13 @@ def download_coco_val() -> tuple[Path, Path]:
 
 @pytest.fixture(scope="session")
 def download_coco_val_keypoints() -> tuple[Path, Path]:
-    """Prepare COCO val images plus person-keypoint annotations for benchmark tests."""
-    if not _is_online(_COCO_HOST, _COCO_PORT):
+    """Prepare COCO val images plus person-keypoint annotations for benchmark tests.
+
+    Example:
+        >>> download_coco_val_keypoints.__name__
+        'download_coco_val_keypoints'
+    """
+    if not is_online(_COCO_HOST, _COCO_PORT):
         pytest.skip("Offline environment, skipping COCO keypoint benchmark tests.")
 
     images_root = _DATA_DIR / "val2017"
@@ -75,8 +76,13 @@ def download_coco_val_keypoints() -> tuple[Path, Path]:
 
 @pytest.fixture(scope="session")
 def download_coco_train_val_keypoints() -> Path:
-    """Prepare full COCO train/val images plus person-keypoint annotations for release-qualification tests."""
-    if not _is_online(_COCO_HOST, _COCO_PORT):
+    """Prepare full COCO train/val images plus person-keypoint annotations for release-qualification tests.
+
+    Example:
+        >>> download_coco_train_val_keypoints.__name__
+        'download_coco_train_val_keypoints'
+    """
+    if not is_online(_COCO_HOST, _COCO_PORT):
         pytest.skip("Offline environment, skipping full COCO keypoint training validation.")
 
     lock_path = _DATA_DIR / ".coco_keypoint_train_val_download.lock"
@@ -105,6 +111,10 @@ def seed_everything(request: pytest.FixtureRequest) -> None:
 
     Args:
         request: Pytest fixture request that may carry an overridden seed.
+
+    Example:
+        >>> seed_everything.__name__
+        'seed_everything'
     """
     seed = request.param if hasattr(request, "param") else 7
     seed_all(seed)
@@ -115,6 +125,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
     This hook runs after collection but before xdist distributes tests to workers. By moving the training test to the
     front, we ensure it gets scheduled early, maximizing parallel resource utilization.
+
+    Example:
+        >>> pytest_collection_modifyitems.__name__
+        'pytest_collection_modifyitems'
     """
     training_tests = []
     other_tests = []

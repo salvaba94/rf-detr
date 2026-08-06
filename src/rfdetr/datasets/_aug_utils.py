@@ -16,6 +16,34 @@ HFLIP_TRANSFORM_NAMES: frozenset[str] = frozenset({"HorizontalFlip", "Flip", "D4
 
 CONTAINER_TRANSFORM_NAMES: frozenset[str] = frozenset({"OneOf", "SomeOf", "Sequential"})
 
+# Target-dict keys that describe the whole image rather than individual object instances.
+# Both augmentation backends (torchvision-native in ``_torchvision.py`` and Albumentations in
+# ``transforms.py``) treat these as global: they are never sliced by the per-instance keep mask
+# when boxes are dropped. Shared here so the two pipelines stay in sync on this image-level
+# subset while each keeps its own, deliberately different, per-instance-field policy (notably
+# how each handles ``labels`` — see the per-instance filter helpers in both modules).
+IMAGE_LEVEL_TARGET_FIELDS: frozenset[str] = frozenset({"orig_size", "size", "image_id"})
+
+
+def resolve_keypoint_flip_pairs(args: Any, *, include_keypoints: bool) -> list[int] | None:
+    """Resolve the ``keypoint_flip_pairs`` sentinel for augmentation-pipeline gating.
+
+    ``None`` (not ``[]``) signals a detection pipeline to
+    ``AlbumentationsWrapper.from_config``, which preserves horizontal-flip
+    augmentations. A list (possibly empty) signals a keypoint pipeline; an empty
+    list means "keypoint pipeline with no flip pairs defined", which strips hflip
+    augmentations to prevent incorrect keypoint annotations. See #1243.
+
+    Args:
+        args: Argument namespace optionally carrying a ``keypoint_flip_pairs`` attribute.
+        include_keypoints: Whether the augmentation config will be applied to keypoint data.
+
+    Returns:
+        ``None`` for detection-only pipelines, otherwise the resolved flip-pair
+        list (possibly empty).
+    """
+    return (getattr(args, "keypoint_flip_pairs", []) or []) if include_keypoints else None
+
 
 def _warn_keypoint_hflip_disabled(aug_name: str, warn: Callable[..., None]) -> None:
     """Emit the standard warning for a disabled keypoint horizontal flip."""

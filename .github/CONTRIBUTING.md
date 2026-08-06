@@ -140,16 +140,21 @@ uv sync --group build      # Build tools only
 
 **Important:** Always run `uv sync` after pulling changes to ensure your dependencies are up to date.
 
+### Optional Extras
+
+- `rfdetr[train]` installs the minimal training loop dependencies and uses torchvision-native default augmentations.
+- `rfdetr[augment]` installs Albumentations (custom CPU `aug_config` dictionaries and built-in presets) and Kornia (GPU-side augmentation with `augmentation_backend="gpu"` or `"auto"`).
+
 ### Running Tests
 
 > **CI Workflows as Source of Truth:** See `.github/workflows/ci-tests-cpu.yml` and `.github/workflows/ci-tests-gpu.yml` for the exact commands used in continuous integration.
 
 ```bash
 # Run CPU tests (default for local development; mirrors CI)
-uv run --no-sync pytest src/ tests/ -n 2 -m "not gpu" --ignore=tests/run_smoke_all_models.py --cov=rfdetr --cov-report=xml --timeout=240 --durations=50
+uv run --no-sync pytest src/ tests/ -n 2 -m "not gpu" --ignore=tests/run_smoke_all_models.py --ignore=tests/legacy/test_checkpoint_compat.py --cov=rfdetr --cov-report=xml --timeout=240 --durations=50
 
 # Run GPU tests (requires GPU; mirrors CI)
-uv run --no-sync pytest tests/ -m gpu -n 3 --reruns 1 --only-rerun "OutOfMemoryError" --cov=rfdetr --cov-report=xml --timeout=600 --durations=20
+uv run --no-sync pytest tests/ -m gpu --ignore=tests/legacy/test_checkpoint_compat.py -n 3 --reruns 1 --only-rerun "OutOfMemoryError" --cov=rfdetr --cov-report=xml --timeout=600 --durations=20
 ```
 
 **Development vs. PR Requirements:**
@@ -281,10 +286,13 @@ Our continuous integration tests run on:
 
 This ensures your changes work across all supported platforms and Python versions.
 
+**Legacy checkpoint compatibility is advisory only.** `ci-legacy-checkpoints.yml` is not among develop's required status checks (`Test docs build`, `pre-commit.ci - pr`, `testing-guardian`, and `Testing`). The required `Testing` job invokes pytest with `--ignore=tests/legacy/test_checkpoint_compat.py`, so it excludes legacy tests. Branch-protection required-check configuration is repo-admin config outside this PR's diff. This is a deliberate advisory-only tradeoff: a legacy-compatibility failure, including an intentional future checkpoint-format break, does not block merge.
+
 **Key GitHub Actions workflow files** (in `.github/workflows/`):
 
 - **ci-tests-cpu.yml** — CPU tests across Ubuntu/Windows/macOS × Python 3.10–3.13
 - **ci-tests-gpu.yml** — GPU-dependent tests
+- **ci-legacy-checkpoints.yml** — Backward-compatibility checkpoint-loading tests across historical rfdetr releases (advisory only — not a required check; a compat break does not block merge)
 - **build-package.yml** — Build and validate distributions (`uv build` + `twine check`)
 - **ci-build-docs.yml** — Documentation build validation
 - **publish-docs.yml** — Deploy docs to GitHub Pages on release
@@ -295,7 +303,7 @@ This ensures your changes work across all supported platforms and Python version
 
 ```bash
 # Run tests with parallel execution (recommended)
-uv run --no-sync pytest src/ tests/ -n 2 -m "not gpu" --ignore=tests/run_smoke_all_models.py --timeout=240 --durations=50
+uv run --no-sync pytest src/ tests/ -n 2 -m "not gpu" --ignore=tests/run_smoke_all_models.py --ignore=tests/legacy/test_checkpoint_compat.py --timeout=240 --durations=50
 
 # Run a specific test file
 uv run --no-sync pytest tests/models/test_model.py
@@ -443,6 +451,9 @@ def sample_function(param1: int, param2: int = 10) -> bool:
 ```
 
 Following this pattern helps ensure consistency throughout the codebase.
+
+> [!IMPORTANT]
+> This applies to helper functions inside `tests/` too, not just `src/`. Any non-`test_*` function used as a test fixture/builder (e.g. `_make_checkpoint`, `_random_xyxy_boxes`) needs a docstring with an `Examples` doctest that exercises it directly — a small, fast check that the helper still does what its callers assume. `pyproject.toml`'s `--doctest-plus` runs doctests across `tests/` for exactly this reason (see the comment above `[tool.pytest.ini_options]`). Skip the live doctest (`# doctest: +SKIP` with a one-line reason) only when the helper cannot run standalone — e.g. it is a `@pytest.fixture` (pytest now hard-fails on direct fixture calls) or needs real GPU/XLA/network hardware.
 
 ## Reporting Bugs
 

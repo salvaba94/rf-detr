@@ -33,7 +33,13 @@ from rfdetr.models.postprocess import PostProcess
 
 
 def _make_ns(mc=None, tc=None):
-    """Build a namespace suitable for builder functions."""
+    """Build a namespace suitable for builder functions.
+
+    Examples:
+        >>> ns = _make_ns()
+        >>> ns.num_classes
+        80
+    """
     mc = mc or RFDETRBaseConfig(num_classes=80, pretrain_weights=None, device="cpu")
     tc = tc or TrainConfig(dataset_dir="/tmp")
     return _namespace_from_configs(mc, tc)
@@ -350,6 +356,35 @@ class TestBuildModelContextCharacterization:
         mc = RFDETRBaseConfig(num_classes=80, pretrain_weights=None, device="cpu")
         ctx = _build_model_context(mc)
         assert ctx.inference_model is None
+
+    def test_args_dataset_dir_does_not_leak_cwd(self) -> None:
+        """The serialized namespace must not embed the caller's realpathed CWD as dataset_dir."""
+        from rfdetr.detr import _build_model_context
+
+        mc = RFDETRBaseConfig(num_classes=80, pretrain_weights=None, device="cpu")
+        ctx = _build_model_context(mc)
+        assert ctx.args.dataset_dir is None
+
+    def test_args_output_dir_does_not_leak_cwd(self) -> None:
+        """The serialized namespace must keep a relative output_dir, not the caller's realpathed CWD."""
+        from rfdetr.detr import _build_model_context
+
+        mc = RFDETRBaseConfig(num_classes=80, pretrain_weights=None, device="cpu")
+        ctx = _build_model_context(mc)
+        assert ctx.args.output_dir == "output"
+
+    def test_predict_postprocess_always_upsamples_masks_regardless_of_eval_flag(self) -> None:
+        """RFDETR.predict's PostProcess must always upsample masks to full image resolution.
+
+        TrainConfig.eval_masks_head_resolution is a validation-only cost-saving knob; it must never leak into the
+        inference/predict path via ``_build_model_context``'s internal dummy ``TrainConfig`` — deployment predictions
+        always report at native image resolution regardless of how the checkpoint was trained.
+        """
+        from rfdetr.detr import _build_model_context
+
+        mc = RFDETRSegNanoConfig(pretrain_weights=None, device="cpu")
+        ctx = _build_model_context(mc)
+        assert ctx.postprocess.upsample_masks_to_image_size is True
 
 
 # ---------------------------------------------------------------------------

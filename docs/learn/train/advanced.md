@@ -234,6 +234,45 @@ torchrun \
 
 Run this command on each node, changing `--node_rank` accordingly.
 
+### Keypoint / Pose models
+
+Keypoint models (`RFDETRKeypointPreview`) train under `DistributedDataParallel` on multiple GPUs and
+multiple nodes exactly like detection models — build a script and launch it with `torchrun`, setting
+`devices=` (e.g. `"auto"` or an integer like `8`):
+
+```python
+# train_pose.py
+from rfdetr import RFDETRKeypointPreview
+
+model = RFDETRKeypointPreview()
+
+model.train(
+    dataset_dir="path/to/keypoint-dataset",
+    epochs=100,
+    batch_size=2,  # per-GPU batch size
+    grad_accum_steps=1,  # recommended on multi-GPU — see note below
+    lr=1e-4,
+    output_dir="output",
+    devices="auto",  # or devices=8
+)
+```
+
+```bash
+torchrun --nproc_per_node=8 train_pose.py
+```
+
+!!! note "Prefer `grad_accum_steps=1` on multi-GPU for keypoints"
+
+    Keypoint models use **manual optimization** so the per-step box-count loss normalization is
+    computed over the full accumulated batch. As a result, gradients synchronize on **every**
+    microbatch rather than only at the end of an accumulation window. Training with
+    `grad_accum_steps > 1` on multiple GPUs is still numerically correct, but performs one
+    `all_reduce` per microbatch (i.e. `grad_accum_steps`× the necessary communication). For best
+    throughput, scale with more GPUs / a larger per-GPU `batch_size` and keep `grad_accum_steps=1`.
+
+    Sharded strategies (FSDP / DeepSpeed) are **not** supported for keypoint models — use `ddp`
+    (or `strategy="auto"` with `devices > 1`).
+
 ### Advanced multi-GPU options (PTL API)
 
 For fine-grained control over strategy, sync batch norm, precision, and other distributed settings, use the Lightning API directly.
@@ -244,7 +283,16 @@ For fine-grained control over strategy, sync batch norm, precision, and other di
 
 ## Custom Augmentations
 
-RF-DETR supports advanced data augmentations using the [Albumentations](https://albumentations.ai/) library, providing access to over 70 different image transformations optimized for object detection.
+RF-DETR uses torchvision-native default augmentations during training. Passing a non-empty `aug_config` switches to one of two optional backends, selected by `augmentation_backend`:
+
+- **CPU (default when `aug_config` is set):** [Albumentations](https://albumentations.ai/) integration, with access to over 70 image transformations optimized for object detection.
+- **GPU (`augmentation_backend="kornia"` or `"auto"` with CUDA):** [Kornia](https://kornia.readthedocs.io/) integration, applying augmentations on-batch on the GPU instead of per-sample on CPU workers.
+
+Both optional backends share the same `aug_config` dictionary format. See [Augmentation Backend Values](augmentations.md#augmentation-backend-values) for the full set of accepted `augmentation_backend` strings, including `"torchvision"` to force the default pipeline regardless of what's installed. Install the optional augmentation extra before using custom `aug_config` dictionaries or the built-in presets:
+
+```bash
+pip install "rfdetr[train,augment]"
+```
 
 → **[Complete Augmentation Guide](augmentations.md)** - Configuration examples, best practices, troubleshooting, and advanced topics.
 
@@ -286,18 +334,38 @@ To disable all augmentations, pass an empty dict:
 model.train(dataset_dir="path/to/dataset", aug_config={})
 ```
 
+`aug_config` controls only the augmentation stack (Albumentations on CPU, or the
+equivalent Kornia pipeline when `augmentation_backend="kornia"`/`"auto"`). The training
+resize pipeline's independent resize → crop → resize branch (Option B) is controlled
+separately by `scale_jitter`:
+
+```python
+# Keep aug_config's default augmentation stack, but disable random crop/scale jitter
+model.train(dataset_dir="path/to/dataset", scale_jitter=False)
+```
+
+`scale_jitter` defaults to `True`. Set it to `False` to use direct resize only —
+no random crop, so annotations near image borders are never clipped.
+
 ---
 
 ## Memory Optimization
 
 ### Gradient Checkpointing
 
-For large models or high resolutions, enable gradient checkpointing to trade compute for memory:
+For large models or high resolutions, enable gradient checkpointing to trade compute for memory.
+
+!!! warning "Constructor parameter — not a `train()` parameter"
+
+    `gradient_checkpointing` is a `ModelConfig` field and must be passed to the **model constructor**, not to `train()`. Passing it to `train()` will raise a `ValidationError` because `TrainConfig` has `extra="forbid"`.
 
 ```python
+from rfdetr import RFDETRMedium
+
+model = RFDETRMedium(gradient_checkpointing=True)
+
 model.train(
     dataset_dir="path/to/dataset",
-    gradient_checkpointing=True,
     batch_size=2,  # May be able to increase with checkpointing
 )
 ```
@@ -341,10 +409,9 @@ RF-DETR applies built-in augmentations during training:
 
 - Random resizing
 - Random cropping
-- Color jittering
 - Horizontal flipping
 
-These are automatically configured and don't require manual setup.
+These defaults are implemented with torchvision and don't require manual setup. Color jitter and other advanced transforms are available through the optional Albumentations presets and custom `aug_config` dictionaries.
 
 ---
 
@@ -355,7 +422,7 @@ These are automatically configured and don't require manual setup.
 If you encounter CUDA out of memory errors:
 
 1. Reduce `batch_size`
-2. Enable `gradient_checkpointing=True`
+2. Enable `gradient_checkpointing=True` (pass to the model constructor, not `train()`)
 3. Reduce `resolution`
 4. Increase `grad_accum_steps` to maintain effective batch size
 

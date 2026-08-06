@@ -6,170 +6,148 @@
 # Copied and modified from LW-DETR (https://github.com/Atten4Vis/LW-DETR)
 # Copyright (c) 2024 Baidu. All Rights Reserved.
 # ------------------------------------------------------------------------
-"""TensorRT export helpers: trtexec invocation and output parsing."""
+"""TensorRT export helper: build a serialized engine from ONNX in-process.
 
-import argparse
+The engine is built with the TensorRT Python API (via `polygraphy`), so no
+``trtexec`` binary on ``PATH`` is required — only ``pip install rfdetr[tensorrt]``.
+
+For TensorRT *inference*, use the ``inference-models`` library which provides
+multi-backend RF-DETR support (PyTorch, ONNX, TensorRT) with automatic backend
+selection::
+
+    from inference_models import AutoModel
+
+    model = AutoModel.from_pretrained("rfdetr-small")
+
+See https://github.com/roboflow/inference/tree/main/inference_models for details.
+"""
+
+from __future__ import annotations
+
 import os
-import re
-import subprocess
 
+from rfdetr.export._naming import resolve_export_stem
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
 
-
-def run_command_shell(command: list[str], dry_run: bool = False) -> "subprocess.CompletedProcess[str]":
-    """Run *command* as a subprocess, optionally in dry-run mode.
-
-    Note: Despite the legacy name, this function always uses ``shell=False`` —
-    command must be an argv list, never a shell string.
-
-    Args:
-        command: Argument list (``argv``).  Must be a list — never a shell
-            string — so that paths containing spaces or shell metacharacters
-            are passed verbatim to the OS without interpretation.
-        dry_run: When ``True``, log the command that *would* run and return a
-            synthetic :class:`subprocess.CompletedProcess` with ``returncode=0``
-            without actually executing anything.
-
-    Returns:
-        A :class:`subprocess.CompletedProcess` instance.
-
-    Raises:
-        subprocess.CalledProcessError: If the command exits with a non-zero
-            return code (``check=True``).
-    """
-    if dry_run:
-        display = " ".join(command)
-        logger.info(f"\nCUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES', '')} {display}\n")
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
-    try:
-        result = subprocess.run(command, shell=False, capture_output=True, text=True, check=True)
-        return result
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command failed with exit code {e.returncode}")
-        logger.error(f"Error output:\n{e.stderr}")
-        raise
-
-
-def trtexec(onnx_dir: str, args: argparse.Namespace) -> str:
-    """Convert an ONNX model to a TensorRT engine using ``trtexec``.
-
-    Args:
-        onnx_dir: Path to the source ``.onnx`` file.
-        args: Parsed CLI arguments.  Consumed attributes: ``profile``,
-            ``verbose``, ``dry_run``.
-
-    Returns:
-        Path to the generated ``.engine`` file.
-
-    Raises:
-        subprocess.CalledProcessError: If ``trtexec`` (or ``nsys profile``) exits
-            with a non-zero return code.
-    """
-    engine_dir = onnx_dir.replace(".onnx", ".engine")
-
-    # Build trtexec argv — list form prevents shell-injection via paths.
-    trt_argv: list[str] = [
-        "trtexec",
-        f"--onnx={onnx_dir}",
-        f"--saveEngine={engine_dir}",
-        "--memPoolSize=workspace:4096",
-        "--fp16",
-        "--useCudaGraph",
-        "--useSpinWait",
-        "--warmUp=500",
-        "--avgRuns=1000",
-        "--duration=10",
-    ]
-    if args.verbose:
-        trt_argv.append("--verbose")
-
-    if args.profile:
-        profile_dir = onnx_dir.replace(".onnx", ".nsys-rep")
-        # Wrap with nsys profile — also argv, not a shell string.
-        argv: list[str] = [
-            "nsys",
-            "profile",
-            f"--output={profile_dir}",
-            "--trace=cuda,nvtx",
-            "--force-overwrite",
-            "true",
-            *trt_argv,
-        ]
-        logger.info(f"Profile data will be saved to: {profile_dir}")
-    else:
-        argv = trt_argv
-
-    output = run_command_shell(argv, args.dry_run)
-    parse_trtexec_output(output.stdout)
-    return engine_dir
-
-
-def parse_trtexec_output(output_text: str) -> dict[str, float]:
-    """Parse latency / throughput statistics from ``trtexec`` stdout.
-
-    Args:
-        output_text: Raw stdout from a ``trtexec`` run.
-
-    Returns:
-        Dictionary mapping statistic names to float values. Empty dict if no
-        patterns matched.
-    """
-    logger.info(output_text)
-    # Common patterns in trtexec output
-    gpu_compute_pattern = (
-        r"GPU Compute Time: min = (\d+\.\d+) ms, max = (\d+\.\d+) ms, mean = (\d+\.\d+) ms, median = (\d+\.\d+) ms"
+# polygraphy ships in the ``rfdetr[tensorrt]`` extra alongside ``tensorrt``. Import it
+# lazily at module scope (guarded) so importing this module never fails on hosts
+# without TensorRT, and so tests can monkeypatch these names without polygraphy
+# installed.
+try:
+    from polygraphy.backend.trt import (
+        CreateConfig,
+        engine_from_network,
+        network_from_onnx_path,
+        save_engine,
     )
-    h2d_pattern = r"Host to Device Transfer Time: min = (\d+\.\d+) ms, max = (\d+\.\d+) ms, mean = (\d+\.\d+) ms"
-    d2h_pattern = r"Device to Host Transfer Time: min = (\d+\.\d+) ms, max = (\d+\.\d+) ms, mean = (\d+\.\d+) ms"
-    latency_pattern = r"Latency: min = (\d+\.\d+) ms, max = (\d+\.\d+) ms, mean = (\d+\.\d+) ms"
-    throughput_pattern = r"Throughput: (\d+\.\d+) qps"
 
-    stats: dict[str, float] = {}
+    _IS_TENSORRT_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised via the guard in build_engine
+    CreateConfig = None
+    engine_from_network = None
+    network_from_onnx_path = None
+    save_engine = None
 
-    # Extract compute times
-    if match := re.search(gpu_compute_pattern, output_text):
-        stats.update(
-            {
-                "compute_min_ms": float(match.group(1)),
-                "compute_max_ms": float(match.group(2)),
-                "compute_mean_ms": float(match.group(3)),
-                "compute_median_ms": float(match.group(4)),
-            }
-        )
+    _IS_TENSORRT_AVAILABLE = False
 
-    # Extract H2D times
-    if match := re.search(h2d_pattern, output_text):
-        stats.update(
-            {
-                "h2d_min_ms": float(match.group(1)),
-                "h2d_max_ms": float(match.group(2)),
-                "h2d_mean_ms": float(match.group(3)),
-            }
-        )
 
-    # Extract D2H times
-    if match := re.search(d2h_pattern, output_text):
-        stats.update(
-            {
-                "d2h_min_ms": float(match.group(1)),
-                "d2h_max_ms": float(match.group(2)),
-                "d2h_mean_ms": float(match.group(3)),
-            }
-        )
+def build_engine(
+    onnx_path: str,
+    *,
+    fp16: bool = True,
+    verbose: bool = False,
+    dry_run: bool = False,
+    output_name: str | None = None,
+) -> str:
+    """Build a serialized TensorRT engine from an ONNX model, in-process.
 
-    if match := re.search(latency_pattern, output_text):
-        stats.update(
-            {
-                "latency_min_ms": float(match.group(1)),
-                "latency_max_ms": float(match.group(2)),
-                "latency_mean_ms": float(match.group(3)),
-            }
-        )
+    Uses the TensorRT Python API through ``polygraphy`` — no ``trtexec`` subprocess.
+    Workspace size is left to the TensorRT default (it auto-sizes to the available
+    device memory), which meets or exceeds the historical 4 GiB cap.
 
-    # Extract throughput
-    if match := re.search(throughput_pattern, output_text):
-        stats["throughput_qps"] = float(match.group(1))
+    Args:
+        onnx_path: Path to the source ``.onnx`` file. Its stem (typically the model variant name,
+            e.g. ``"rfdetr-medium"``) is reused for the engine filename unless *output_name* is given.
+        fp16: Enable FP16 precision when building the engine.  Automatically downgraded to FP32 (with a
+            warning) on TensorRT builds that do not expose the FP16 builder flag — the engine filename
+            reflects the precision actually built, not just the requested value (except under
+            *dry_run*, where no build/probe happens so the requested value is used as-is).
+        verbose: Emit extra progress logging.
+        dry_run: Log the intended build and return the engine path without
+            building anything (no TensorRT / GPU required).
+        output_name: Full filename override (without extension). Takes precedence over the ONNX
+            stem and suppresses the ``_fp16``/``_fp32`` suffix — the engine is named
+            ``{output_name}.trt`` verbatim, written alongside *onnx_path*.
 
-    return stats
+    Returns:
+        Path to the generated ``.trt`` engine file.
+
+    Raises:
+        ImportError: If ``polygraphy``/``tensorrt`` are not installed.
+
+    Examples:
+        >>> build_engine("output/rfdetr-medium.onnx", dry_run=True)  # doctest: +SKIP
+        'output/rfdetr-medium_fp16.trt'
+    """
+    onnx_stem = os.path.splitext(onnx_path)[0]
+
+    def _engine_path(*, fp16_used: bool) -> str:
+        if output_name:
+            # Delegate output_name sanitize to the shared resolver so the custom-name stem is derived
+            # identically to the ONNX/CoreML/ExecuTorch backends (single source of truth for basename +
+            # extension stripping); TensorRT still owns its own path prefix and precision suffix below.
+            stem = resolve_export_stem(None, output_name)[0]
+            # Preserve onnx_path's directory prefix verbatim rather than rebuilding it via
+            # os.path.dirname + os.path.join, which inject os.sep (a backslash on Windows) regardless
+            # of onnx_path's own separator style and mis-parse a foreign-separator path. The sibling
+            # suffix branch below deliberately avoids pathlib/os.path for the same reason.
+            sep_idx = max(onnx_path.rfind("/"), onnx_path.rfind("\\"))
+            prefix = onnx_path[: sep_idx + 1] if sep_idx != -1 else ""
+            return f"{prefix}{stem}.trt"
+        # Precision materially changes the engine (fp16 vs fp32 accuracy/speed), so it is always
+        # encoded — unless a custom name was requested. Swapping only the final suffix (rather than
+        # rebuilding the whole path) keeps any earlier ".onnx"-like segment intact and never aliases
+        # the input path; a string-level split (not pathlib) preserves separators verbatim (pathlib
+        # rewrites "/" to "\\" on Windows).
+        return f"{onnx_stem}_{'fp16' if fp16_used else 'fp32'}.trt"
+
+    engine_path = _engine_path(fp16_used=fp16)
+
+    if dry_run:
+        logger.info(f"[dry-run] Would build TensorRT engine (fp16={fp16}): {onnx_path} -> {engine_path}")
+        return engine_path
+
+    if engine_from_network is None:
+        raise ImportError("TensorRT export requires the 'tensorrt' extra. Install with: pip install rfdetr[tensorrt]")
+
+    if fp16:
+        # Some TensorRT builds (e.g. lean/partial wheels) do not expose the FP16 builder flag. polygraphy aborts
+        # when asked to set an unavailable flag, so probe for it up front and fall back to an FP32 engine instead
+        # of crashing the whole export.
+        try:
+            import tensorrt as trt
+
+            if not hasattr(trt.BuilderFlag, "FP16"):
+                logger.warning(
+                    "TensorRT %s does not expose the FP16 builder flag; building an FP32 engine instead. "
+                    "Pass fp16=False to silence this warning.",
+                    getattr(trt, "__version__", "unknown"),
+                )
+                fp16 = False
+                engine_path = _engine_path(fp16_used=fp16)
+        except ImportError:
+            pass  # a missing/broken tensorrt import is surfaced by the polygraphy build chain below
+
+    if verbose:
+        logger.info(f"Building TensorRT engine (fp16={fp16}) from {onnx_path}")
+
+    engine = engine_from_network(
+        network_from_onnx_path(onnx_path),
+        config=CreateConfig(fp16=fp16),
+    )
+    save_engine(engine, path=engine_path)
+
+    logger.info(f"Successfully built TensorRT engine: {engine_path}")
+    return engine_path

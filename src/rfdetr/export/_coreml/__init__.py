@@ -3,8 +3,14 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-"""Deprecated: use ``rfdetr.utilities.files`` instead."""
+"""CoreML export availability.
 
-from rfdetr.utilities.decorators import _warn_deprecated_module
+Import converters from submodules, not this package root.
+"""
 
-_warn_deprecated_module("rfdetr.util.files", "rfdetr.utilities.files", deprecated_in="1.6.0", remove_in="1.9.0")
+try:
+    import coremltools  # noqa: F401 — availability check only, never referenced by name
+
+    _IS_COREMLTOOLS_AVAILABLE = True
+except ImportError:
+    _IS_COREMLTOOLS_AVAILABLE = False

@@ -31,6 +31,7 @@ from rfdetr.export._tflite.converter import (
     _DEFAULT_CALIB_SAMPLES,
     _DEFAULT_DIR_CALIB_SAMPLES,
     _IMAGE_EXTENSIONS,
+    _NUMPY_LOAD_PATCH_LOCK,
     _VALID_QUANTIZATIONS,
     _check_onnx2tf_available,
     _get_onnx_input_info,
@@ -66,6 +67,13 @@ def _install_fake_onnx2tf() -> tuple[_FakeOnnx2tfModule, mock.MagicMock, dict[st
 
     Returns:
         Tuple of (fake_module, convert_mock, saved_originals).
+
+    Examples:
+        >>> fake, convert_mock, saved = _install_fake_onnx2tf()
+        >>> import sys
+        >>> "onnx2tf" in sys.modules
+        True
+        >>> _remove_fake_onnx2tf(saved)
     """
     # Snapshot originals before overwriting (None means the key was absent).
     saved: dict[str, object] = {k: sys.modules.get(k) for k in _ONNX2TF_KEYS}
@@ -107,6 +115,15 @@ def _remove_fake_onnx2tf(saved: dict[str, object] | None = None) -> None:
         saved: Snapshot returned by ``_install_fake_onnx2tf``.  If a key was
             present before installation its original value is restored; if it was absent it is deleted.  When *saved* is
             ``None`` all ``onnx2tf*`` keys are simply deleted (legacy behaviour).
+
+    Examples:
+        >>> _, _, saved = _install_fake_onnx2tf()
+        >>> import sys
+        >>> "onnx2tf" in sys.modules
+        True
+        >>> _remove_fake_onnx2tf(saved)
+        >>> "onnx2tf" in sys.modules
+        False
     """
     if saved is not None:
         for key in _ONNX2TF_KEYS:
@@ -376,13 +393,15 @@ class TestExportTfliteConverter:
         fake_onnx2tf: Any,
         mock_prepare_calib: Any,
     ) -> None:
-        """Fallback returns a stem-scoped file when the primary *_float32.tflite is absent."""
+        """Fallback returns a stem-scoped file when the primary *_fp32.tflite is absent."""
         out = tmp_path / "out"
         out.mkdir()
-        # Scoped fallback: must match {stem}_*.tflite (stem == "model" here).
+        # Scoped fallback: must match {stem}_*.tflite (stem == "model" here). Written pre-renamed
+        # ("_float16") to mirror onnx2tf's real output naming -- _rename_precision_outputs renames it
+        # to "_fp16" before the fallback glob runs.
         (out / "model_float16.tflite").write_bytes(b"fb")
         result = export_tflite(onnx_model, out)
-        assert result.name == "model_float16.tflite"
+        assert result.name == "model_fp16.tflite"
 
     def test_fallback_does_not_return_unrelated_tflite(
         self,
@@ -461,6 +480,36 @@ class TestExportTfliteConverter:
 
     def test_valid_quantizations_set(self) -> None:
         assert _VALID_QUANTIZATIONS == {None, "fp32", "fp16", "int8"}
+
+    def test_output_name_end_to_end_filename_includes_gs_patched(
+        self,
+        tmp_path: Path,
+        fake_onnx2tf: Any,
+        mock_prepare_calib: Any,
+    ) -> None:
+        """A real RF-DETR export always contains GridSample nodes (module docstring), so
+        ``_replace_gridsample_for_tflite`` always renames the ONNX stem with a ``_gs_patched`` infix before ``onnx2tf``
+        ever runs. ``output_name="my-model"`` (already baked into the ONNX filename by ``export_onnx``, per
+        ``_convert_onnx_export``'s docstring) must therefore produce ``my-model_gs_patched_fp32.tflite`` — not ``my-
+        model_fp32.tflite`` — confirming the actually-produced filename rather than the docstring's simplified "inherits
+        its stem" claim.
+
+        The ``fake_onnx2tf`` fixture stubs ``_replace_gridsample_for_tflite`` as a pure passthrough (no rename), so this
+        test overrides that stub to reflect the real rename step.
+        """
+        onnx_path = tmp_path / "my-model.onnx"
+        onnx_path.write_bytes(b"\x08\x06")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "my-model_gs_patched_float32.tflite").write_bytes(b"tflite")
+
+        with mock.patch(
+            "rfdetr.export._tflite.converter._replace_gridsample_for_tflite",
+            side_effect=lambda path, output_dir: output_dir / f"{path.stem}_gs_patched.onnx",
+        ):
+            result = export_tflite(onnx_path, out_dir)
+
+        assert result.name == "my-model_gs_patched_fp32.tflite"
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +679,7 @@ class TestNumpyAllowPickle:
             np.load = original  # type: ignore[assignment]
 
     def test_restores_on_exception(self) -> None:
+        """Patch is restored even when an exception propagates out of the context."""
         original = np.load
         try:
             with _numpy_allow_pickle():
@@ -637,6 +687,28 @@ class TestNumpyAllowPickle:
         except RuntimeError:
             pass
         assert np.load is original
+
+    def test_concurrent_access_lock_not_reentrant(self) -> None:
+        """Lock prevents a second context from patching np.load while the first is still active."""
+        import threading
+
+        entered = threading.Event()
+        released = threading.Event()
+
+        def _hold_context() -> None:
+            with _numpy_allow_pickle():
+                entered.set()
+                released.wait(timeout=2.0)
+
+        holder = threading.Thread(target=_hold_context)
+        holder.start()
+        entered.wait(timeout=2.0)
+
+        acquired = _NUMPY_LOAD_PATCH_LOCK.acquire(blocking=False)
+        released.set()
+        holder.join(timeout=2.0)
+
+        assert not acquired, "Lock must remain held while first context is active"
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +963,38 @@ class TestLoadCalibrationImages:
         assert result.min() >= 0.0
         assert result.max() <= 1.0
 
+    def test_resize_matches_predict_convention(self, tmp_path: Path) -> None:
+        """The calibration resize must follow predict()'s convention: bilinear, half-pixel, antialias-free.
+
+        Guards the #1206 alignment: PIL's default resize (BICUBIC + adaptive antialias when downscaling) produces a
+        pixel distribution the model never sees at inference and would skew the INT8 ranges.
+        """
+        import torchvision.transforms.functional as F  # noqa: N812
+        from PIL import Image
+
+        rng = np.random.default_rng(11)
+        base = rng.integers(0, 256, size=(40, 50, 3), dtype=np.uint8)
+        nearest = getattr(Image, "Resampling", Image).NEAREST
+        pil = Image.fromarray(base, mode="RGB").resize((400, 320), nearest)
+        pil.save(tmp_path / "img.png")
+
+        result = _load_calibration_images(tmp_path, height=128, width=160)
+
+        ref = F.resize(F.to_tensor(pil), [128, 160], antialias=False).numpy().transpose(1, 2, 0)
+        max_diff = float(np.abs(result[0] - ref).max())
+        assert max_diff < 1e-3, (
+            f"Calibration resize diverged from predict()'s antialias-free convention: "
+            f"max|diff|={max_diff:.4f}. _load_calibration_images must resize with "
+            f"_bilinear_resize_half_pixel, not PIL."
+        )
+
+        # PIL's default resample (the old behaviour) must stay far from the reference,
+        # proving this assertion actually discriminates on the resize convention.
+        pil_default = np.asarray(pil.resize((160, 128)), dtype=np.float32) / np.float32(255.0)
+        assert float(np.abs(pil_default - ref).max()) > 0.05, (
+            "PIL's default resize unexpectedly matches the reference; this test no longer discriminates."
+        )
+
     def test_respects_max_images(self, tmp_path: Path) -> None:
         self._make_images(tmp_path, count=10)
         result = _load_calibration_images(tmp_path, height=64, width=64, max_images=4)
@@ -991,7 +1095,14 @@ def _build_gridsample_onnx(
     h_out: int = 4,
     w_out: int = 4,
 ) -> None:
-    """Write a minimal ONNX model with one GridSample node to *path*."""
+    """Write a minimal ONNX model with one GridSample node to *path*.
+
+    Examples:
+        Requires ``onnx`` and ``onnx_graphsurgeon`` which are optional — skipped in the doctest runner.
+
+        >>> callable(_build_gridsample_onnx)  # doctest: +SKIP
+        True
+    """
     import onnx
     from onnx import TensorProto, helper
 
