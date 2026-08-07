@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="assets/roboflow-logo.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
   
@@ -31,7 +31,7 @@
   
 
     
-      <link rel="stylesheet" href="assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="assets/stylesheets/main.ec1eaa64.min.css">
       
       
 
@@ -61,6 +61,16 @@
     
     
   
+  
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-5M220DKLMB"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){window.dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', 'G-5M220DKLMB');
+  </script>
   <link rel="preconnect" href="https://storage.googleapis.com">
 
   
@@ -119,7 +129,7 @@
         "operatingSystem": "Linux, macOS, Windows",
         "url": "https://rfdetr.roboflow.com/develop",
         "downloadUrl": "https://pypi.org/project/rfdetr/",
-        "softwareVersion": "1.8.3",
+        "softwareVersion": "1.10.0.dev",
         "softwareRequirements": "Python >=3.10; torch >=2.2.0; torchvision >=0.17.0; transformers >=5.1.0,<6.0.0",
         "identifier": [
           {"@type": "PropertyValue", "propertyID": "Python package", "value": "rfdetr"},
@@ -251,7 +261,7 @@
         "name": "How do I export RF-DETR to ONNX or TensorRT?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Call model.export(format='onnx') after training or loading a checkpoint. ONNX export works on CPU and produces a single .onnx file compatible with ONNX Runtime and OpenCV DNN. For TensorRT deployment, first export to ONNX and then convert the .onnx model with TensorRT tooling such as trtexec; this requires TensorRT and a CUDA GPU."
+          "text": "Call model.export(format='onnx') after training or loading a checkpoint. ONNX export works on CPU and produces a single .onnx file compatible with ONNX Runtime and OpenCV DNN. For TensorRT deployment, use model.export(format='tensorrt'), which builds a .trt engine in-process via the TensorRT Python API; this requires pip install rfdetr[trt] and a CUDA GPU."
         }
       },
       {
@@ -569,6 +579,25 @@
         </a>
       </li>
     
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="faq/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  FAQ
+
+      </a>
+    </li>
   
 
       
@@ -2406,6 +2435,33 @@
   
   
     <li class="md-nav__item">
+      <a href="faq/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    FAQ
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="cookbooks/" class="md-nav__link">
         
   
@@ -2627,10 +2683,10 @@
 <h1 id="rf-detr-real-time-sota-object-detection-instance-segmentation-and-keypoint-detection">RF-DETR: Real-Time SOTA Object Detection, Instance Segmentation, and Keypoint Detection<a class="headerlink" href="#rf-detr-real-time-sota-object-detection-instance-segmentation-and-keypoint-detection" title="Permanent link">&para;</a></h1>
 <p>RF-DETR is a real-time transformer architecture for object detection, instance segmentation, and keypoint detection (preview) developed by Roboflow. Built on a DINOv2 vision transformer backbone, RF-DETR achieves state-of-the-art accuracy–latency trade-offs: RF-DETR-L reaches 56.5 AP50:95 on COCO at 6.8 ms (NVIDIA T4, TensorRT FP16), and RF-DETR-2XL achieves 60.1 AP50:95 — the first real-time model to exceed 60 AP on COCO. Accepted at <a href="https://arxiv.org/abs/2511.09554">ICLR 2026</a>.</p>
 <p>RF-DETR uses a DINOv2 vision transformer backbone and supports object detection, instance segmentation, and keypoint detection (preview) in a single, consistent API. Core models (Nano through Large) and all code are released under the Apache 2.0 license; XL and 2XLarge detection models require <code>rfdetr[plus]</code> and are provided under PML 1.0.</p>
-<p>Developed by Isaac Robinson, Peter Robicheaux, Fedor Popov, Deva Ramanan (CMU), and Neehar Peri (CMU) at <a href="https://roboflow.com">Roboflow</a>. If you use RF-DETR in your research, please cite:</p>
+<p>Developed by Isaac Robinson, Peter Robicheaux, Matvei Popov, Deva Ramanan (CMU), and Neehar Peri (CMU) at <a href="https://roboflow.com">Roboflow</a>. If you use RF-DETR in your research, please cite:</p>
 <div class="language-bibtex highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nc">@inproceedings</span><span class="p">{</span><span class="nl">robinson2026rfdetr</span><span class="p">,</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="na">title</span><span class="w">     </span><span class="p">=</span><span class="w"> </span><span class="s">{RF-DETR: Real-Time Detection Transformer}</span><span class="p">,</span>
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="na">author</span><span class="w">    </span><span class="p">=</span><span class="w"> </span><span class="s">{Robinson, Isaac and Robicheaux, Peter and Popov, Fedor and Ramanan, Deva and Peri, Neehar}</span><span class="p">,</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="na">author</span><span class="w">    </span><span class="p">=</span><span class="w"> </span><span class="s">{Robinson, Isaac and Robicheaux, Peter and Popov, Matvei and Ramanan, Deva and Peri, Neehar}</span><span class="p">,</span>
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="na">booktitle</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">{International Conference on Learning Representations (ICLR)}</span><span class="p">,</span>
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="na">year</span><span class="w">      </span><span class="p">=</span><span class="w"> </span><span class="s">{2026}</span><span class="p">,</span>
 </span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span><span class="na">url</span><span class="w">       </span><span class="p">=</span><span class="w"> </span><span class="s">{https://arxiv.org/abs/2511.09554}</span>
@@ -2642,7 +2698,7 @@
 <p class="admonition-title">Installation</p>
 <p><a href="https://badge.fury.io/py/rfdetr"><img alt="version" src="https://badge.fury.io/py/rfdetr.svg" width="125" height="20" /></a>
 <a href="https://badge.fury.io/py/rfdetr"><img alt="python-version" src="https://img.shields.io/pypi/pyversions/rfdetr" width="198" height="20" /></a>
-<a href="https://github.com/roboflow/rfdetr/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/pypi/l/rfdetr" width="164" height="20" /></a>
+<a href="https://github.com/roboflow/rf-detr/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/pypi/l/rfdetr" width="164" height="20" /></a>
 <a href="https://pypistats.org/packages/rfdetr"><img alt="downloads" src="https://img.shields.io/pypi/dm/rfdetr" width="258" height="20" /></a></p>
 <div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">pip</label><label for="__tabbed_1_2">uv</label></div>
 <div class="tabbed-content">
@@ -2870,7 +2926,7 @@
 <td>RF-DETR Keypoint (Preview)</td>
 <td>71.8</td>
 <td>9.7</td>
-<td>126.4</td>
+<td>40.7</td>
 <td>576×576</td>
 </tr>
 </tbody>
@@ -2883,7 +2939,7 @@ For the full competitor comparison (YOLO11-pose, YOLO26-pose), see the <a href="
 <p><strong>What is RF-DETR?</strong>
 RF-DETR (Roboflow Detection Transformer) is a real-time object detection and instance segmentation model from Roboflow, accepted at ICLR 2026. It uses a DINOv2 vision transformer backbone and achieves state-of-the-art accuracy–latency trade-offs on COCO (60.1 AP50:95 for RF-DETR-2XL) and RF100-VL.</p>
 <p><strong>How does RF-DETR compare to YOLOv11?</strong>
-RF-DETR-L achieves 56.5 AP50:95 on COCO at 6.8 ms latency on an NVIDIA T4, outperforming YOLOv11x (54.7 AP) at lower latency. The DINOv2 backbone gives RF-DETR stronger performance on domain-shift benchmarks such as RF100-VL.</p>
+RF-DETR-L achieves 56.5 AP50:95 on COCO at 6.8 ms latency on an NVIDIA T4, outperforming YOLOv11x (50.9 AP) at lower latency. The DINOv2 backbone gives RF-DETR stronger performance on domain-shift benchmarks such as RF100-VL.</p>
 <p><strong>What GPU is required to train RF-DETR?</strong>
 A CUDA-capable GPU with at least 8 GB VRAM (e.g., NVIDIA RTX 3060, T4, A10) is recommended for fine-tuning. Smaller models (RF-DETR-N and RF-DETR-S) can fit in 6 GB VRAM with reduced batch size. CPU inference is supported for evaluation.</p>
 <p><strong>Which dataset formats does RF-DETR support?</strong>
@@ -2897,9 +2953,9 @@ RF-DETR Keypoint (Preview) detects 17 body keypoints per person on COCO, achievi
 <p><strong>Is RF-DETR open source?</strong>
 Yes. Core models (Nano through Large) and all training/inference code are released under the Apache 2.0 license. XLarge and 2XLarge models require the <code>rfdetr[plus]</code> package (PML 1.0 license).</p>
 <p><strong>How do I fine-tune RF-DETR on a custom dataset?</strong>
-Instantiate a model and call <code>model.train(...)</code> with your dataset directory in COCO JSON or YOLO format. Example: <code>model = RFDETRLarge(); model.train(dataset_dir='./dataset', epochs=50, batch_size=4)</code>. The model downloads pretrained weights automatically and resumes from the best checkpoint.</p>
+Instantiate a model and call <code>model.train(...)</code> with your dataset directory in COCO JSON or YOLO format. Example: <code>model = RFDETRLarge(); model.train(dataset_dir='./dataset', epochs=50, batch_size=4)</code>. The model downloads pretrained weights automatically and saves best checkpoints automatically (use <code>resume=</code> to continue from one).</p>
 <p><strong>How do I export RF-DETR to ONNX or TensorRT?</strong>
-Call <code>model.export(format="onnx")</code> after training or loading a checkpoint. ONNX export works on CPU and produces a single <code>.onnx</code> file compatible with ONNX Runtime and OpenCV DNN. For TensorRT deployment, first export to ONNX and then convert the <code>.onnx</code> model with TensorRT tooling or helpers such as <code>trtexec</code>; this requires TensorRT and a CUDA GPU.</p>
+Call <code>model.export(format="onnx")</code> after training or loading a checkpoint. ONNX export works on CPU and produces a single <code>.onnx</code> file compatible with ONNX Runtime and OpenCV DNN. For TensorRT deployment, use <code>model.export(format="tensorrt")</code>, which exports ONNX and then builds a <code>.trt</code> engine in-process via the TensorRT Python API; this requires <code>pip install rfdetr[tensorrt]</code> and a CUDA GPU.</p>
 <p><strong>Which RF-DETR model size should I use?</strong>
 RF-DETR-Nano (2.3 ms, 67.6 AP50 on COCO) is best for edge and real-time applications. RF-DETR-Large (6.8 ms, 56.5 AP50:95) offers the best accuracy–latency trade-off for server deployment. RF-DETR-2XLarge (17.2 ms, 60.1 AP50:95) maximizes accuracy when latency allows.</p>
 <blockquote>
@@ -2925,7 +2981,7 @@ RF-DETR-Nano (2.3 ms, 67.6 AP50 on COCO) is best for edge and real-time applic
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="June 29, 2026 19:46:59 UTC">2026-06-29 19:46:59</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="July 31, 2026 08:36:15 UTC">2026-07-31 08:36:15</span>
   </span>
 
     
@@ -3035,7 +3091,7 @@ RF-DETR-Nano (2.3 ms, 67.6 AP50 on COCO) is best for edge and real-time applic
       <script id="__config" type="application/json">{"annotate": null, "base": ".", "features": ["content.tabs.link", "content.code.copy", "navigation.expand", "navigation.tabs", "content.code.annotate", "navigation.tracking", "content.tooltips", "navigation.tabs.sticky"], "search": "assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
     
     
-      <script src="assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>
